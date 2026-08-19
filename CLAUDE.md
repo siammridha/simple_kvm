@@ -1,0 +1,13 @@
+- When reporting back to me from now on explain things in plain, simple language. Use short sentences and everyday words. Avoid unnecessary detail, buzzwords, overly formal language, metaphors, analogies, and figures of speech. Be direct, clear, and literal.
+
+- Do not add Co-Authored-By trailers on this repo.
+- Use cargo nextest run insted of cargo test.
+- For browser and end-to-end testing use agent-browser (the Rust CLI, `cargo install agent-browser`) driving the container's system Chromium at `/usr/bin/chromium`. Chrome for Testing has no Linux arm64 build, so the system Chromium is used with `--no-sandbox`. The browser test is `e2e/browser-test.sh`; The browser test only adds a browser layer, it does not replace the Rust tests.
+- Use task management skills to impliment features.
+- Ensure all changes are clean, don't leave behind dangling code, unused variables, or stale configuration.
+- Before making any commit, make sure to update all relevant documentation so it accurately reflects the current changes.
+- When a question is asked just answer the question so that I can make an informative decission. Do not start planing and exicuting.
+- Once I approve a plan, build exactly what the plan says. If while building you think a step should change, stop and ask me first. Do not quietly do something different. If you did diverge, say so clearly in your report, do not smooth over it.
+- Write brief comments only when they add context that isn't obvious from the code itself. Don't use comments to describe what the code does.
+- Treat everything I report seeing as accurate. Never question or contradict my observations. Instead, do everything you can to accurately explain what I saw, including any plausible technical or UI behavior that could account for it.
+- Never use `sed -i` (or any in-place-edit flag that swaps in a new file) in this environment. It has repeatedly stripped file permissions down to `000`, making the file unreadable and unwritable by anyone, including root. Use the `Edit` tool for file changes. If a bulk find/replace across many files is genuinely needed, write into the existing file instead of swapping a new one in, so it keeps its own permissions.

@@ -1,0 +1,31 @@
+name: build
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # Runs on GitHub's x86_64 runner, inside a native x86_64 Alpine
+    # container - this matches the Wyse 3040's CPU and OS exactly, so it's a
+    # normal build, not a cross-compile.
+    runs-on: ubuntu-latest
+    container: alpine:3.23
+    steps:
+      - name: Install build tools
+        run: apk add --no-cache git rust cargo build-base
+
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/simple_kvm

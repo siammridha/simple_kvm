@@ -1,0 +1,44 @@
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the
+// README at: https://github.com/devcontainers/templates/tree/main/src/rust
+{
+	"name": "Rust",
+	// Dedicated image: rust + node + Claude Code + rust-analyzer + the
+	// rust-analyzer-lsp plugin are baked in by the Dockerfile.
+	"build": {
+		"dockerfile": "Dockerfile"
+	},
+	"workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+	"remoteUser": "vscode",
+	// Volumes survive rebuilds: cargo cache, and all Claude state (login,
+	// sessions, history, plugins — the Dockerfile sets CLAUDE_CONFIG_DIR so
+	// everything, including what would otherwise be ~/.claude.json, lives in
+	// /home/vscode/.claude).
+	"mounts": [
+		{
+			"source": "devcontainer-cargo-cache-${devcontainerId}",
+			"target": "/usr/local/cargo",
+			"type": "volume"
+		},
+		{
+			"source": "devcontainer-claude-config-${devcontainerId}",
+			"target": "/home/vscode/.claude",
+			"type": "volume"
+		},
+		// Bind the host git config so name/email survive rebuilds. SSH keys are
+		// not mounted: VS Code forwards the host SSH agent into the container
+		// automatically, so the key never leaves the host.
+		{
+			"source": "${localEnv:HOME}/.gitconfig",
+			"target": "/home/vscode/.gitconfig",
+			"type": "bind"
+		}
+	],
+
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"spencerwmiles.vscode-task-buttons"
+			]
+		}
+	}
+}

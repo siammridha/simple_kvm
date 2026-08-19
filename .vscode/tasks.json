@@ -1,0 +1,29 @@
+{
+    // See https://go.microsoft.com/fwlink/?LinkId=733558
+    // for the documentation about the tasks.json format
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "start-server",
+            "detail": "Kill any running simple_kvm, then cargo run",
+            "type": "shell",
+            "command": "pkill -x simple_kvm 2>/dev/null; pkill -x cargo 2>/dev/null; sleep 1; AUDIO_PLAYER_MOCK=1 MUSIC_DIR=/tmp/music PORT=3000 cargo run",
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "clear": true
+            }
+        },
+        {
+            "label": "cargo-build",
+            "detail": "Run cargo Build",
+            "type": "shell",
+            "command": "cargo build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "clear": true
+            }
+        }
+    ]
+}
