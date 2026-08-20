@@ -65,6 +65,7 @@ struct ConfigResponse {
     webtransport_port: u16,
     video_mode: VideoMode,
     mouse_mode: MouseMode,
+    version: &'static str,
 }
 
 #[derive(Serialize)]
@@ -98,6 +99,7 @@ async fn config_handler(State(state): State<AppState>) -> Json<ConfigResponse> {
         webtransport_port: state.webtransport_port,
         video_mode: state.video_mode,
         mouse_mode: state.mouse_mode,
+        version: env!("CARGO_PKG_VERSION"),
     })
 }
 

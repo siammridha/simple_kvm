@@ -18,6 +18,7 @@ const pasteText = document.getElementById('paste-text');
 const pasteSend = document.getElementById('paste-send');
 const saveSettings = document.getElementById('save-settings');
 const saveSettingsStatus = document.getElementById('save-settings-status');
+const versionEl = document.getElementById('version');
 
 let controlWriter = null;
 let datagramWriter = null;
@@ -89,6 +90,7 @@ async function connect() {
   populateResolutions(config.resolutions, config.default_resolution);
   videoModeSelect.value = config.video_mode;
   mouseModeSelect.value = config.mouse_mode;
+  versionEl.textContent = `v${config.version}`;
 
   if (!config.video_available) {
     setStatus('no video device found', true);
