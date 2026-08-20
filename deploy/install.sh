@@ -1,14 +1,14 @@
 #!/bin/sh
 # Run this on the Wyse 3040 itself, as root:
 #
-#   wget -qO- https://raw.githubusercontent.com/username/project_name/master/deploy/install.sh | sh
+#   wget -qO- https://raw.githubusercontent.com/siammridha/simple_kvm/main/deploy/install.sh | sh
 #
 # Downloads the latest release binary from GitHub, installs it as an OpenRC
 # boot service, and starts it. No other files need to be copied to the
 # device first.
 set -eu
 
-REPO="username/project_name"
+REPO="siammridha/simple_kvm"
 
 if [ "$(id -u)" -ne 0 ]; then
 	echo "Run this as root." >&2

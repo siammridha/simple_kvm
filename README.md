@@ -93,7 +93,7 @@ workflow already install these.
 Run this on the Wyse 3040 itself, as root:
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/username/project_name/master/deploy/install.sh | sh
+wget -qO- https://raw.githubusercontent.com/siammridha/simple_kvm/main/deploy/install.sh | sh
 ```
 
 This downloads the latest release binary and sets it up as an OpenRC
