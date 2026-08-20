@@ -23,6 +23,11 @@ let controlWriter = null;
 let datagramWriter = null;
 let videoDecoder = null;
 let decoderConfigured = false;
+// A fresh decoder (or one that just errored) can't decode a delta frame
+// until it's seen a keyframe - feeding it one throws and, per WebCodecs,
+// permanently closes the decoder. Dropping delta frames until the next
+// real keyframe avoids that instead of erroring on every frame forever.
+let awaitingKeyframe = true;
 let reconnectScheduled = false;
 
 function setStatus(text, isError) {
@@ -192,6 +197,19 @@ function naluIsKeyframe(bytes) {
   return false;
 }
 
+function resetH264Decoder() {
+  if (videoDecoder && videoDecoder.state !== 'closed') {
+    try {
+      videoDecoder.close();
+    } catch {
+      // Already closing/closed - nothing to do.
+    }
+  }
+  videoDecoder = null;
+  decoderConfigured = false;
+  awaitingKeyframe = true;
+}
+
 function renderH264(payload) {
   if (typeof VideoDecoder === 'undefined') {
     setStatus('this browser has no WebCodecs support for H.264', true);
@@ -207,15 +225,31 @@ function renderH264(payload) {
         ctx2d.drawImage(frame, 0, 0);
         frame.close();
       },
-      error: (err) => console.error('VideoDecoder error', err),
+      error: (err) => {
+        console.error('VideoDecoder error', err);
+        resetH264Decoder();
+      },
     });
+    decoderConfigured = false;
   }
   if (!decoderConfigured) {
     videoDecoder.configure({ codec: 'avc1.42E01E', avc: { format: 'annexb' }, optimizeForLatency: true });
     decoderConfigured = true;
   }
-  const type = naluIsKeyframe(payload) ? 'key' : 'delta';
-  videoDecoder.decode(new EncodedVideoChunk({ type, timestamp: performance.now() * 1000, data: payload }));
+
+  const isKeyframe = naluIsKeyframe(payload);
+  if (awaitingKeyframe && !isKeyframe) {
+    return;
+  }
+  awaitingKeyframe = false;
+
+  try {
+    const type = isKeyframe ? 'key' : 'delta';
+    videoDecoder.decode(new EncodedVideoChunk({ type, timestamp: performance.now() * 1000, data: payload }));
+  } catch (err) {
+    console.error('VideoDecoder decode failed', err);
+    resetH264Decoder();
+  }
 }
 
 function sendDatagram(bytes) {

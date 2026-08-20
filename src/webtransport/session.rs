@@ -64,10 +64,12 @@ pub async fn handle(connection: Connection, ctx: SessionContext) -> Result<()> {
     let mut keyboard = KeyboardState::default();
     let mut control: Option<(wtransport::SendStream, RecvStream)> = None;
     let mut control_buf: Vec<u8> = Vec::new();
-    // Set once the video_bus sender is gone for good (e.g. no capture
-    // device at all, so the capture task exits immediately). Keyboard and
-    // mouse must keep working either way, so this only disables the video
-    // branch — it must never end the session.
+    // Set once the video_bus sender is gone for good (only happens if the
+    // capture task itself is torn down, e.g. process shutdown - it no
+    // longer exits just because the card is absent or unplugged, see
+    // `CaptureManager::run`). Keyboard and mouse must keep working either
+    // way, so this only disables the video branch — it must never end the
+    // session.
     let mut video_closed = false;
 
     loop {

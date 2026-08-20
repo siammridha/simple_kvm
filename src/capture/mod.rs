@@ -2,8 +2,10 @@ pub mod h264;
 pub mod mjpeg;
 pub mod v4l2;
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::watch;
 
@@ -11,16 +13,25 @@ use crate::config::{CaptureSettings, VideoMode};
 use crate::video_bus::{self, FrameEnvelope, FrameKind};
 use v4l2::{PixelFormat, SupportedFormat};
 
+/// How often to check whether the capture card is plugged in while it's
+/// absent. There's no cheap notification for USB add/remove without a udev
+/// dependency (deliberately avoided elsewhere in this project), so this
+/// just polls - same presence-check idea as `ch9329::writer`, applied on a
+/// timer instead of per-write since there's no per-write equivalent here.
+const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
 pub struct CaptureManager {
     device_path: String,
     formats: Vec<SupportedFormat>,
 }
 
 impl CaptureManager {
-    /// Probes `device_path` for its supported formats. Never fails — if
-    /// there's no capture device (e.g. in the devcontainer), `formats` is
-    /// just empty and `run` becomes a no-op, per the soft-unavailable
-    /// design.
+    /// Probes `device_path` for its supported formats, once, for the
+    /// startup snapshot (`is_available`/`default_settings`/etc. below —
+    /// used to build the page's initial state). Never fails — if there's
+    /// no capture device (e.g. in the devcontainer), `formats` is just
+    /// empty. `run` below does its own live presence checking and doesn't
+    /// depend on this snapshot staying accurate.
     pub fn probe(device_path: &str) -> Self {
         let formats = v4l2::enumerate(device_path).unwrap_or_else(|err| {
             tracing::warn!(%err, device_path, "no capture device found, video will be unavailable");
@@ -64,31 +75,86 @@ impl CaptureManager {
         self.formats.iter().any(|f| f.pixel_format == pixel_format && f.resolutions.contains(&resolution))
     }
 
-    /// Runs forever, restarting the capture loop whenever `settings`
-    /// changes, publishing frames onto `video_bus`.
+    /// Runs forever: whenever the capture card is present, restarts the
+    /// capture loop whenever `settings` changes and publishes frames onto
+    /// `video_bus`; whenever it's absent (never plugged in, or unplugged
+    /// mid-session), polls until it reappears instead of exiting for good.
     pub async fn run(self, mut settings: watch::Receiver<CaptureSettings>, video_bus: video_bus::Sender) {
-        if !self.is_available() {
-            tracing::info!("no capture device available, video capture task exiting");
-            return;
-        }
+        let device_path = self.device_path;
+        let mut known_present = false;
 
         loop {
+            if !Path::new(&device_path).exists() {
+                if known_present {
+                    tracing::warn!(device_path = %device_path, "capture device disconnected, pausing video until it reconnects");
+                    known_present = false;
+                }
+                if wait_for_device_or_shutdown(&device_path, &mut settings).await.is_err() {
+                    break;
+                }
+                continue;
+            }
+
+            let formats = match v4l2::enumerate(&device_path) {
+                Ok(formats) => formats,
+                Err(err) => {
+                    tracing::error!(%err, device_path = %device_path, "failed to enumerate capture device, will retry");
+                    tokio::time::sleep(DEVICE_POLL_INTERVAL).await;
+                    continue;
+                }
+            };
+            if !known_present {
+                tracing::info!(device_path = %device_path, "capture device connected");
+                known_present = true;
+            }
+
             let current = *settings.borrow();
-            let device_path = self.device_path.clone();
-            let formats = self.formats.clone();
+            let device_path_task = device_path.clone();
             let stop = Arc::new(AtomicBool::new(false));
             let stop_task = Arc::clone(&stop);
             let video_bus_task = video_bus.clone();
 
-            let handle = tokio::task::spawn_blocking(move || {
-                run_one_pass(&device_path, &formats, &current, stop_task, video_bus_task)
+            let mut handle = tokio::task::spawn_blocking(move || {
+                run_one_pass(&device_path_task, &formats, &current, stop_task, video_bus_task)
             });
 
-            if settings.changed().await.is_err() {
-                break;
+            tokio::select! {
+                changed = settings.changed() => {
+                    stop.store(true, Ordering::Relaxed);
+                    let _ = handle.await;
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+                // The pass ended on its own - most likely the card was
+                // unplugged mid-capture and the next loop iteration's
+                // presence check will notice. Could also be some other
+                // capture error; either way, looping back (rather than
+                // exiting the task) is what makes it retryable. The sleep
+                // keeps a persistent non-unplug error (e.g. a permissions
+                // problem) from busy-looping instead of just polling.
+                _ = &mut handle => {
+                    tokio::time::sleep(DEVICE_POLL_INTERVAL).await;
+                }
             }
-            stop.store(true, Ordering::Relaxed);
-            let _ = handle.await;
+        }
+    }
+}
+
+/// Polls `device_path` until it exists, or returns `Err` once the settings
+/// channel closes (server shutting down, nothing left to wait for).
+async fn wait_for_device_or_shutdown(device_path: &str, settings: &mut watch::Receiver<CaptureSettings>) -> Result<(), ()> {
+    loop {
+        if Path::new(device_path).exists() {
+            return Ok(());
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(DEVICE_POLL_INTERVAL) => {}
+            changed = settings.changed() => {
+                if changed.is_err() {
+                    return Err(());
+                }
+            }
         }
     }
 }

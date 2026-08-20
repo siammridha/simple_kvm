@@ -36,7 +36,11 @@ ip>:3000` with:
   - **H.264**, software-encoded. Included because it was asked for, but
     the Wyse 3040's Atom CPU is genuinely weak for real-time software
     video encoding - expect this mode to be choppy. MJPEG is the
-    practical default.
+    practical default. The encoder inserts a keyframe every 60 frames so
+    a browser that (re)connects mid-stream has something to start
+    decoding from - without it, only the very first frame of a capture
+    session would ever be a keyframe, and joining any later would leave
+    the video stuck.
 - **Resolution dropdown**, populated from whatever the capture card
   actually reports supporting (queried at startup) - not a hardcoded
   list.
@@ -57,11 +61,14 @@ ip>:3000` with:
 The server runs fine with no capture card or CH9329 attached - the page
 still loads, dropdowns just reflect "no video device," and keyboard/mouse
 input is silently dropped instead of the service failing to start. Useful
-for development without the hardware plugged in. This also covers the
-CH9329 disconnecting (or failing to write) after the service has already
-started: input is silently dropped while it's gone, and picks back up on
-its own the next time a key or click comes in after it's plugged back in -
-no restart needed.
+for development without the hardware plugged in. This also covers either
+device disconnecting after the service has already started, and both
+recover on their own once reconnected, no restart needed: the CH9329
+silently drops input while it's gone and picks back up the next time a key
+or click comes in; the capture card pauses video the same way and resumes
+streaming once it's replugged (the page itself only picks up the "video is
+back" state on its next load or reconnect, since the resolution dropdown
+is filled in when the page connects, not continuously).
 
 **Dropdown changes are saved automatically** - there's no separate "save"
 step required. Changing video mode, resolution, or mouse mode applies

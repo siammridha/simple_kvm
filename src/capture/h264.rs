@@ -6,8 +6,16 @@
 //! configured for `avc.format: "annexb"`.
 
 use anyhow::{Context, Result};
-use openh264::encoder::Encoder;
+use openh264::encoder::{Encoder, EncoderConfig, IntraFramePeriod};
 use openh264::formats::YUVBuffer;
+use openh264::OpenH264API;
+
+/// A joining/reconnecting browser only ever sees the *latest* published
+/// frame (`video_bus` keeps no backlog - see the module doc there), so
+/// without a periodic keyframe, everyone who connects after the very first
+/// frame of a capture pass would only ever receive delta frames and could
+/// never start decoding.
+const INTRA_FRAME_PERIOD: u32 = 60;
 
 pub struct H264Encoder {
     encoder: Encoder,
@@ -17,7 +25,8 @@ pub struct H264Encoder {
 
 impl H264Encoder {
     pub fn new(width: u32, height: u32) -> Result<Self> {
-        let encoder = Encoder::new().context("creating openh264 encoder")?;
+        let config = EncoderConfig::new().intra_frame_period(IntraFramePeriod::from_num_frames(INTRA_FRAME_PERIOD));
+        let encoder = Encoder::with_api_config(OpenH264API::from_source(), config).context("creating openh264 encoder")?;
         Ok(Self { encoder, width: width as usize, height: height as usize })
     }
 
