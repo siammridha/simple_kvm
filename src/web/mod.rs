@@ -72,11 +72,18 @@ struct CertInfoResponse {
     hash: String,
 }
 
+/// Every asset here is embedded in the binary itself, so the only way its
+/// content ever changes is a new binary being installed - the browser must
+/// never serve a cached copy from before an update, or the page can end up
+/// running old JS against a new server (e.g. still showing removed
+/// features).
+const NO_CACHE: (header::HeaderName, &str) = (header::CACHE_CONTROL, "no-store");
+
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/", get(|| async { Html(INDEX_HTML) }))
-        .route("/app.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript")], APP_JS) }))
-        .route("/style.css", get(|| async { ([(header::CONTENT_TYPE, "text/css")], STYLE_CSS) }))
+        .route("/", get(|| async { ([NO_CACHE], Html(INDEX_HTML)) }))
+        .route("/app.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript"), NO_CACHE], APP_JS) }))
+        .route("/style.css", get(|| async { ([(header::CONTENT_TYPE, "text/css"), NO_CACHE], STYLE_CSS) }))
         .route("/api/config", get(config_handler))
         .route("/api/cert-info", get(cert_info_handler))
         .route("/api/settings/save", post(save_settings_handler))

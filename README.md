@@ -161,6 +161,9 @@ connection](#tls-for-the-page-and-the-videoinput-connection)).
 
 **Updating later:** push a new version tag on GitHub, then re-run the same
 `wget ... | sh` command on the device - it always grabs the latest release.
+The page, `app.js`, and `style.css` are all served with `Cache-Control:
+no-store`, so a browser tab reloaded after an update always gets the new
+version instead of quietly running old page code against the new server.
 
 **Why the service waits 30 seconds after boot before starting:** on the
 actual Wyse 3040 this was built and tested against, opening the capture
@@ -192,7 +195,7 @@ if you need to change one):
 | `TLS_SAN` | `localhost` | Comma-separated subject names for the self-signed cert |
 | `TLS_CERT_PATH`, `TLS_KEY_PATH` | unset | Use a specific cert/key PEM pair instead of generating a self-signed one. Set both to enable; loaded once at startup and never auto-rotated - that's on whoever manages the file pair. |
 | `SETTINGS_PATH` | `/etc/simple_kvm-settings.json` | Where video mode/resolution/mouse mode are written when you click **Save settings** on the page, and read back on the next startup. |
-| `RUST_LOG` | `info` | Standard `tracing` log filter. Every keystroke/click is logged at `debug` (e.g. `RUST_LOG=debug` or `RUST_LOG=info,simple_kvm::webtransport::session=debug,simple_kvm::ch9329::writer=debug`) - useful for tracking down input lag, since each log line includes how long that event took to queue/write. A command that takes more than 50ms logs at `warn` even at the default level, so a slow one shows up without turning this on first. |
+| `RUST_LOG` | `info,simple_kvm::webtransport::session=debug,simple_kvm::ch9329::writer=debug` | Standard `tracing` log filter. By default, every keystroke/click is already logged at `debug` - no configuration needed first - since each log line includes how long that event took to queue/write, which is useful for tracking down input lag. A command that takes more than 50ms logs at `warn` regardless. Setting `RUST_LOG` yourself (e.g. `RUST_LOG=debug` for everything, or `RUST_LOG=warn` to quiet the per-keystroke lines) fully overrides the default above. |
 
 ## Releasing a new version
 

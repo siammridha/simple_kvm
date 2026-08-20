@@ -145,9 +145,14 @@ async fn open_serial_after_delay(serial_path: String, delay_secs: u64, serial_tx
     let _ = tokio::task::spawn_blocking(move || writer.run(serial_rx)).await;
 }
 
+/// Used only when `RUST_LOG` isn't set. Everything else stays at `info`,
+/// but keystroke/click handling logs at `debug` by default so input-lag
+/// reports are visible in the log immediately, with no configuration step
+/// needed first - setting `RUST_LOG` explicitly still overrides this
+/// entirely, same as any `EnvFilter`.
+const DEFAULT_LOG_FILTER: &str = "info,simple_kvm::webtransport::session=debug,simple_kvm::ch9329::writer=debug";
+
 fn init_logging() {
-    let filter = EnvFilter::builder()
-        .with_default_directive(tracing::level_filters::LevelFilter::INFO.into())
-        .from_env_lossy();
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
