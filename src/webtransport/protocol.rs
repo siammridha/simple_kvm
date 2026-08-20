@@ -1,0 +1,125 @@
+//! Wire formats for the two input channels: small binary datagrams for
+//! high-frequency mouse/key events, and JSON-lines on the one
+//! bidirectional control stream per session for low-frequency settings
+//! changes and paste submissions.
+
+use serde::Deserialize;
+
+/// Parsed from a WebTransport datagram. Loss-tolerant by design — the
+/// next event supersedes a dropped one for mouse moves, and a dropped key
+/// event is rare enough on a LAN not to design around further.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InputEvent {
+    /// A physical key's press/release state changed. `code` is a
+    /// `KeyboardEvent.code` value (e.g. `"KeyA"`); translated via
+    /// `ch9329::keymap`.
+    KeyEvent { pressed: bool, code: String },
+    /// Absolute cursor position as a fraction of the video frame.
+    MouseAbsoluteMove { x_frac: f32, y_frac: f32 },
+    /// A full relative-mode report: move plus button/wheel state.
+    MouseRelativeMove { buttons: u8, dx: i8, dy: i8, wheel: i8 },
+    /// Click/scroll state without moving the cursor — used for absolute
+    /// mode, where the hardware only honors position, not buttons/wheel,
+    /// in its own absolute report (see `ch9329::writer`).
+    MouseButtons { buttons: u8, wheel: i8 },
+}
+
+const TAG_KEY_EVENT: u8 = 0x01;
+const TAG_MOUSE_ABSOLUTE_MOVE: u8 = 0x02;
+const TAG_MOUSE_RELATIVE_MOVE: u8 = 0x03;
+const TAG_MOUSE_BUTTONS: u8 = 0x04;
+
+impl InputEvent {
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        let (&tag, rest) = data.split_first()?;
+        match tag {
+            TAG_KEY_EVENT if !rest.is_empty() => Some(InputEvent::KeyEvent {
+                pressed: rest[0] != 0,
+                code: String::from_utf8_lossy(&rest[1..]).into_owned(),
+            }),
+            TAG_MOUSE_ABSOLUTE_MOVE if rest.len() == 8 => Some(InputEvent::MouseAbsoluteMove {
+                x_frac: f32::from_le_bytes(rest[0..4].try_into().ok()?),
+                y_frac: f32::from_le_bytes(rest[4..8].try_into().ok()?),
+            }),
+            TAG_MOUSE_RELATIVE_MOVE if rest.len() == 4 => Some(InputEvent::MouseRelativeMove {
+                buttons: rest[0],
+                dx: rest[1] as i8,
+                dy: rest[2] as i8,
+                wheel: rest[3] as i8,
+            }),
+            TAG_MOUSE_BUTTONS if rest.len() == 2 => Some(InputEvent::MouseButtons { buttons: rest[0], wheel: rest[1] as i8 }),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ControlMessage {
+    SetVideoMode { mode: VideoModeWire },
+    SetResolution { width: u32, height: u32 },
+    SetMouseMode { mode: MouseModeWire },
+    Paste { text: String },
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoModeWire {
+    Mjpeg,
+    H264,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseModeWire {
+    Absolute,
+    Relative,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_key_event() {
+        let mut data = vec![TAG_KEY_EVENT, 1];
+        data.extend_from_slice(b"KeyA");
+        assert_eq!(InputEvent::parse(&data), Some(InputEvent::KeyEvent { pressed: true, code: "KeyA".into() }));
+    }
+
+    #[test]
+    fn parses_mouse_absolute_move() {
+        let mut data = vec![TAG_MOUSE_ABSOLUTE_MOVE];
+        data.extend_from_slice(&0.25f32.to_le_bytes());
+        data.extend_from_slice(&0.75f32.to_le_bytes());
+        assert_eq!(InputEvent::parse(&data), Some(InputEvent::MouseAbsoluteMove { x_frac: 0.25, y_frac: 0.75 }));
+    }
+
+    #[test]
+    fn parses_mouse_relative_move_with_signed_deltas() {
+        let data = vec![TAG_MOUSE_RELATIVE_MOVE, 0x01, (-5i8) as u8, 10, (-3i8) as u8];
+        assert_eq!(InputEvent::parse(&data), Some(InputEvent::MouseRelativeMove { buttons: 1, dx: -5, dy: 10, wheel: -3 }));
+    }
+
+    #[test]
+    fn parses_mouse_buttons() {
+        let data = vec![TAG_MOUSE_BUTTONS, 0x02, (-1i8) as u8];
+        assert_eq!(InputEvent::parse(&data), Some(InputEvent::MouseButtons { buttons: 2, wheel: -1 }));
+    }
+
+    #[test]
+    fn rejects_malformed_or_unknown_datagrams() {
+        assert_eq!(InputEvent::parse(&[]), None);
+        assert_eq!(InputEvent::parse(&[0xFF, 1, 2, 3]), None);
+        assert_eq!(InputEvent::parse(&[TAG_MOUSE_ABSOLUTE_MOVE, 1, 2, 3]), None);
+    }
+
+    #[test]
+    fn control_message_deserializes_from_json() {
+        let msg: ControlMessage = serde_json::from_str(r#"{"type":"set_video_mode","mode":"h264"}"#).unwrap();
+        assert!(matches!(msg, ControlMessage::SetVideoMode { mode: VideoModeWire::H264 }));
+
+        let msg: ControlMessage = serde_json::from_str(r#"{"type":"paste","text":"hi"}"#).unwrap();
+        assert!(matches!(msg, ControlMessage::Paste { text } if text == "hi"));
+    }
+}

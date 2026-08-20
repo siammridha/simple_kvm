@@ -1,27 +1,71 @@
 # simple_kvm
 
 A small KVM-over-USB tool for a Dell Wyse 3040 running Alpine Linux. It sits
-next to a target computer and lets you see its screen and control its
-keyboard/mouse remotely.
+next to a target computer, reads its screen through a capture card, and
+sends keyboard/mouse input to it through a CH9329 HID adapter — controlled
+entirely from a web page.
 
 ## Hardware
 
-- **CH9329 + CH340 UART/TTL Serial Port to USB Connecting Wire** - plugs
-  into the target computer's USB port and acts as a keyboard/mouse (HID).
-  The Wyse 3040 talks to it over serial to send keystrokes and mouse moves.
+- **CH9329 + CH340 UART/TTL Serial Port to USB Connecting Wire** - the
+  CH340 side (a plain USB-serial adapter with TX/RX/GND leads, wired to the
+  CH9329 board's UART pins) plugs into the Wyse 3040 and shows up as
+  `/dev/ttyUSB*`. The CH9329's own USB connector plugs into the **target**
+  computer, where it enumerates as a USB keyboard/mouse. Getting this
+  backwards (CH9329's USB side into the Wyse 3040) makes the Wyse 3040
+  itself show up as a keyboard/mouse instead of controlling anything - if
+  `/dev/ttyUSB*` never appears, check which connector is plugged in where.
 - **1080P Capture Card, USB 3.0 to HDMI** - plugs into the target
-  computer's HDMI output and the Wyse 3040's USB port, so the Wyse 3040 can
-  read the target's screen as a video source.
+  computer's HDMI output and the Wyse 3040's USB port, and shows up as
+  `/dev/video*`.
 
-Both devices are recognized by the Linux kernel automatically (no extra
-drivers to install) and show up as `/dev/ttyUSB*` (the CH9329/CH340 serial
-adapter) and `/dev/video*` (the capture card) once plugged in.
+Both devices are recognized by the Linux kernel automatically, no drivers
+to install.
 
-## Current state
+## What it does
 
-This repository currently has a minimal Rust binary (`src/main.rs`) plus
-the build and deploy tooling described below. It doesn't yet read the
-serial adapter or the capture card - that's the next piece of work.
+Run the binary on the Wyse 3040 and it serves a page at `http://<device
+ip>:3000` with:
+
+- **Live video**, streamed over WebTransport (not WebRTC). Two modes,
+  switchable live from a dropdown:
+  - **MJPEG** (default) - if the capture card has hardware MJPEG (most
+    UVC capture cards do), frames are forwarded as-is, essentially free on
+    the CPU. If not, frames are JPEG-compressed in software from the raw
+    feed - still much cheaper than video encoding, just not free.
+  - **H.264**, software-encoded. Included because it was asked for, but
+    the Wyse 3040's Atom CPU is genuinely weak for real-time software
+    video encoding - expect this mode to be choppy. MJPEG is the
+    practical default.
+- **Resolution dropdown**, populated from whatever the capture card
+  actually reports supporting (queried at startup) - not a hardcoded
+  list.
+- **Mouse control**, absolute or relative, switchable live. Absolute
+  mode positions the cursor exactly where you click in the video; on the
+  CH9329 hardware this repo was built against, clicks and scroll wheel
+  only work through its *relative* HID report, so absolute mode
+  transparently sends position via the absolute report and clicks/scroll
+  via a zero-motion relative report - invisible from the browser, just how
+  `ch9329::writer` talks to this chip.
+- **A paste box** - text typed or pasted into it is sent to the target as
+  simulated keystrokes (US QWERTY only; there's no OS-level clipboard
+  access over a HID-only link).
+- **No login.** Anyone who can reach port 3000 has full control. This is
+  meant for a trusted LAN, not the open internet.
+
+The server runs fine with no capture card or CH9329 attached - the page
+still loads, dropdowns just reflect "no video device," and keyboard/mouse
+input is silently dropped instead of the service failing to start. Useful
+for development without the hardware plugged in.
+
+### TLS for the video/input connection
+
+WebTransport requires TLS. There's no public domain for a LAN device, so
+the server generates its own self-signed certificate and the page pins it
+by hash (`serverCertificateHashes`) - no manual "accept this certificate"
+step needed in the browser. Chrome caps a self-signed cert used this way
+at 14 days, so the server regenerates it every 12 days automatically; any
+session connected at that moment reconnects on its own.
 
 ## How it's built
 
@@ -32,6 +76,12 @@ serial adapter or the capture card - that's the next piece of work.
 - `deploy/install.sh` - run on the device; downloads the latest release
   binary from GitHub and sets it up as an OpenRC service that starts on
   boot.
+
+Building needs a few extra Alpine packages beyond a bare Rust toolchain:
+`clang-dev` and `linux-headers` (the `v4l` crate generates V4L2 bindings
+with `bindgen` at build time) and `nasm` (speeds up the `openh264`
+encoder, which matters on this CPU). Both the devcontainer and the release
+workflow already install these.
 
 ## Target platform
 
@@ -57,8 +107,23 @@ rc-service simple_kvm status
 cat /var/log/simple_kvm.log
 ```
 
+Then open `http://<device ip>:3000` from a browser on the same network.
+
 **Updating later:** push a new version tag on GitHub, then re-run the same
 `wget ... | sh` command on the device - it always grabs the latest release.
+
+### Configuration
+
+All optional, set as environment variables (e.g. in `/etc/init.d/simple_kvm`
+if you need to change one):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SERIAL_PATH` | `/dev/ttyUSB0` | CH9329/CH340 serial device |
+| `VIDEO_PATH` | `/dev/video0` | Capture card device |
+| `HTTP_PORT` | `3000` | Plain HTTP port for the page |
+| `WEBTRANSPORT_PORT` | `4433` | UDP port for the video/input connection |
+| `TLS_SAN` | `localhost` | Comma-separated subject names for the self-signed cert |
 
 ## Releasing a new version
 
@@ -77,3 +142,8 @@ cat /var/log/simple_kvm.log
 cargo build
 cargo nextest run
 ```
+
+`e2e/browser-test.sh` drives the actual page with `agent-browser` against
+the container's system Chromium (no capture card/CH9329 needed - it runs
+against the same soft "no device" state described above). It's a layer on
+top of the Rust tests, not a replacement for them.

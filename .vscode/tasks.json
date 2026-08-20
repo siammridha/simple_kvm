@@ -7,7 +7,7 @@
             "label": "start-server",
             "detail": "Kill any running simple_kvm, then cargo run",
             "type": "shell",
-            "command": "pkill -x simple_kvm 2>/dev/null; pkill -x cargo 2>/dev/null; sleep 1; AUDIO_PLAYER_MOCK=1 MUSIC_DIR=/tmp/music PORT=3000 cargo run",
+            "command": "pkill -x simple_kvm 2>/dev/null; pkill -x cargo 2>/dev/null; sleep 1; HTTP_PORT=3000 cargo run",
             "presentation": {
                 "reveal": "always",
                 "panel": "dedicated",

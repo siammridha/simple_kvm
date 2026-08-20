@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>simple_kvm</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="toolbar">
+  <span id="status">connecting&hellip;</span>
+
+  <label>Video
+    <select id="video-mode">
+      <option value="mjpeg">MJPEG</option>
+      <option value="h264">H.264</option>
+    </select>
+  </label>
+
+  <label>Resolution
+    <select id="resolution"></select>
+  </label>
+
+  <label>Mouse
+    <select id="mouse-mode">
+      <option value="absolute">Absolute</option>
+      <option value="relative">Relative</option>
+    </select>
+  </label>
+</div>
+
+<canvas id="video" tabindex="0"></canvas>
+
+<div id="paste-bar">
+  <textarea id="paste-text" placeholder="Type or paste text here, then Send to type it on the target (US QWERTY only)"></textarea>
+  <button id="paste-send">Send</button>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

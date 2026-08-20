@@ -1,0 +1,9 @@
+# bindgen (used by the `v4l` crate) dlopens libclang.so at runtime, which
+# doesn't work with musl's default fully-static linking. Same fix as the
+# audio_player reference project needed for ALSA: build dynamically linked
+# against musl's libc.so instead (present by default on Alpine).
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=-crt-static"]
+
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=-crt-static"]

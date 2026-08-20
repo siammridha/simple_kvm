@@ -1,0 +1,78 @@
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: #111;
+  color: #eee;
+  font-family: system-ui, sans-serif;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+#toolbar {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.5rem 1rem;
+  background: #1a1a1a;
+  border-bottom: 1px solid #333;
+}
+
+#toolbar label {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.9rem;
+}
+
+#status {
+  font-size: 0.85rem;
+  color: #9a9;
+  margin-right: auto;
+}
+
+#status.error {
+  color: #e77;
+}
+
+#video {
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+  background: #000;
+  object-fit: contain;
+  cursor: crosshair;
+}
+
+#paste-bar {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  background: #1a1a1a;
+  border-top: 1px solid #333;
+}
+
+#paste-text {
+  flex: 1;
+  resize: vertical;
+  min-height: 2.5rem;
+  background: #222;
+  color: #eee;
+  border: 1px solid #444;
+  border-radius: 4px;
+  padding: 0.4rem;
+}
+
+#paste-send {
+  padding: 0 1rem;
+  border: none;
+  border-radius: 4px;
+  background: #2a6;
+  color: #fff;
+  cursor: pointer;
+}
+
+#paste-send:hover {
+  background: #3b7;
+}

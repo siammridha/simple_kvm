@@ -18,7 +18,7 @@ jobs:
     container: alpine:3.23
     steps:
       - name: Install build tools
-        run: apk add --no-cache git rust cargo build-base
+        run: apk add --no-cache git rust cargo build-base clang-dev linux-headers nasm
 
       - uses: actions/checkout@v4
 
