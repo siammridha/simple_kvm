@@ -40,13 +40,14 @@ ip>:3000` with:
 - **Resolution dropdown**, populated from whatever the capture card
   actually reports supporting (queried at startup) - not a hardcoded
   list.
-- **Mouse control**, absolute or relative, switchable live. Absolute
-  mode positions the cursor exactly where you click in the video; on the
-  CH9329 hardware this repo was built against, clicks and scroll wheel
-  only work through its *relative* HID report, so absolute mode
-  transparently sends position via the absolute report and clicks/scroll
-  via a zero-motion relative report - invisible from the browser, just how
-  `ch9329::writer` talks to this chip.
+- **Mouse clicks and scroll wheel**, absolute or relative mode
+  switchable live; on the CH9329 hardware this repo was built against,
+  clicks and scroll wheel only work through its *relative* HID report,
+  so both modes send them via a zero-motion relative report - invisible
+  from the browser, just how `ch9329::writer` talks to this chip. Mouse
+  *movement* is not sent at all - moving the mouse over the video was
+  crashing the Wyse 3040, so cursor tracking has been removed for now
+  and only clicks/scroll go through.
 - **A paste box** - text typed or pasted into it is sent to the target as
   simulated keystrokes (US QWERTY only; there's no OS-level clipboard
   access over a HID-only link).

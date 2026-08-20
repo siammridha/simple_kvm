@@ -5,7 +5,6 @@
 // stream carries settings changes and paste text as JSON-lines.
 
 const TAG_KEY_EVENT = 1;
-const TAG_MOUSE_ABSOLUTE_MOVE = 2;
 const TAG_MOUSE_RELATIVE_MOVE = 3;
 const TAG_MOUSE_BUTTONS = 4;
 
@@ -228,17 +227,6 @@ function wireInput(transport) {
     sendKeyEvent(transport, e.code, false);
   });
 
-  canvas.addEventListener('mousemove', (e) => {
-    if (mouseModeSelect.value === 'absolute') {
-      const rect = canvas.getBoundingClientRect();
-      const xFrac = (e.clientX - rect.left) / rect.width;
-      const yFrac = (e.clientY - rect.top) / rect.height;
-      sendMouseAbsoluteMove(transport, xFrac, yFrac);
-    } else {
-      sendMouseRelativeMove(transport, buttonMask(e.buttons), e.movementX, e.movementY, 0);
-    }
-  });
-
   canvas.addEventListener('mousedown', (e) => handleMouseButtons(transport, e));
   canvas.addEventListener('mouseup', (e) => handleMouseButtons(transport, e));
   canvas.addEventListener('contextmenu', (e) => e.preventDefault());
@@ -289,15 +277,6 @@ function sendKeyEvent(transport, code, pressed) {
   bytes[0] = TAG_KEY_EVENT;
   bytes[1] = pressed ? 1 : 0;
   bytes.set(codeBytes, 2);
-  sendDatagram(transport, bytes);
-}
-
-function sendMouseAbsoluteMove(transport, xFrac, yFrac) {
-  const bytes = new Uint8Array(9);
-  const view = new DataView(bytes.buffer);
-  bytes[0] = TAG_MOUSE_ABSOLUTE_MOVE;
-  view.setFloat32(1, xFrac, true);
-  view.setFloat32(5, yFrac, true);
   sendDatagram(transport, bytes);
 }
 
