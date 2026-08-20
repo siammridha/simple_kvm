@@ -77,8 +77,6 @@ async fn main() -> Result<()> {
     let (mouse_mode_tx, mouse_mode_rx) = watch::channel(default_mouse_mode);
     let (video_bus_tx, video_bus_rx) = video_bus::channel();
 
-    tokio::spawn(settings_store::run(settings_path, capture_settings_rx.clone(), mouse_mode_rx));
-
     // --- Serial: same soft-unavailable treatment as capture. Commands sent
     // to `serial_tx` before the port is open just queue up in the channel,
     // so this delay doesn't hold up the HTTP page or WebTransport server
@@ -102,6 +100,9 @@ async fn main() -> Result<()> {
         cert_manager: Arc::clone(&cert_manager),
         video_mode: default_capture_settings.video_mode,
         mouse_mode: default_mouse_mode,
+        capture_settings_rx: capture_settings_rx.clone(),
+        mouse_mode_rx,
+        settings_path,
     };
     let https_config = cert_manager.https_config().await?;
     let http_addr = std::net::SocketAddr::from(([0, 0, 0, 0], http_port));

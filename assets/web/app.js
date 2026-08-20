@@ -291,9 +291,14 @@ function wireInput() {
     pasteText.value = '';
   });
 
-  saveSettings.addEventListener('click', () => {
-    sendControl({ type: 'save_settings' });
-    saveSettingsStatus.textContent = 'Saved';
+  saveSettings.addEventListener('click', async () => {
+    try {
+      const res = await fetch('/api/settings/save', { method: 'POST' });
+      saveSettingsStatus.textContent = res.ok ? 'Saved' : 'Save failed';
+    } catch (err) {
+      console.error('save settings failed', err);
+      saveSettingsStatus.textContent = 'Save failed';
+    }
     setTimeout(() => { saveSettingsStatus.textContent = ''; }, 2000);
   });
 

@@ -1,12 +1,13 @@
 //! Persists the live-adjustable settings (video mode, resolution, mouse
 //! mode) to a JSON file, so a dropdown change survives a service restart
-//! instead of resetting to the capture card's defaults every time.
+//! instead of resetting to the capture card's defaults every time. Saving
+//! only happens when the page's Save button sends `POST /api/settings/save`
+//! (see `web::save_settings_handler`) — dropdown changes apply immediately
+//! but are not written to disk on their own.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use tokio::sync::watch;
-
-use crate::config::{CaptureSettings, MouseMode, PersistedSettings};
+use crate::config::PersistedSettings;
 
 /// Reads the settings file, if any. Returns `None` if it doesn't exist yet
 /// or can't be parsed — either way, the caller falls back to the capture
@@ -22,7 +23,7 @@ pub fn load(path: &Path) -> Option<PersistedSettings> {
     }
 }
 
-fn save(path: &Path, settings: PersistedSettings) {
+pub fn save(path: &Path, settings: PersistedSettings) {
     let data = match serde_json::to_vec_pretty(&settings) {
         Ok(data) => data,
         Err(err) => {
@@ -35,30 +36,11 @@ fn save(path: &Path, settings: PersistedSettings) {
     }
 }
 
-/// Runs forever, writing the settings file whenever the capture settings
-/// or mouse mode change. A single task owns every write so two sessions
-/// changing settings at once can't interleave partial writes.
-pub async fn run(path: PathBuf, mut capture_rx: watch::Receiver<CaptureSettings>, mut mouse_mode_rx: watch::Receiver<MouseMode>) {
-    loop {
-        tokio::select! {
-            result = capture_rx.changed() => {
-                if result.is_err() { return; }
-            }
-            result = mouse_mode_rx.changed() => {
-                if result.is_err() { return; }
-            }
-        }
-        let settings = PersistedSettings { capture: *capture_rx.borrow(), mouse_mode: *mouse_mode_rx.borrow() };
-        let path = path.clone();
-        tokio::task::spawn_blocking(move || save(&path, settings));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::capture::v4l2::Resolution;
-    use crate::config::VideoMode;
+    use crate::config::{CaptureSettings, MouseMode, VideoMode};
 
     #[test]
     fn round_trips_through_a_file() {

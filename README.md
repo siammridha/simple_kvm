@@ -81,16 +81,17 @@ kernel works regardless of what (if anything) is managing devices. A slow,
 infrequent poll still runs alongside it as a safety net in case that
 listener can't be opened.
 
-**Dropdown changes are saved automatically** - there's no separate "save"
-step required. Changing video mode, resolution, or mouse mode applies
-immediately (as before) and is also written to a small settings file on
-disk, so the next time the service starts (e.g. after a reboot) it comes
-back up with the same choices instead of resetting to the capture card's
-defaults. If you reload the page, the dropdowns show whatever the server
-is actually using right now. A **Save settings** button is there too, for
-a visible confirmation that the current choices are on disk - it writes
-the same file the automatic save does, so it's a manual double-check, not
-a required step.
+**Dropdown changes are not saved automatically.** Changing video mode,
+resolution, or mouse mode applies immediately, but the choice is only
+written to the settings file on disk when you click **Save settings** -
+that button sends a plain `POST /api/settings/save` request (a normal
+HTTPS call, not through the WebTransport connection) that writes whatever
+is in effect right now. If you reload the page without saving, the
+dropdowns still show whatever the server is actually using right now
+(nothing is lost mid-session) - but if the service restarts (e.g. after a
+reboot) without a save having happened first, it comes back up with
+whatever was last saved, or the capture card's own defaults if nothing
+ever was.
 
 ### TLS for the page and the video/input connection
 
@@ -190,7 +191,8 @@ if you need to change one):
 | `WEBTRANSPORT_PORT` | `4433` | UDP port for the video/input connection |
 | `TLS_SAN` | `localhost` | Comma-separated subject names for the self-signed cert |
 | `TLS_CERT_PATH`, `TLS_KEY_PATH` | unset | Use a specific cert/key PEM pair instead of generating a self-signed one. Set both to enable; loaded once at startup and never auto-rotated - that's on whoever manages the file pair. |
-| `SETTINGS_PATH` | `/etc/simple_kvm-settings.json` | Where video mode/resolution/mouse mode are saved whenever a dropdown changes, and read back on the next startup. |
+| `SETTINGS_PATH` | `/etc/simple_kvm-settings.json` | Where video mode/resolution/mouse mode are written when you click **Save settings** on the page, and read back on the next startup. |
+| `RUST_LOG` | `info` | Standard `tracing` log filter. Every keystroke/click is logged at `debug` (e.g. `RUST_LOG=debug` or `RUST_LOG=info,simple_kvm::webtransport::session=debug,simple_kvm::ch9329::writer=debug`) - useful for tracking down input lag, since each log line includes how long that event took to queue/write. A command that takes more than 50ms logs at `warn` even at the default level, so a slow one shows up without turning this on first. |
 
 ## Releasing a new version
 

@@ -28,6 +28,10 @@ const KEY_HOLD_DELAY: Duration = Duration::from_millis(20);
 /// notification was somehow missed) — mirrors `capture`'s
 /// `DEVICE_POLL_INTERVAL` for the same reason.
 const CONNECTION_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Above this, `handle` logs at `warn` instead of `debug` — visible in the
+/// log at the default level, so a slow CH9329 write shows up without
+/// needing `RUST_LOG=debug` turned on first.
+const SLOW_COMMAND_THRESHOLD: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone)]
 pub enum SerialCommand {
@@ -52,6 +56,19 @@ pub enum SerialCommand {
     /// so a reconnect is noticed immediately instead of waiting for the
     /// next real keystroke or click.
     CheckConnection,
+}
+
+impl SerialCommand {
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            SerialCommand::KeyReport { .. } => "key_report",
+            SerialCommand::MouseAbsoluteMove { .. } => "mouse_absolute_move",
+            SerialCommand::MouseButtons { .. } => "mouse_buttons",
+            SerialCommand::MouseRelativeMove { .. } => "mouse_relative_move",
+            SerialCommand::PasteText(_) => "paste_text",
+            SerialCommand::CheckConnection => "check_connection",
+        }
+    }
 }
 
 /// Opens the CH9329's serial port. Returns `Ok(None)` (not an error) if no
@@ -112,6 +129,8 @@ impl SerialWriter {
     }
 
     fn handle(&mut self, cmd: SerialCommand) {
+        let start = std::time::Instant::now();
+        let kind = cmd.kind();
         self.sync_connection_state();
         if self.port.is_none() {
             return;
@@ -135,6 +154,12 @@ impl SerialWriter {
         if let Err(err) = result {
             tracing::error!(%err, "failed to write CH9329 command, dropping the connection until it reconnects");
             self.port = None;
+        }
+        let elapsed = start.elapsed();
+        if elapsed > SLOW_COMMAND_THRESHOLD {
+            tracing::warn!(kind, elapsed_ms = elapsed.as_millis(), "CH9329 command took longer than expected to write");
+        } else {
+            tracing::debug!(kind, elapsed_ms = elapsed.as_millis(), "wrote CH9329 command");
         }
     }
 

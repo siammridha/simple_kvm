@@ -8,6 +8,7 @@
 
 use anyhow::Result;
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use wtransport::{Connection, RecvStream};
 
@@ -123,19 +124,33 @@ async fn send_frame(connection: &Connection, kind: FrameKind, data: &[u8]) -> Re
     Ok(())
 }
 
+/// Above this, the queue-time log below fires at `warn` instead of `debug`
+/// — a slow enqueue means the CH9329 writer task is falling behind, which
+/// is exactly what shows up as "typing/clicking lags".
+const SLOW_ENQUEUE_THRESHOLD: Duration = Duration::from_millis(50);
+
 async fn handle_input_event(event: InputEvent, keyboard: &mut KeyboardState, ctx: &SessionContext) {
+    let start = Instant::now();
     let cmd = match event {
         InputEvent::KeyEvent { pressed, code } => {
             let Some((modifiers, keys)) = keyboard.apply(&code, pressed) else {
                 return;
             };
+            tracing::debug!(code = %code, pressed, "typing: key event received from browser");
             SerialCommand::KeyReport { modifiers, keys }
         }
         InputEvent::MouseAbsoluteMove { x_frac, y_frac } => SerialCommand::MouseAbsoluteMove { x_frac, y_frac },
         InputEvent::MouseRelativeMove { buttons, dx, dy, wheel } => SerialCommand::MouseRelativeMove { buttons, dx, dy, wheel },
         InputEvent::MouseButtons { buttons, wheel } => SerialCommand::MouseButtons { buttons, wheel },
     };
-    let _ = ctx.serial_tx.send(cmd).await;
+    let kind = cmd.kind();
+    let sent = ctx.serial_tx.send(cmd).await.is_ok();
+    let elapsed = start.elapsed();
+    if elapsed > SLOW_ENQUEUE_THRESHOLD {
+        tracing::warn!(kind, sent, elapsed_ms = elapsed.as_millis(), "input event took longer than expected to queue for CH9329");
+    } else {
+        tracing::debug!(kind, sent, elapsed_ms = elapsed.as_millis(), "queued input event for CH9329");
+    }
 }
 
 fn handle_control_message(msg: ControlMessage, ctx: &SessionContext) {
@@ -165,14 +180,6 @@ fn handle_control_message(msg: ControlMessage, ctx: &SessionContext) {
             tokio::spawn(async move {
                 let _ = tx.send(SerialCommand::PasteText(text)).await;
             });
-        }
-        // Dropdown changes already persist themselves via `send_modify`/
-        // `send_replace` above — this just re-triggers the same write
-        // with the current (unchanged) values, so the Save button has
-        // something real to point at instead of being purely cosmetic.
-        ControlMessage::SaveSettings => {
-            ctx.capture_settings_tx.send_modify(|_| {});
-            ctx.mouse_mode_tx.send_modify(|_| {});
         }
     }
 }

@@ -1,20 +1,24 @@
 //! The HTTPS page server on port 3000: serves the page/JS/CSS (embedded
 //! in the binary — no files to copy alongside it, matching the
-//! single-binary install model) plus two small JSON endpoints the page
-//! needs before it can open its WebTransport session: the resolutions the
-//! capture card actually supports, and the current TLS certificate hash.
-//! HTTPS (not plain HTTP) because browsers only expose the `WebTransport`
-//! API on a secure context — see `crate::tls` for the shared identity.
+//! single-binary install model) plus the small JSON endpoints the page
+//! needs: the resolutions the capture card actually supports, the current
+//! TLS certificate hash, and (on demand, from the Save button) writing the
+//! current settings to disk. HTTPS (not plain HTTP) because browsers only
+//! expose the `WebTransport` API on a secure context — see `crate::tls`
+//! for the shared identity.
 
 use axum::extract::State;
-use axum::http::header;
+use axum::http::{header, StatusCode};
 use axum::response::Html;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Serialize;
+use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::watch;
 
-use crate::config::{MouseMode, VideoMode};
+use crate::config::{CaptureSettings, MouseMode, PersistedSettings, VideoMode};
+use crate::settings_store;
 use crate::tls::{self, CertManager};
 
 const INDEX_HTML: &str = include_str!("../../assets/web/index.html");
@@ -45,6 +49,12 @@ pub struct AppState {
     /// whichever `<option>` happens to be listed first.
     pub video_mode: VideoMode,
     pub mouse_mode: MouseMode,
+    /// Live settings, read at save time (not just startup) so `POST
+    /// /api/settings/save` always writes whatever's actually in effect
+    /// right now, including changes made since the page loaded.
+    pub capture_settings_rx: watch::Receiver<CaptureSettings>,
+    pub mouse_mode_rx: watch::Receiver<MouseMode>,
+    pub settings_path: PathBuf,
 }
 
 #[derive(Serialize)]
@@ -69,6 +79,7 @@ pub fn router(state: AppState) -> Router {
         .route("/style.css", get(|| async { ([(header::CONTENT_TYPE, "text/css")], STYLE_CSS) }))
         .route("/api/config", get(config_handler))
         .route("/api/cert-info", get(cert_info_handler))
+        .route("/api/settings/save", post(save_settings_handler))
         .with_state(state)
 }
 
@@ -86,4 +97,20 @@ async fn config_handler(State(state): State<AppState>) -> Json<ConfigResponse> {
 async fn cert_info_handler(State(state): State<AppState>) -> Json<CertInfoResponse> {
     let identity = state.cert_manager.current();
     Json(CertInfoResponse { hash: tls::cert_hash(&identity) })
+}
+
+/// Writes whatever video mode/resolution/mouse mode are in effect right
+/// now to the settings file — the only way the file gets written, since
+/// dropdown changes themselves no longer save automatically (see
+/// `settings_store`).
+async fn save_settings_handler(State(state): State<AppState>) -> StatusCode {
+    let settings = PersistedSettings { capture: *state.capture_settings_rx.borrow(), mouse_mode: *state.mouse_mode_rx.borrow() };
+    let path = state.settings_path.clone();
+    match tokio::task::spawn_blocking(move || settings_store::save(&path, settings)).await {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(err) => {
+            tracing::error!(%err, "settings save task panicked");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
 }
