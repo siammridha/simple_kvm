@@ -44,6 +44,10 @@ ip>:3000` with:
 - **Resolution dropdown**, populated from whatever the capture card
   actually reports supporting (queried at startup) - not a hardcoded
   list.
+- **Frame rate dropdown** (5, 10, or 25 fps, default 5) - sent to the
+  capture card via V4L2's frame-interval negotiation. The card is free to
+  negotiate a different rate than requested; a mismatch is logged, not
+  shown on the page.
 - **Mouse clicks and scroll wheel**, absolute or relative mode
   switchable live; on the CH9329 hardware this repo was built against,
   clicks and scroll wheel only work through its *relative* HID report,
@@ -67,9 +71,9 @@ recover on their own once reconnected, no restart needed: the CH9329
 silently drops input while it's gone and reconnects as soon as it's
 plugged back in (noticed immediately, not just on the next key or click -
 see below); the capture card pauses video the same way and resumes
-streaming once it's replugged (the page itself only picks up the "video is
-back" state on its next load or reconnect, since the resolution dropdown
-is filled in when the page connects, not continuously).
+streaming once it's replugged. The page picks this up live, too - the
+resolution dropdown and "no video device" status update immediately on an
+already-open tab, not just on the next load or reconnect.
 
 Both the capture card's and the CH9329's reconnects are noticed
 immediately: the server listens directly on the Linux kernel's own
@@ -82,16 +86,16 @@ infrequent poll still runs alongside it as a safety net in case that
 listener can't be opened.
 
 **Dropdown changes are not saved automatically.** Changing video mode,
-resolution, or mouse mode applies immediately, but the choice is only
-written to the settings file on disk when you click **Save settings** -
-that button sends a plain `POST /api/settings/save` request (a normal
-HTTPS call, not through the WebTransport connection) that writes whatever
-is in effect right now. If you reload the page without saving, the
-dropdowns still show whatever the server is actually using right now
-(nothing is lost mid-session) - but if the service restarts (e.g. after a
-reboot) without a save having happened first, it comes back up with
-whatever was last saved, or the capture card's own defaults if nothing
-ever was.
+frame rate, resolution, or mouse mode applies immediately, but the choice
+is only written to the settings file on disk when you click **Save
+settings** - that button sends a plain `POST /api/settings/save` request
+(a normal HTTPS call, not through the WebTransport connection) that
+writes whatever is in effect right now. If you reload the page without
+saving, the dropdowns still show whatever the server is actually using
+right now (nothing is lost mid-session) - but if the service restarts
+(e.g. after a reboot) without a save having happened first, it comes back
+up with whatever was last saved, or the capture card's own defaults if
+nothing ever was.
 
 ### TLS for the page and the video/input connection
 
@@ -194,7 +198,7 @@ if you need to change one):
 | `WEBTRANSPORT_PORT` | `4433` | UDP port for the video/input connection |
 | `TLS_SAN` | `localhost` | Comma-separated subject names for the self-signed cert |
 | `TLS_CERT_PATH`, `TLS_KEY_PATH` | unset | Use a specific cert/key PEM pair instead of generating a self-signed one. Set both to enable; loaded once at startup and never auto-rotated - that's on whoever manages the file pair. |
-| `SETTINGS_PATH` | `/etc/simple_kvm-settings.json` | Where video mode/resolution/mouse mode are written when you click **Save settings** on the page, and read back on the next startup. |
+| `SETTINGS_PATH` | `/etc/simple_kvm-settings.json` | Where video mode/frame rate/resolution/mouse mode are written when you click **Save settings** on the page, and read back on the next startup. |
 | `RUST_LOG` | `info,simple_kvm::webtransport::session=debug,simple_kvm::ch9329::writer=debug` | Standard `tracing` log filter. By default, every keystroke/click is already logged at `debug` - no configuration needed first - since each log line includes how long that event took to queue/write, which is useful for tracking down input lag. A command that takes more than 50ms logs at `warn` regardless. Setting `RUST_LOG` yourself (e.g. `RUST_LOG=debug` for everything, or `RUST_LOG=warn` to quiet the per-keystroke lines) fully overrides the default above. |
 
 ## Releasing a new version

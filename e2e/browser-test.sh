@@ -47,8 +47,8 @@ agent-browser wait --load load
 
 DROPDOWN_COUNT=$(agent-browser get count select)
 echo "dropdowns found: $DROPDOWN_COUNT"
-if [ "$DROPDOWN_COUNT" -ne 3 ]; then
-	echo "FAIL: expected 3 dropdowns (video mode, resolution, mouse mode), got $DROPDOWN_COUNT" >&2
+if [ "$DROPDOWN_COUNT" -ne 4 ]; then
+	echo "FAIL: expected 4 dropdowns (video mode, frame rate, resolution, mouse mode), got $DROPDOWN_COUNT" >&2
 	exit 1
 fi
 

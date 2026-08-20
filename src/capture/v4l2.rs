@@ -15,6 +15,7 @@ use v4l::buffer::Type as BufferType;
 use v4l::format::FourCC;
 use v4l::io::mmap::Stream as MmapStream;
 use v4l::io::traits::CaptureStream;
+use v4l::video::capture::Parameters;
 use v4l::video::Capture;
 use v4l::{Device, Format};
 
@@ -119,6 +120,7 @@ pub fn run_capture_loop<H>(
     path: &str,
     pixel_format: PixelFormat,
     resolution: Resolution,
+    fps: u32,
     mut should_stop: impl FnMut() -> bool,
     make_handler: impl FnOnce(Resolution) -> H,
 ) -> Result<()>
@@ -129,6 +131,16 @@ where
     let requested = Format::new(resolution.width, resolution.height, pixel_format.fourcc());
     let actual = dev.set_format(&requested).context("negotiating capture format")?;
     let actual_resolution = Resolution { width: actual.width, height: actual.height };
+
+    match dev.set_params(&Parameters::with_fps(fps)) {
+        Ok(actual_params) => {
+            if let Some(actual_fps) = fps_mismatch(fps, actual_params.interval) {
+                tracing::warn!(requested_fps = fps, actual_fps, "capture device negotiated a different frame rate than requested");
+            }
+        }
+        Err(err) => tracing::warn!(%err, requested_fps = fps, "failed to set capture frame rate, continuing at device default"),
+    }
+
     let mut on_frame = make_handler(actual_resolution);
 
     let mut stream = MmapStream::with_buffers(&dev, BufferType::VideoCapture, 4).context("starting mmap capture stream")?;
@@ -142,6 +154,18 @@ where
         }
     }
     Ok(())
+}
+
+/// `None` if `interval` matches `requested` fps (or is degenerate); `Some`
+/// with the actual negotiated fps otherwise, for a warn-level log — unlike
+/// resolution, nothing downstream sizes a buffer from fps, so a log line is
+/// the only way a driver-side mismatch is ever observable.
+fn fps_mismatch(requested: u32, interval: v4l::fraction::Fraction) -> Option<u32> {
+    if interval.numerator == 0 {
+        return None;
+    }
+    let actual_fps = interval.denominator / interval.numerator;
+    (actual_fps != requested).then_some(actual_fps)
 }
 
 #[cfg(test)]
@@ -182,5 +206,20 @@ mod tests {
     #[test]
     fn no_supported_formats_returns_none() {
         assert_eq!(pick_default(&[]), None);
+    }
+
+    #[test]
+    fn fps_mismatch_reports_when_driver_negotiated_differently() {
+        assert_eq!(fps_mismatch(10, v4l::fraction::Fraction::new(1, 5)), Some(5));
+    }
+
+    #[test]
+    fn fps_mismatch_is_none_when_matched() {
+        assert_eq!(fps_mismatch(5, v4l::fraction::Fraction::new(1, 5)), None);
+    }
+
+    #[test]
+    fn fps_mismatch_is_none_for_degenerate_interval() {
+        assert_eq!(fps_mismatch(5, v4l::fraction::Fraction::new(0, 0)), None);
     }
 }

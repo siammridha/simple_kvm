@@ -3,7 +3,7 @@
 //! bidirectional control stream per session for low-frequency settings
 //! changes and paste submissions.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Parsed from a WebTransport datagram. Loss-tolerant by design — the
 /// next event supersedes a dropped one for mouse moves, and a dropped key
@@ -58,8 +58,18 @@ impl InputEvent {
 pub enum ControlMessage {
     SetVideoMode { mode: VideoModeWire },
     SetResolution { width: u32, height: u32 },
+    SetFrameRate { fps: u32 },
     SetMouseMode { mode: MouseModeWire },
     Paste { text: String },
+}
+
+/// Server-to-client messages, pushed down the same control stream's send
+/// half whenever server-side state changes that the page can't otherwise
+/// learn about without a reload (see `session::handle`'s device-state arm).
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerMessage {
+    DeviceState(crate::config::DeviceState),
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -121,5 +131,8 @@ mod tests {
 
         let msg: ControlMessage = serde_json::from_str(r#"{"type":"paste","text":"hi"}"#).unwrap();
         assert!(matches!(msg, ControlMessage::Paste { text } if text == "hi"));
+
+        let msg: ControlMessage = serde_json::from_str(r#"{"type":"set_frame_rate","fps":10}"#).unwrap();
+        assert!(matches!(msg, ControlMessage::SetFrameRate { fps: 10 }));
     }
 }

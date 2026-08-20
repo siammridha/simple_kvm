@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
-use crate::config::{CaptureSettings, VideoMode};
+use crate::config::{CaptureSettings, DeviceState, VideoMode};
 use crate::uevent;
 use crate::video_bus::{self, FrameEnvelope, FrameKind};
 use v4l2::{PixelFormat, SupportedFormat};
@@ -28,7 +28,7 @@ pub struct CaptureManager {
 
 impl CaptureManager {
     /// Probes `device_path` for its supported formats, once, for the
-    /// startup snapshot (`is_available`/`default_settings`/etc. below —
+    /// startup snapshot (`device_state`/`default_settings`/etc. below —
     /// used to build the page's initial state). Never fails — if there's
     /// no capture device (e.g. in the devcontainer), `formats` is just
     /// empty. `run` below does its own live presence checking and doesn't
@@ -41,28 +41,17 @@ impl CaptureManager {
         Self { device_path: device_path.to_string(), formats }
     }
 
-    pub fn is_available(&self) -> bool {
-        !self.formats.is_empty()
-    }
-
     pub fn default_settings(&self) -> Option<CaptureSettings> {
         let (_pixel_format, resolution) = v4l2::pick_default(&self.formats)?;
-        Some(CaptureSettings { video_mode: VideoMode::Mjpeg, resolution })
+        Some(CaptureSettings { video_mode: VideoMode::Mjpeg, resolution, fps: 5 })
     }
 
-    /// The resolutions available in whichever pixel format `video_mode`
-    /// would actually use (see `pixel_format_for`). Used to build the
-    /// resolution dropdown so it matches whatever video mode the page
-    /// starts in, including a persisted mode from `settings_store`.
-    pub fn resolutions_for(&self, video_mode: VideoMode) -> Vec<v4l2::Resolution> {
-        let Some(pixel_format) = pixel_format_for(&self.formats, video_mode) else {
-            return Vec::new();
-        };
-        self.formats
-            .iter()
-            .find(|f| f.pixel_format == pixel_format)
-            .map(|f| f.resolutions.clone())
-            .unwrap_or_default()
+    /// The card's current availability and resolution list for `settings`'s
+    /// video mode — the startup snapshot used to seed the `DeviceState`
+    /// watch channel. `run`'s hot-plug loop recomputes the same thing live
+    /// via the free function `device_state_for` below.
+    pub fn device_state(&self, settings: &CaptureSettings) -> DeviceState {
+        device_state_for(&self.formats, settings)
     }
 
     /// Whether the card can actually run in `video_mode` at `resolution`.
@@ -80,7 +69,7 @@ impl CaptureManager {
     /// capture loop whenever `settings` changes and publishes frames onto
     /// `video_bus`; whenever it's absent (never plugged in, or unplugged
     /// mid-session), polls until it reappears instead of exiting for good.
-    pub async fn run(self, mut settings: watch::Receiver<CaptureSettings>, video_bus: video_bus::Sender) {
+    pub async fn run(self, mut settings: watch::Receiver<CaptureSettings>, video_bus: video_bus::Sender, device_state_tx: watch::Sender<DeviceState>) {
         let device_path = self.device_path;
         let mut known_present = false;
         let mut uevents = match uevent::UeventListener::open() {
@@ -96,6 +85,7 @@ impl CaptureManager {
                 if known_present {
                     tracing::warn!(device_path = %device_path, "capture device disconnected, pausing video until it reconnects");
                     known_present = false;
+                    let _ = device_state_tx.send(DeviceState::default());
                 }
                 if wait_for_device_or_shutdown(&device_path, &mut settings, &mut uevents).await.is_err() {
                     break;
@@ -117,6 +107,16 @@ impl CaptureManager {
             }
 
             let current = *settings.borrow();
+            let new_state = device_state_for(&formats, &current);
+            device_state_tx.send_if_modified(|s| {
+                if *s == new_state {
+                    false
+                } else {
+                    *s = new_state;
+                    true
+                }
+            });
+
             let device_path_task = device_path.clone();
             let stop = Arc::new(AtomicBool::new(false));
             let stop_task = Arc::clone(&stop);
@@ -204,7 +204,7 @@ fn run_one_pass(
     // negotiated resolution (which the driver is free to pick differently
     // than what was requested) — sizing the JPEG/H.264 conversion buffers
     // from anything else risks reading past the end of a real frame.
-    let result = v4l2::run_capture_loop(device_path, pixel_format, settings.resolution, || stop.load(Ordering::Relaxed), move |actual_resolution| {
+    let result = v4l2::run_capture_loop(device_path, pixel_format, settings.resolution, settings.fps, || stop.load(Ordering::Relaxed), move |actual_resolution| {
         let mut h264_encoder = if video_mode == VideoMode::H264 {
             match h264::H264Encoder::new(actual_resolution.width, actual_resolution.height) {
                 Ok(encoder) => Some(encoder),
@@ -266,4 +266,19 @@ fn pixel_format_for(formats: &[SupportedFormat], video_mode: VideoMode) -> Optio
         VideoMode::H264 if has(PixelFormat::Yuyv) => Some(PixelFormat::Yuyv),
         _ => None,
     }
+}
+
+/// Shared by `CaptureManager::device_state` (the startup snapshot) and
+/// `run`'s hot-plug loop (recomputed fresh on every reconnect) — kept as a
+/// free function over plain `&[SupportedFormat]` so both call sites can use
+/// it without needing a full `CaptureManager` instance.
+fn device_state_for(formats: &[SupportedFormat], settings: &CaptureSettings) -> DeviceState {
+    if formats.is_empty() {
+        return DeviceState::default();
+    }
+    let resolutions = pixel_format_for(formats, settings.video_mode)
+        .and_then(|pf| formats.iter().find(|f| f.pixel_format == pf))
+        .map(|f| f.resolutions.clone())
+        .unwrap_or_default();
+    DeviceState { available: true, resolutions, default_resolution: Some(settings.resolution) }
 }

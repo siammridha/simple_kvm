@@ -15,16 +15,17 @@ use wtransport::{Connection, RecvStream};
 use crate::capture::v4l2::Resolution;
 use crate::ch9329::keymap::{self, KeyCode};
 use crate::ch9329::writer::SerialCommand;
-use crate::config::{CaptureSettings, MouseMode, VideoMode};
+use crate::config::{CaptureSettings, DeviceState, MouseMode, VideoMode};
 use crate::video_bus::{self, FrameKind};
 
-use super::protocol::{ControlMessage, InputEvent, MouseModeWire, VideoModeWire};
+use super::protocol::{ControlMessage, InputEvent, MouseModeWire, ServerMessage, VideoModeWire};
 
 pub struct SessionContext {
     pub video_bus: video_bus::Receiver,
     pub serial_tx: mpsc::Sender<SerialCommand>,
     pub capture_settings_tx: watch::Sender<CaptureSettings>,
     pub mouse_mode_tx: watch::Sender<MouseMode>,
+    pub device_state_rx: watch::Receiver<DeviceState>,
 }
 
 #[derive(Default)]
@@ -62,6 +63,7 @@ impl KeyboardState {
 
 pub async fn handle(connection: Connection, ctx: SessionContext) -> Result<()> {
     let mut video_rx = ctx.video_bus.clone();
+    let mut device_state_rx = ctx.device_state_rx.clone();
     let mut keyboard = KeyboardState::default();
     let mut control: Option<(wtransport::SendStream, RecvStream)> = None;
     let mut control_buf: Vec<u8> = Vec::new();
@@ -106,6 +108,20 @@ pub async fn handle(connection: Connection, ctx: SessionContext) -> Result<()> {
                         }
                     }
                     None => control = None,
+                }
+            }
+            changed = device_state_rx.changed(), if control.is_some() => {
+                if changed.is_ok() {
+                    let state = device_state_rx.borrow_and_update().clone();
+                    if let Some((send, _)) = control.as_mut() {
+                        let msg = ServerMessage::DeviceState(state);
+                        if let Ok(mut line) = serde_json::to_string(&msg) {
+                            line.push('\n');
+                            if send.write_all(line.as_bytes()).await.is_err() {
+                                control = None;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -163,6 +179,9 @@ fn handle_control_message(msg: ControlMessage, ctx: &SessionContext) {
         }),
         ControlMessage::SetResolution { width, height } => {
             ctx.capture_settings_tx.send_modify(|s| s.resolution = Resolution { width, height });
+        }
+        ControlMessage::SetFrameRate { fps } => {
+            ctx.capture_settings_tx.send_modify(|s| s.fps = fps);
         }
         // The server doesn't need mouse mode to translate input events —
         // that's purely which datagram variant the client sends (see

@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::watch;
 
-use crate::config::{CaptureSettings, MouseMode, PersistedSettings, VideoMode};
+use crate::config::{CaptureSettings, DeviceState, MouseMode, PersistedSettings, VideoMode};
 use crate::settings_store;
 use crate::tls::{self, CertManager};
 
@@ -25,21 +25,12 @@ const INDEX_HTML: &str = include_str!("../../assets/web/index.html");
 const APP_JS: &str = include_str!("../../assets/web/app.js");
 const STYLE_CSS: &str = include_str!("../../assets/web/style.css");
 
-#[derive(Debug, Clone, Copy, Serialize)]
-pub struct ResolutionOption {
-    pub width: u32,
-    pub height: u32,
-}
-
 #[derive(Clone)]
 pub struct AppState {
-    pub video_available: bool,
-    pub resolutions: Arc<Vec<ResolutionOption>>,
-    /// The resolution actually in effect for the first stream a session
-    /// gets (see `CaptureManager::default_format_resolutions`) — the page
-    /// pre-selects this in the dropdown rather than just assuming
-    /// whichever resolution happens to be listed first.
-    pub default_resolution: Option<ResolutionOption>,
+    /// Live capture-card presence/resolution list — read fresh on every
+    /// `/api/config` call, so this reflects a hot-plug/unplug that happened
+    /// after startup instead of a frozen snapshot from server boot.
+    pub device_state_rx: watch::Receiver<DeviceState>,
     pub webtransport_port: u16,
     pub cert_manager: Arc<CertManager>,
     /// The video/mouse mode the server actually started with — either a
@@ -48,6 +39,7 @@ pub struct AppState {
     /// dropdowns to match reality instead of always defaulting to
     /// whichever `<option>` happens to be listed first.
     pub video_mode: VideoMode,
+    pub fps: u32,
     pub mouse_mode: MouseMode,
     /// Live settings, read at save time (not just startup) so `POST
     /// /api/settings/save` always writes whatever's actually in effect
@@ -59,11 +51,11 @@ pub struct AppState {
 
 #[derive(Serialize)]
 struct ConfigResponse {
-    video_available: bool,
-    resolutions: Vec<ResolutionOption>,
-    default_resolution: Option<ResolutionOption>,
+    #[serde(flatten)]
+    device_state: DeviceState,
     webtransport_port: u16,
     video_mode: VideoMode,
+    fps: u32,
     mouse_mode: MouseMode,
     version: &'static str,
 }
@@ -93,11 +85,10 @@ pub fn router(state: AppState) -> Router {
 
 async fn config_handler(State(state): State<AppState>) -> Json<ConfigResponse> {
     Json(ConfigResponse {
-        video_available: state.video_available,
-        resolutions: (*state.resolutions).clone(),
-        default_resolution: state.default_resolution,
+        device_state: state.device_state_rx.borrow().clone(),
         webtransport_port: state.webtransport_port,
         video_mode: state.video_mode,
+        fps: state.fps,
         mouse_mode: state.mouse_mode,
         version: env!("CARGO_PKG_VERSION"),
     })

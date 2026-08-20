@@ -19,6 +19,19 @@ pub enum VideoMode {
 pub struct CaptureSettings {
     pub video_mode: VideoMode,
     pub resolution: Resolution,
+    pub fps: u32,
+}
+
+/// Live state of the capture card itself — whether it's plugged in right
+/// now, and what it supports. Published by `CaptureManager::run`'s hot-plug
+/// loop over a `watch` channel so the web page (both a fresh `/api/config`
+/// load and an already-open tab, via a control-stream push) reflects a
+/// hot-plug/unplug instead of being frozen at server-startup values.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct DeviceState {
+    pub available: bool,
+    pub resolutions: Vec<Resolution>,
+    pub default_resolution: Option<Resolution>,
 }
 
 /// Mouse mode doesn't affect the capture pipeline — it's purely which

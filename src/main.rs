@@ -52,7 +52,6 @@ async fn main() -> Result<()> {
     // stays unavailable (soft "no device" state), so the rest of the
     // server still starts and the page still loads. ---
     let capture_manager = CaptureManager::probe(&video_path);
-    let video_available = capture_manager.is_available();
 
     // A settings file from a previous run wins over the capture card's own
     // default, but only if the card on hand can actually still run it —
@@ -62,17 +61,11 @@ async fn main() -> Result<()> {
     let default_capture_settings = persisted_capture.or_else(|| capture_manager.default_settings()).unwrap_or(CaptureSettings {
         video_mode: VideoMode::Mjpeg,
         resolution: Resolution { width: 1280, height: 720 },
+        fps: 5,
     });
     let default_mouse_mode = persisted.map(|p| p.mouse_mode).unwrap_or(MouseMode::Absolute);
 
-    let resolutions: Vec<web::ResolutionOption> = capture_manager
-        .resolutions_for(default_capture_settings.video_mode)
-        .iter()
-        .map(|r| web::ResolutionOption { width: r.width, height: r.height })
-        .collect();
-    let default_resolution =
-        video_available.then_some(web::ResolutionOption { width: default_capture_settings.resolution.width, height: default_capture_settings.resolution.height });
-
+    let (device_state_tx, device_state_rx) = watch::channel(capture_manager.device_state(&default_capture_settings));
     let (capture_settings_tx, capture_settings_rx) = watch::channel(default_capture_settings);
     let (mouse_mode_tx, mouse_mode_rx) = watch::channel(default_mouse_mode);
     let (video_bus_tx, video_bus_rx) = video_bus::channel();
@@ -93,12 +86,11 @@ async fn main() -> Result<()> {
     });
 
     let app_state = web::AppState {
-        video_available,
-        resolutions: Arc::new(resolutions),
-        default_resolution,
+        device_state_rx: device_state_rx.clone(),
         webtransport_port,
         cert_manager: Arc::clone(&cert_manager),
         video_mode: default_capture_settings.video_mode,
+        fps: default_capture_settings.fps,
         mouse_mode: default_mouse_mode,
         capture_settings_rx: capture_settings_rx.clone(),
         mouse_mode_rx,
@@ -113,10 +105,10 @@ async fn main() -> Result<()> {
         }
     });
 
-    let capture_handle = tokio::spawn(capture_manager.run(capture_settings_rx, video_bus_tx));
+    let capture_handle = tokio::spawn(capture_manager.run(capture_settings_rx, video_bus_tx, device_state_tx));
 
     let webtransport_handle = tokio::spawn(async move {
-        if let Err(err) = webtransport::serve(webtransport_port, cert_manager, video_bus_rx, serial_tx, capture_settings_tx, mouse_mode_tx).await {
+        if let Err(err) = webtransport::serve(webtransport_port, cert_manager, video_bus_rx, serial_tx, capture_settings_tx, mouse_mode_tx, device_state_rx).await {
             tracing::error!(%err, "WebTransport server exited");
         }
     });

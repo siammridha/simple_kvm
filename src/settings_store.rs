@@ -49,7 +49,7 @@ mod tests {
         let path = dir.join("settings.json");
 
         let settings = PersistedSettings {
-            capture: CaptureSettings { video_mode: VideoMode::H264, resolution: Resolution { width: 1280, height: 720 } },
+            capture: CaptureSettings { video_mode: VideoMode::H264, resolution: Resolution { width: 1280, height: 720 }, fps: 25 },
             mouse_mode: MouseMode::Relative,
         };
         save(&path, settings);
@@ -57,6 +57,7 @@ mod tests {
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.capture.video_mode, VideoMode::H264);
         assert_eq!(loaded.capture.resolution, Resolution { width: 1280, height: 720 });
+        assert_eq!(loaded.capture.fps, 25);
         assert_eq!(loaded.mouse_mode, MouseMode::Relative);
 
         std::fs::remove_dir_all(&dir).ok();

@@ -12,6 +12,7 @@ const statusEl = document.getElementById('status');
 const canvas = document.getElementById('video');
 const ctx2d = canvas.getContext('2d');
 const videoModeSelect = document.getElementById('video-mode');
+const frameRateSelect = document.getElementById('frame-rate');
 const resolutionSelect = document.getElementById('resolution');
 const mouseModeSelect = document.getElementById('mouse-mode');
 const pasteText = document.getElementById('paste-text');
@@ -89,10 +90,11 @@ async function connect() {
   const config = await loadConfig();
   populateResolutions(config.resolutions, config.default_resolution);
   videoModeSelect.value = config.video_mode;
+  frameRateSelect.value = config.fps;
   mouseModeSelect.value = config.mouse_mode;
   versionEl.textContent = `v${config.version}`;
 
-  if (!config.video_available) {
+  if (!config.available) {
     setStatus('no video device found', true);
   }
 
@@ -129,16 +131,33 @@ async function connect() {
 }
 
 async function readControlReplies(readable) {
-  // The server doesn't currently send anything back on the control
-  // stream, but draining it keeps the stream from backing up.
   const reader = readable.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
   try {
     while (true) {
-      const { done } = await reader.read();
+      const { value, done } = await reader.read();
       if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let newlineIndex;
+      while ((newlineIndex = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, newlineIndex);
+        buf = buf.slice(newlineIndex + 1);
+        if (line) handleServerMessage(JSON.parse(line));
+      }
     }
   } catch {
     // Session ending; the top-level reconnect logic handles it.
+  }
+}
+
+function handleServerMessage(msg) {
+  if (msg.type !== 'device_state') return;
+  populateResolutions(msg.resolutions, msg.default_resolution);
+  if (!msg.available) {
+    setStatus('no video device found', true);
+  } else if (statusEl.textContent === 'no video device found') {
+    setStatus('connected');
   }
 }
 
@@ -283,6 +302,7 @@ function wireInput() {
   });
 
   videoModeSelect.addEventListener('change', () => sendControl({ type: 'set_video_mode', mode: videoModeSelect.value }));
+  frameRateSelect.addEventListener('change', () => sendControl({ type: 'set_frame_rate', fps: Number(frameRateSelect.value) }));
   resolutionSelect.addEventListener('change', () => {
     const [width, height] = resolutionSelect.value.split('x').map(Number);
     sendControl({ type: 'set_resolution', width, height });
