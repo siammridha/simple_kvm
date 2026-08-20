@@ -60,20 +60,50 @@ pub fn open(path: &str) -> Result<Option<Box<dyn SerialPort>>> {
 }
 
 pub struct SerialWriter {
-    port: Box<dyn SerialPort>,
+    path: String,
+    port: Option<Box<dyn SerialPort>>,
 }
 
 impl SerialWriter {
-    pub fn new(port: Box<dyn SerialPort>) -> Self {
-        Self { port }
+    pub fn new(path: String) -> Self {
+        Self { path, port: None }
+    }
+
+    /// Checks whether the CH9329 is plugged in right now, and opens or
+    /// drops `self.port` to match — so a write is only attempted while the
+    /// device is actually present, and a stale handle from a device that
+    /// vanished mid-session gets dropped instead of erroring on every
+    /// command after it.
+    fn sync_connection_state(&mut self) {
+        let present = std::path::Path::new(&self.path).exists();
+        match (&self.port, present) {
+            (None, true) => match open(&self.path) {
+                Ok(Some(port)) => {
+                    tracing::info!(path = %self.path, "CH9329 connected");
+                    self.port = Some(port);
+                }
+                Ok(None) => {} // vanished again between the exists() check and opening it
+                Err(err) => tracing::error!(%err, path = %self.path, "failed to open CH9329 serial port"),
+            },
+            (Some(_), false) => {
+                tracing::warn!(path = %self.path, "CH9329 disconnected, pausing writes until it reconnects");
+                self.port = None;
+            }
+            _ => {}
+        }
     }
 
     fn write_packet(&mut self, packet: &[u8]) -> Result<()> {
-        self.port.write_all(packet).context("writing to CH9329 serial port")
+        let port = self.port.as_mut().context("no CH9329 connected")?;
+        port.write_all(packet).context("writing to CH9329 serial port")
     }
 
-    fn handle(&mut self, cmd: SerialCommand) -> Result<()> {
-        match cmd {
+    fn handle(&mut self, cmd: SerialCommand) {
+        self.sync_connection_state();
+        if self.port.is_none() {
+            return;
+        }
+        let result = match cmd {
             SerialCommand::KeyReport { modifiers, keys } => {
                 self.write_packet(&protocol::keyboard_report(modifiers, keys))
             }
@@ -87,6 +117,10 @@ impl SerialWriter {
                 self.write_packet(&protocol::mouse_relative(buttons, dx, dy, wheel))
             }
             SerialCommand::PasteText(text) => self.type_text(&text),
+        };
+        if let Err(err) = result {
+            tracing::error!(%err, "failed to write CH9329 command, dropping the connection until it reconnects");
+            self.port = None;
         }
     }
 
@@ -105,9 +139,7 @@ impl SerialWriter {
     /// (`tokio::task::spawn_blocking`), never on an async task directly.
     pub fn run(mut self, mut commands: mpsc::Receiver<SerialCommand>) {
         while let Some(cmd) = commands.blocking_recv() {
-            if let Err(err) = self.handle(cmd) {
-                tracing::error!(%err, "failed to write CH9329 command");
-            }
+            self.handle(cmd);
         }
     }
 }

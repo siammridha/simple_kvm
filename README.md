@@ -57,15 +57,22 @@ ip>:3000` with:
 The server runs fine with no capture card or CH9329 attached - the page
 still loads, dropdowns just reflect "no video device," and keyboard/mouse
 input is silently dropped instead of the service failing to start. Useful
-for development without the hardware plugged in.
+for development without the hardware plugged in. This also covers the
+CH9329 disconnecting (or failing to write) after the service has already
+started: input is silently dropped while it's gone, and picks back up on
+its own the next time a key or click comes in after it's plugged back in -
+no restart needed.
 
 **Dropdown changes are saved automatically** - there's no separate "save"
-step. Changing video mode, resolution, or mouse mode applies immediately
-(as before) and is also written to a small settings file on disk, so the
-next time the service starts (e.g. after a reboot) it comes back up with
-the same choices instead of resetting to the capture card's defaults. If
-you reload the page, the dropdowns show whatever the server is actually
-using right now.
+step required. Changing video mode, resolution, or mouse mode applies
+immediately (as before) and is also written to a small settings file on
+disk, so the next time the service starts (e.g. after a reboot) it comes
+back up with the same choices instead of resetting to the capture card's
+defaults. If you reload the page, the dropdowns show whatever the server
+is actually using right now. A **Save settings** button is there too, for
+a visible confirmation that the current choices are on disk - it writes
+the same file the automatic save does, so it's a manual double-check, not
+a required step.
 
 ### TLS for the page and the video/input connection
 

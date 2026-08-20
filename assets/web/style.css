@@ -76,3 +76,22 @@ body {
 #paste-send:hover {
   background: #3b7;
 }
+
+#save-settings {
+  padding: 0 0.75rem;
+  border: none;
+  border-radius: 4px;
+  background: #2a6;
+  color: #fff;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+#save-settings:hover {
+  background: #3b7;
+}
+
+#save-settings-status {
+  font-size: 0.85rem;
+  color: #9a9;
+}

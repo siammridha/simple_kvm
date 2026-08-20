@@ -164,6 +164,14 @@ fn handle_control_message(msg: ControlMessage, ctx: &SessionContext) {
                 let _ = tx.send(SerialCommand::PasteText(text)).await;
             });
         }
+        // Dropdown changes already persist themselves via `send_modify`/
+        // `send_replace` above — this just re-triggers the same write
+        // with the current (unchanged) values, so the Save button has
+        // something real to point at instead of being purely cosmetic.
+        ControlMessage::SaveSettings => {
+            ctx.capture_settings_tx.send_modify(|_| {});
+            ctx.mouse_mode_tx.send_modify(|_| {});
+        }
     }
 }
 

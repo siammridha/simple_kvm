@@ -16,6 +16,8 @@ const resolutionSelect = document.getElementById('resolution');
 const mouseModeSelect = document.getElementById('mouse-mode');
 const pasteText = document.getElementById('paste-text');
 const pasteSend = document.getElementById('paste-send');
+const saveSettings = document.getElementById('save-settings');
+const saveSettingsStatus = document.getElementById('save-settings-status');
 
 let controlWriter = null;
 let datagramWriter = null;
@@ -253,6 +255,12 @@ function wireInput() {
   pasteSend.addEventListener('click', () => {
     sendControl({ type: 'paste', text: pasteText.value });
     pasteText.value = '';
+  });
+
+  saveSettings.addEventListener('click', () => {
+    sendControl({ type: 'save_settings' });
+    saveSettingsStatus.textContent = 'Saved';
+    setTimeout(() => { saveSettingsStatus.textContent = ''; }, 2000);
   });
 
   function handleMouseButtons(e) {

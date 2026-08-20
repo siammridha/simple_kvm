@@ -60,6 +60,10 @@ pub enum ControlMessage {
     SetResolution { width: u32, height: u32 },
     SetMouseMode { mode: MouseModeWire },
     Paste { text: String },
+    /// Explicit request from the Save button. Dropdown changes already
+    /// persist on their own — this just re-triggers `settings_store`'s
+    /// write with the current values, for a visible confirmation.
+    SaveSettings,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -121,5 +125,8 @@ mod tests {
 
         let msg: ControlMessage = serde_json::from_str(r#"{"type":"paste","text":"hi"}"#).unwrap();
         assert!(matches!(msg, ControlMessage::Paste { text } if text == "hi"));
+
+        let msg: ControlMessage = serde_json::from_str(r#"{"type":"save_settings"}"#).unwrap();
+        assert!(matches!(msg, ControlMessage::SaveSettings));
     }
 }

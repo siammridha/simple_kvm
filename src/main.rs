@@ -127,36 +127,19 @@ fn env_parsed<T: std::str::FromStr>(key: &str) -> Option<T> {
     env::var(key).ok().and_then(|v| v.parse().ok())
 }
 
-async fn drain_serial_commands(mut rx: mpsc::Receiver<SerialCommand>) {
-    while rx.recv().await.is_some() {
-        // No CH9329 attached: silently discard input commands.
-    }
-}
-
 /// Waits `delay_secs` (giving the CH9329's USB enumeration time to settle,
 /// the same crash-avoidance reasoning as the capture card's boot delay —
-/// see `deploy/install.sh`), then opens the serial port and runs the
-/// writer loop, or drains commands as a no-op if it's not present.
+/// see `deploy/install.sh`), then runs the writer loop. The writer itself
+/// checks whether the CH9329 is actually plugged in before every command,
+/// so it's a no-op whenever the device isn't there and picks back up on
+/// its own once it is — no need to decide that once, up front, here.
 async fn open_serial_after_delay(serial_path: String, delay_secs: u64, serial_rx: mpsc::Receiver<SerialCommand>) {
     if delay_secs > 0 {
         tracing::info!(seconds = delay_secs, "waiting before opening CH9329 serial port");
         tokio::time::sleep(Duration::from_secs(delay_secs)).await;
     }
-    match writer::open(&serial_path) {
-        Ok(Some(port)) => {
-            tracing::info!(serial_path, "opened CH9329 serial port");
-            let writer = writer::SerialWriter::new(port);
-            let _ = tokio::task::spawn_blocking(move || writer.run(serial_rx)).await;
-        }
-        Ok(None) => {
-            tracing::warn!(serial_path, "no CH9329 serial device found, input will be a no-op");
-            drain_serial_commands(serial_rx).await;
-        }
-        Err(err) => {
-            tracing::error!(%err, serial_path, "failed to open CH9329 serial port, input will be a no-op");
-            drain_serial_commands(serial_rx).await;
-        }
-    }
+    let writer = writer::SerialWriter::new(serial_path);
+    let _ = tokio::task::spawn_blocking(move || writer.run(serial_rx)).await;
 }
 
 fn init_logging() {
