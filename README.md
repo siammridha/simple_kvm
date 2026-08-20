@@ -112,6 +112,16 @@ Then open `http://<device ip>:3000` from a browser on the same network.
 **Updating later:** push a new version tag on GitHub, then re-run the same
 `wget ... | sh` command on the device - it always grabs the latest release.
 
+**Why the service waits 30 seconds after boot before starting:** on the
+actual Wyse 3040 this was built and tested against, opening the capture
+card right as it finishes USB enumeration at boot reliably hard-crashes
+the machine (confirmed by repeated testing - starting the service at boot
+crashed it every time; starting the exact same binary the exact same way
+once the system had been up a while never did). The installed service
+waits 30 seconds before starting to avoid that window. If you hit boot
+crashes on different hardware, try increasing the delay in
+`/etc/init.d/simple_kvm`'s `start_pre()`.
+
 ### Configuration
 
 All optional, set as environment variables (e.g. in `/etc/init.d/simple_kvm`
