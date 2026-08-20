@@ -18,6 +18,7 @@ const pasteText = document.getElementById('paste-text');
 const pasteSend = document.getElementById('paste-send');
 
 let controlWriter = null;
+let datagramWriter = null;
 let videoDecoder = null;
 let decoderConfigured = false;
 let reconnectScheduled = false;
@@ -108,12 +109,14 @@ async function connect() {
   await transport.ready;
   setStatus('connected');
 
+  datagramWriter = transport.datagrams.writable.getWriter();
+
   const controlStream = await transport.createBidirectionalStream();
   controlWriter = controlStream.writable.getWriter();
   readControlReplies(controlStream.readable);
 
   readVideoStreams(transport);
-  wireInput(transport);
+  wireInput();
 }
 
 async function readControlReplies(readable) {
@@ -213,31 +216,31 @@ function renderH264(payload) {
   videoDecoder.decode(new EncodedVideoChunk({ type, timestamp: performance.now() * 1000, data: payload }));
 }
 
-function sendDatagram(transport, bytes) {
-  transport.datagrams.writable.getWriter().write(bytes).catch(() => {});
+function sendDatagram(bytes) {
+  datagramWriter.write(bytes).catch(() => {});
 }
 
-function wireInput(transport) {
+function wireInput() {
   canvas.addEventListener('keydown', (e) => {
     e.preventDefault();
-    sendKeyEvent(transport, e.code, true);
+    sendKeyEvent(e.code, true);
   });
   canvas.addEventListener('keyup', (e) => {
     e.preventDefault();
-    sendKeyEvent(transport, e.code, false);
+    sendKeyEvent(e.code, false);
   });
 
-  canvas.addEventListener('mousedown', (e) => handleMouseButtons(transport, e));
-  canvas.addEventListener('mouseup', (e) => handleMouseButtons(transport, e));
+  canvas.addEventListener('mousedown', handleMouseButtons);
+  canvas.addEventListener('mouseup', handleMouseButtons);
   canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 
   canvas.addEventListener('wheel', (e) => {
     e.preventDefault();
     const wheel = clampWheel(-e.deltaY);
     if (mouseModeSelect.value === 'absolute') {
-      sendMouseButtons(transport, buttonMask(e.buttons), wheel);
+      sendMouseButtons(buttonMask(e.buttons), wheel);
     } else {
-      sendMouseRelativeMove(transport, buttonMask(e.buttons), 0, 0, wheel);
+      sendMouseRelativeMove(buttonMask(e.buttons), 0, 0, wheel);
     }
   });
 
@@ -252,11 +255,11 @@ function wireInput(transport) {
     pasteText.value = '';
   });
 
-  function handleMouseButtons(transport, e) {
+  function handleMouseButtons(e) {
     if (mouseModeSelect.value === 'absolute') {
-      sendMouseButtons(transport, buttonMask(e.buttons), 0);
+      sendMouseButtons(buttonMask(e.buttons), 0);
     } else {
-      sendMouseRelativeMove(transport, buttonMask(e.buttons), 0, 0, 0);
+      sendMouseRelativeMove(buttonMask(e.buttons), 0, 0, 0);
     }
   }
 }
@@ -271,31 +274,31 @@ function clampWheel(value) {
   return Math.max(-127, Math.min(127, Math.round(value / 20)));
 }
 
-function sendKeyEvent(transport, code, pressed) {
+function sendKeyEvent(code, pressed) {
   const codeBytes = new TextEncoder().encode(code);
   const bytes = new Uint8Array(2 + codeBytes.length);
   bytes[0] = TAG_KEY_EVENT;
   bytes[1] = pressed ? 1 : 0;
   bytes.set(codeBytes, 2);
-  sendDatagram(transport, bytes);
+  sendDatagram(bytes);
 }
 
-function sendMouseRelativeMove(transport, buttons, dx, dy, wheel) {
+function sendMouseRelativeMove(buttons, dx, dy, wheel) {
   const bytes = new Uint8Array(5);
   bytes[0] = TAG_MOUSE_RELATIVE_MOVE;
   bytes[1] = buttons;
   bytes[2] = clampByte(dx);
   bytes[3] = clampByte(dy);
   bytes[4] = clampByte(wheel);
-  sendDatagram(transport, bytes);
+  sendDatagram(bytes);
 }
 
-function sendMouseButtons(transport, buttons, wheel) {
+function sendMouseButtons(buttons, wheel) {
   const bytes = new Uint8Array(3);
   bytes[0] = TAG_MOUSE_BUTTONS;
   bytes[1] = buttons;
   bytes[2] = clampByte(wheel);
-  sendDatagram(transport, bytes);
+  sendDatagram(bytes);
 }
 
 function clampByte(value) {
