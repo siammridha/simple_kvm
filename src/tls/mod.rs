@@ -1,17 +1,23 @@
-//! Self-signed TLS identity generation and rotation. Chrome caps a
-//! self-signed cert used with `serverCertificateHashes` at 14 days'
-//! validity, so this regenerates well inside that window and publishes
-//! the new identity for `webtransport::mod` (which must rebuild its
-//! `Endpoint` on rotation — wtransport has no live-identity-swap API) and
-//! `web::mod` (which serves the current hash for the page to fetch).
+//! TLS identity for the WebTransport endpoint (and, once it serves HTTPS
+//! too, the plain page). Two sources:
 //!
-//! Self-signed only, for now — swapping in a step-ca-issued identity later
-//! is just replacing `generate()`'s body with `Identity::load_pemfiles`.
+//! - Self-signed, auto-rotated (the default). Chrome caps a self-signed
+//!   cert used with `serverCertificateHashes` at 14 days' validity, so
+//!   this regenerates well inside that window and publishes the new
+//!   identity for `webtransport::mod` (which must rebuild its `Endpoint`
+//!   on rotation — wtransport has no live-identity-swap API) and
+//!   `web::mod` (which serves the current hash for the page to fetch).
+//! - Loaded once from a cert/key file pair (e.g. an operator-provided
+//!   cert, or later a step-ca-issued one) and never rotated — rotating a
+//!   file-provided identity would mean this process silently starts
+//!   ignoring whatever the operator put on disk, which isn't ours to
+//!   decide. Whoever manages that file pair owns its rotation.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use tokio::sync::watch;
 use wtransport::tls::Sha256DigestFmt;
 use wtransport::Identity;
@@ -21,14 +27,29 @@ const ROTATE_EVERY: Duration = Duration::from_secs(12 * 24 * 60 * 60);
 
 pub struct CertManager {
     identity: watch::Receiver<Arc<Identity>>,
+    /// Kept alive so `identity`'s `changed()` blocks forever rather than
+    /// erroring once there's no more rotation to wait for (the static
+    /// file-loaded case never sends again, but must still hold the
+    /// sender open).
+    _sender: watch::Sender<Arc<Identity>>,
 }
 
 impl CertManager {
-    pub fn start(subject_alt_names: Vec<String>) -> Result<Self> {
+    pub fn start_self_signed(subject_alt_names: Vec<String>) -> Result<Self> {
         let initial = generate(&subject_alt_names)?;
         let (tx, rx) = watch::channel(Arc::new(initial));
-        tokio::spawn(rotate_forever(subject_alt_names, tx));
-        Ok(Self { identity: rx })
+        tokio::spawn(rotate_forever(subject_alt_names, tx.clone()));
+        Ok(Self { identity: rx, _sender: tx })
+    }
+
+    /// Loads a fixed identity from a cert/key PEM pair and never rotates
+    /// it.
+    pub async fn start_from_files(cert_path: impl AsRef<Path>, key_path: impl AsRef<Path>) -> Result<Self> {
+        let identity = Identity::load_pemfiles(cert_path.as_ref(), key_path.as_ref())
+            .await
+            .with_context(|| format!("loading TLS identity from {} / {}", cert_path.as_ref().display(), key_path.as_ref().display()))?;
+        let (tx, rx) = watch::channel(Arc::new(identity));
+        Ok(Self { identity: rx, _sender: tx })
     }
 
     pub fn current(&self) -> Arc<Identity> {

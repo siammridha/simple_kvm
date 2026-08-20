@@ -32,6 +32,8 @@ async fn main() -> Result<()> {
         .split(',')
         .map(|s| s.trim().to_string())
         .collect();
+    let tls_cert_path = env::var("TLS_CERT_PATH").ok();
+    let tls_key_path = env::var("TLS_KEY_PATH").ok();
 
     // --- Capture: probing never fails — an absent card just means video
     // stays unavailable (soft "no device" state), so the rest of the
@@ -70,7 +72,13 @@ async fn main() -> Result<()> {
         }
     }
 
-    let cert_manager = Arc::new(tls::CertManager::start(tls_sans)?);
+    let cert_manager = Arc::new(match (tls_cert_path, tls_key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            tracing::info!(cert_path, key_path, "loading TLS identity from files (no auto-rotation)");
+            tls::CertManager::start_from_files(cert_path, key_path).await?
+        }
+        _ => tls::CertManager::start_self_signed(tls_sans)?,
+    });
 
     let app_state = web::AppState {
         video_available,

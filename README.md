@@ -134,6 +134,7 @@ if you need to change one):
 | `HTTP_PORT` | `3000` | Plain HTTP port for the page |
 | `WEBTRANSPORT_PORT` | `4433` | UDP port for the video/input connection |
 | `TLS_SAN` | `localhost` | Comma-separated subject names for the self-signed cert |
+| `TLS_CERT_PATH`, `TLS_KEY_PATH` | unset | Use a specific cert/key PEM pair instead of generating a self-signed one. Set both to enable; loaded once at startup and never auto-rotated - that's on whoever manages the file pair. |
 
 ## Releasing a new version
 
