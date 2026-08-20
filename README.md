@@ -146,6 +146,11 @@ waits 30 seconds before starting to avoid that window. If you hit boot
 crashes on different hardware, try increasing the delay in
 `/etc/init.d/simple_kvm`'s `start_pre()`.
 
+The CH9329 has shown the same crash-on-connect behavior, so the binary
+itself also waits before opening the serial port (`SERIAL_OPEN_DELAY_SECS`,
+default 30 seconds) — separately from the capture card's boot delay above,
+so it applies any time the service starts, not just at boot.
+
 ### Configuration
 
 All optional, set as environment variables (e.g. in `/etc/init.d/simple_kvm`
@@ -154,6 +159,7 @@ if you need to change one):
 | Variable | Default | Meaning |
 |---|---|---|
 | `SERIAL_PATH` | `/dev/ttyUSB0` | CH9329/CH340 serial device |
+| `SERIAL_OPEN_DELAY_SECS` | `30` | How long to wait before opening the CH9329 serial port, for the same reason as the capture card's boot delay below — set to `0` to disable. |
 | `VIDEO_PATH` | `/dev/video0` | Capture card device |
 | `HTTP_PORT` | `3000` | HTTPS port for the page |
 | `WEBTRANSPORT_PORT` | `4433` | UDP port for the video/input connection |
