@@ -1576,6 +1576,7 @@ dependencies = [
  "axum",
  "axum-server",
  "jpeg-encoder",
+ "libc",
  "openh264",
  "rustls",
  "serde",

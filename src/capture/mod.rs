@@ -1,5 +1,6 @@
 pub mod h264;
 pub mod mjpeg;
+mod uevent;
 pub mod v4l2;
 
 use std::path::Path;
@@ -13,11 +14,11 @@ use crate::config::{CaptureSettings, VideoMode};
 use crate::video_bus::{self, FrameEnvelope, FrameKind};
 use v4l2::{PixelFormat, SupportedFormat};
 
-/// How often to check whether the capture card is plugged in while it's
-/// absent. There's no cheap notification for USB add/remove without a udev
-/// dependency (deliberately avoided elsewhere in this project), so this
-/// just polls - same presence-check idea as `ch9329::writer`, applied on a
-/// timer instead of per-write since there's no per-write equivalent here.
+/// Safety-net interval for checking whether the capture card is plugged in
+/// while it's absent. `UeventListener` (see `capture::uevent`) normally
+/// notices a reconnect immediately, straight from the kernel - this timer
+/// only matters if that listener failed to open (e.g. no permission) or a
+/// notification was somehow missed, so it doesn't need to be tight.
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 pub struct CaptureManager {
@@ -82,6 +83,13 @@ impl CaptureManager {
     pub async fn run(self, mut settings: watch::Receiver<CaptureSettings>, video_bus: video_bus::Sender) {
         let device_path = self.device_path;
         let mut known_present = false;
+        let mut uevents = match uevent::UeventListener::open() {
+            Ok(listener) => Some(listener),
+            Err(err) => {
+                tracing::warn!(%err, "failed to open kernel uevent listener, falling back to polling only for capture device reconnects");
+                None
+            }
+        };
 
         loop {
             if !Path::new(&device_path).exists() {
@@ -89,7 +97,7 @@ impl CaptureManager {
                     tracing::warn!(device_path = %device_path, "capture device disconnected, pausing video until it reconnects");
                     known_present = false;
                 }
-                if wait_for_device_or_shutdown(&device_path, &mut settings).await.is_err() {
+                if wait_for_device_or_shutdown(&device_path, &mut settings, &mut uevents).await.is_err() {
                     break;
                 }
                 continue;
@@ -141,14 +149,22 @@ impl CaptureManager {
     }
 }
 
-/// Polls `device_path` until it exists, or returns `Err` once the settings
+/// Waits until `device_path` exists, or returns `Err` once the settings
 /// channel closes (server shutting down, nothing left to wait for).
-async fn wait_for_device_or_shutdown(device_path: &str, settings: &mut watch::Receiver<CaptureSettings>) -> Result<(), ()> {
+/// Wakes up immediately on a matching kernel uevent when `uevents` is
+/// available; the timer is just the fallback for when it isn't (see
+/// `DEVICE_POLL_INTERVAL`).
+async fn wait_for_device_or_shutdown(
+    device_path: &str,
+    settings: &mut watch::Receiver<CaptureSettings>,
+    uevents: &mut Option<uevent::UeventListener>,
+) -> Result<(), ()> {
     loop {
         if Path::new(device_path).exists() {
             return Ok(());
         }
         tokio::select! {
+            _ = wait_for_uevent(uevents) => {}
             _ = tokio::time::sleep(DEVICE_POLL_INTERVAL) => {}
             changed = settings.changed() => {
                 if changed.is_err() {
@@ -156,6 +172,18 @@ async fn wait_for_device_or_shutdown(device_path: &str, settings: &mut watch::Re
                 }
             }
         }
+    }
+}
+
+/// `video4linux` is the kernel subsystem name for V4L2 capture devices
+/// like `/dev/video0` - unrelated uevents (USB, network, ...) are ignored.
+/// Never resolves when `uevents` is `None` (listener failed to open), so
+/// this branch simply never wins the `select!` above and the timer takes
+/// over instead.
+async fn wait_for_uevent(uevents: &mut Option<uevent::UeventListener>) {
+    match uevents {
+        Some(listener) => listener.wait_for_subsystem("video4linux").await,
+        None => std::future::pending().await,
     }
 }
 

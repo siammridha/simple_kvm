@@ -70,6 +70,15 @@ streaming once it's replugged (the page itself only picks up the "video is
 back" state on its next load or reconnect, since the resolution dropdown
 is filled in when the page connects, not continuously).
 
+The capture card's reconnect is noticed immediately: the server listens
+directly on the Linux kernel's own device-change broadcast
+(`NETLINK_KOBJECT_UEVENT`, the same channel udev listens on), rather than
+going through udev itself - the Wyse 3040 image this runs on has no udev
+daemon (it uses the simpler `mdev` instead), so udev's own notifications
+never fire there. Listening straight to the kernel works regardless of
+what (if anything) is managing devices. A slow, infrequent poll still runs
+alongside it as a safety net in case that listener can't be opened.
+
 **Dropdown changes are saved automatically** - there's no separate "save"
 step required. Changing video mode, resolution, or mouse mode applies
 immediately (as before) and is also written to a small settings file on
