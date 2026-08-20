@@ -33,13 +33,26 @@ impl CaptureManager {
         !self.formats.is_empty()
     }
 
-    pub fn formats(&self) -> &[SupportedFormat] {
-        &self.formats
-    }
-
     pub fn default_settings(&self) -> Option<CaptureSettings> {
         let (_pixel_format, resolution) = v4l2::pick_default(&self.formats)?;
         Some(CaptureSettings { video_mode: VideoMode::Mjpeg, resolution })
+    }
+
+    /// The resolutions actually available in whichever pixel format
+    /// `default_settings` picked. The page's resolution dropdown must be
+    /// built from this (not just every resolution across every format
+    /// merged together) — otherwise it can default-select a resolution
+    /// the initial stream isn't actually using, since different formats
+    /// on the same card can support different resolution sets.
+    pub fn default_format_resolutions(&self) -> Vec<v4l2::Resolution> {
+        let Some((pixel_format, _)) = v4l2::pick_default(&self.formats) else {
+            return Vec::new();
+        };
+        self.formats
+            .iter()
+            .find(|f| f.pixel_format == pixel_format)
+            .map(|f| f.resolutions.clone())
+            .unwrap_or_default()
     }
 
     /// Runs forever, restarting the capture loop whenever `settings`
@@ -78,38 +91,41 @@ fn run_one_pass(
     stop: Arc<AtomicBool>,
     video_bus: video_bus::Sender,
 ) {
-    let pixel_format = pixel_format_for(formats, settings.video_mode);
-    let mut h264_encoder = if settings.video_mode == VideoMode::H264 {
-        match h264::H264Encoder::new(settings.resolution.width, settings.resolution.height) {
-            Ok(encoder) => Some(encoder),
-            Err(err) => {
-                tracing::error!(%err, "failed to create H.264 encoder, dropping frames in this pass");
-                None
-            }
-        }
-    } else {
-        None
+    let Some(pixel_format) = pixel_format_for(formats, settings.video_mode) else {
+        tracing::error!(?settings.video_mode, "capture device doesn't support the pixel format this video mode needs, no video this pass");
+        return;
     };
+    let video_mode = settings.video_mode;
 
-    let result = v4l2::run_capture_loop(
-        device_path,
-        pixel_format,
-        settings.resolution,
-        || stop.load(Ordering::Relaxed),
-        |frame| {
-            let envelope = match settings.video_mode {
+    // `make_handler` runs once `run_capture_loop` knows the *actual*
+    // negotiated resolution (which the driver is free to pick differently
+    // than what was requested) — sizing the JPEG/H.264 conversion buffers
+    // from anything else risks reading past the end of a real frame.
+    let result = v4l2::run_capture_loop(device_path, pixel_format, settings.resolution, || stop.load(Ordering::Relaxed), move |actual_resolution| {
+        let mut h264_encoder = if video_mode == VideoMode::H264 {
+            match h264::H264Encoder::new(actual_resolution.width, actual_resolution.height) {
+                Ok(encoder) => Some(encoder),
+                Err(err) => {
+                    tracing::error!(%err, "failed to create H.264 encoder, dropping frames in this pass");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        move |frame: &[u8]| {
+            let envelope = match video_mode {
                 VideoMode::Mjpeg => {
                     let jpeg = match pixel_format {
                         PixelFormat::Mjpeg => frame.to_vec(),
-                        PixelFormat::Yuyv => {
-                            match mjpeg::yuyv_to_jpeg(frame, settings.resolution.width, settings.resolution.height) {
-                                Ok(bytes) => bytes,
-                                Err(err) => {
-                                    tracing::error!(%err, "JPEG fallback encode failed");
-                                    return;
-                                }
+                        PixelFormat::Yuyv => match mjpeg::yuyv_to_jpeg(frame, actual_resolution.width, actual_resolution.height) {
+                            Ok(bytes) => bytes,
+                            Err(err) => {
+                                tracing::error!(%err, "JPEG fallback encode failed");
+                                return;
                             }
-                        }
+                        },
                     };
                     FrameEnvelope { kind: FrameKind::Mjpeg, data: jpeg.into() }
                 }
@@ -127,20 +143,24 @@ fn run_one_pass(
                 }
             };
             let _ = video_bus.send(Some(envelope));
-        },
-    );
+        }
+    });
 
     if let Err(err) = result {
         tracing::error!(%err, "capture loop exited with error");
     }
 }
 
-/// H.264 mode always captures raw YUYV to encode from; MJPEG mode prefers
-/// the card's own hardware MJPEG, falling back to a software JPEG
-/// conversion of raw YUYV if the card doesn't offer it.
-fn pixel_format_for(formats: &[SupportedFormat], video_mode: VideoMode) -> PixelFormat {
+/// H.264 mode always needs raw YUYV to encode from; MJPEG mode prefers the
+/// card's own hardware MJPEG, falling back to raw YUYV (converted to JPEG
+/// in software) if the card doesn't offer it. Returns `None` if the
+/// device supports neither format this mode needs.
+fn pixel_format_for(formats: &[SupportedFormat], video_mode: VideoMode) -> Option<PixelFormat> {
+    let has = |pixel_format: PixelFormat| formats.iter().any(|f| f.pixel_format == pixel_format);
     match video_mode {
-        VideoMode::Mjpeg if formats.iter().any(|f| f.pixel_format == PixelFormat::Mjpeg) => PixelFormat::Mjpeg,
-        _ => PixelFormat::Yuyv,
+        VideoMode::Mjpeg if has(PixelFormat::Mjpeg) => Some(PixelFormat::Mjpeg),
+        VideoMode::Mjpeg if has(PixelFormat::Yuyv) => Some(PixelFormat::Yuyv),
+        VideoMode::H264 if has(PixelFormat::Yuyv) => Some(PixelFormat::Yuyv),
+        _ => None,
     }
 }

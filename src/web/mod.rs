@@ -28,6 +28,11 @@ pub struct ResolutionOption {
 pub struct AppState {
     pub video_available: bool,
     pub resolutions: Arc<Vec<ResolutionOption>>,
+    /// The resolution actually in effect for the first stream a session
+    /// gets (see `CaptureManager::default_format_resolutions`) — the page
+    /// pre-selects this in the dropdown rather than just assuming
+    /// whichever resolution happens to be listed first.
+    pub default_resolution: Option<ResolutionOption>,
     pub webtransport_port: u16,
     pub cert_manager: Arc<CertManager>,
 }
@@ -36,6 +41,7 @@ pub struct AppState {
 struct ConfigResponse {
     video_available: bool,
     resolutions: Vec<ResolutionOption>,
+    default_resolution: Option<ResolutionOption>,
     webtransport_port: u16,
 }
 
@@ -58,6 +64,7 @@ async fn config_handler(State(state): State<AppState>) -> Json<ConfigResponse> {
     Json(ConfigResponse {
         video_available: state.video_available,
         resolutions: (*state.resolutions).clone(),
+        default_resolution: state.default_resolution,
         webtransport_port: state.webtransport_port,
     })
 }

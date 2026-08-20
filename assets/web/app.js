@@ -56,7 +56,7 @@ async function loadCertInfo() {
   return res.json();
 }
 
-function populateResolutions(resolutions) {
+function populateResolutions(resolutions, defaultResolution) {
   resolutionSelect.innerHTML = '';
   if (resolutions.length === 0) {
     const opt = document.createElement('option');
@@ -72,11 +72,14 @@ function populateResolutions(resolutions) {
     opt.textContent = `${width}x${height}`;
     resolutionSelect.appendChild(opt);
   }
+  if (defaultResolution) {
+    resolutionSelect.value = `${defaultResolution.width}x${defaultResolution.height}`;
+  }
 }
 
 async function connect() {
   const config = await loadConfig();
-  populateResolutions(config.resolutions);
+  populateResolutions(config.resolutions, config.default_resolution);
 
   if (!config.video_available) {
     setStatus('no video device found', true);
@@ -174,7 +177,7 @@ async function renderJpeg(payload) {
 
 function naluIsKeyframe(bytes) {
   // Scans Annex-B start codes for an IDR (type 5) or SPS (type 7) NAL.
-  for (let i = 0; i + 4 < bytes.length; i++) {
+  for (let i = 0; i + 4 <= bytes.length; i++) {
     if (bytes[i] === 0 && bytes[i + 1] === 0 && bytes[i + 2] === 1) {
       const nalType = bytes[i + 3] & 0x1f;
       if (nalType === 5 || nalType === 7) return true;

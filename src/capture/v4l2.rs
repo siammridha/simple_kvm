@@ -61,9 +61,18 @@ pub fn enumerate(path: &str) -> Result<Vec<SupportedFormat>> {
         let Some(pixel_format) = PixelFormat::from_fourcc(desc.fourcc) else {
             continue;
         };
-        let mut resolutions: Vec<Resolution> = dev
-            .enum_framesizes(desc.fourcc)
-            .with_context(|| format!("enumerating frame sizes for {:?} on {path}", pixel_format))?
+        let frame_sizes = match dev.enum_framesizes(desc.fourcc) {
+            Ok(sizes) => sizes,
+            Err(err) => {
+                // Some real UVC devices advertise a format via enum_formats
+                // but fail enum_framesizes for it specifically. Skip just
+                // that format rather than losing every format the device
+                // offers.
+                tracing::warn!(%err, ?pixel_format, path, "failed to enumerate frame sizes for this format, skipping it");
+                continue;
+            }
+        };
+        let mut resolutions: Vec<Resolution> = frame_sizes
             .into_iter()
             .flat_map(|frame_size| frame_size.size.to_discrete())
             .map(|d| Resolution { width: d.width, height: d.height })
@@ -94,19 +103,32 @@ pub fn pick_default(formats: &[SupportedFormat]) -> Option<(PixelFormat, Resolut
 }
 
 /// Runs a blocking capture loop against `path` at the given format and
-/// resolution, calling `on_frame` for each captured buffer, until
-/// `should_stop` returns true. Meant to run inside
-/// `tokio::task::spawn_blocking`.
-pub fn run_capture_loop(
+/// requested resolution, until `should_stop` returns true. Meant to run
+/// inside `tokio::task::spawn_blocking`.
+///
+/// V4L2 drivers are free to negotiate a different resolution than what's
+/// requested (`set_format` returns the format actually in effect) — so
+/// `make_handler` is called once, *after* negotiation, with the *actual*
+/// resolution, and must build the per-frame handler from that. Sizing a
+/// frame handler from the merely-requested resolution instead is a real
+/// bug: a mismatch between it and the driver's actual frame size means
+/// buffer-indexing code (JPEG/I420 conversion) reads past the end of a
+/// frame it assumed was a different size.
+pub fn run_capture_loop<H>(
     path: &str,
     pixel_format: PixelFormat,
     resolution: Resolution,
     mut should_stop: impl FnMut() -> bool,
-    mut on_frame: impl FnMut(&[u8]),
-) -> Result<()> {
+    make_handler: impl FnOnce(Resolution) -> H,
+) -> Result<()>
+where
+    H: FnMut(&[u8]),
+{
     let dev = Device::with_path(path).with_context(|| format!("opening {path}"))?;
-    let format = Format::new(resolution.width, resolution.height, pixel_format.fourcc());
-    dev.set_format(&format).context("negotiating capture format")?;
+    let requested = Format::new(resolution.width, resolution.height, pixel_format.fourcc());
+    let actual = dev.set_format(&requested).context("negotiating capture format")?;
+    let actual_resolution = Resolution { width: actual.width, height: actual.height };
+    let mut on_frame = make_handler(actual_resolution);
 
     let mut stream = MmapStream::with_buffers(&dev, BufferType::VideoCapture, 4).context("starting mmap capture stream")?;
     stream.set_timeout(Duration::from_millis(500));

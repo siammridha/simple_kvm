@@ -38,8 +38,14 @@ async fn main() -> Result<()> {
     // server still starts and the page still loads. ---
     let capture_manager = CaptureManager::probe(&video_path);
     let video_available = capture_manager.is_available();
-    let resolutions = distinct_resolutions(&capture_manager);
-    let default_capture_settings = capture_manager.default_settings().unwrap_or(CaptureSettings {
+    let resolutions: Vec<web::ResolutionOption> =
+        capture_manager.default_format_resolutions().iter().map(|r| web::ResolutionOption { width: r.width, height: r.height }).collect();
+    // Both derived from the same `pick_default` call, so the dropdown's
+    // pre-selected value always matches what the first stream actually
+    // uses (see `default_format_resolutions`'s doc comment).
+    let default_settings = capture_manager.default_settings();
+    let default_resolution = default_settings.map(|s| web::ResolutionOption { width: s.resolution.width, height: s.resolution.height });
+    let default_capture_settings = default_settings.unwrap_or(CaptureSettings {
         video_mode: VideoMode::Mjpeg,
         resolution: Resolution { width: 1280, height: 720 },
     });
@@ -69,6 +75,7 @@ async fn main() -> Result<()> {
     let app_state = web::AppState {
         video_available,
         resolutions: Arc::new(resolutions),
+        default_resolution,
         webtransport_port,
         cert_manager: Arc::clone(&cert_manager),
     };
@@ -94,17 +101,6 @@ async fn main() -> Result<()> {
 
 fn env_parsed<T: std::str::FromStr>(key: &str) -> Option<T> {
     env::var(key).ok().and_then(|v| v.parse().ok())
-}
-
-fn distinct_resolutions(capture_manager: &CaptureManager) -> Vec<web::ResolutionOption> {
-    let mut resolutions: Vec<web::ResolutionOption> = capture_manager
-        .formats()
-        .iter()
-        .flat_map(|f| f.resolutions.iter().map(|r| web::ResolutionOption { width: r.width, height: r.height }))
-        .collect();
-    resolutions.sort_by_key(|r| std::cmp::Reverse(r.width * r.height));
-    resolutions.dedup_by_key(|r| (r.width, r.height));
-    resolutions
 }
 
 async fn drain_serial_commands(mut rx: mpsc::Receiver<SerialCommand>) {

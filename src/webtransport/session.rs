@@ -159,6 +159,12 @@ fn handle_control_message(msg: ControlMessage, ctx: &SessionContext) {
     }
 }
 
+/// No legitimate control message (settings change or paste) needs to be
+/// anywhere near this large. Caps how much a connection with no
+/// authentication (see README) can make the server buffer by simply never
+/// sending a newline.
+const MAX_CONTROL_LINE_BYTES: usize = 64 * 1024;
+
 /// Reads one JSON-line from the control stream, buffering partial reads.
 /// Returns `Ok(None)` on a `None` `recv` (no control stream open yet —
 /// this branch is only ever polled when `control.is_some()`, so `recv`
@@ -171,6 +177,9 @@ async fn read_control_line(recv: Option<&mut RecvStream>, buf: &mut Vec<u8>) -> 
         if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = buf.drain(..=pos).collect();
             return Ok(Some(String::from_utf8_lossy(&line[..line.len() - 1]).into_owned()));
+        }
+        if buf.len() >= MAX_CONTROL_LINE_BYTES {
+            anyhow::bail!("control message exceeded {MAX_CONTROL_LINE_BYTES} bytes with no newline");
         }
         let mut chunk = [0u8; 4096];
         match recv.read(&mut chunk).await? {
