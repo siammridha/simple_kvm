@@ -11,7 +11,7 @@ use wtransport::endpoint::IncomingSession;
 use wtransport::{Endpoint, Identity, ServerConfig};
 
 use crate::ch9329::writer::SerialCommand;
-use crate::config::CaptureSettings;
+use crate::config::{CaptureSettings, MouseMode};
 use crate::tls::CertManager;
 use crate::video_bus;
 use session::SessionContext;
@@ -26,6 +26,7 @@ pub async fn serve(
     video_bus: video_bus::Receiver,
     serial_tx: mpsc::Sender<SerialCommand>,
     capture_settings_tx: watch::Sender<CaptureSettings>,
+    mouse_mode_tx: watch::Sender<MouseMode>,
 ) -> Result<()> {
     let identity_rx = cert_manager.watch();
 
@@ -36,7 +37,7 @@ pub async fn serve(
 
         let mut rotated = identity_rx.clone();
         tokio::select! {
-            result = accept_forever(&endpoint, &video_bus, &serial_tx, &capture_settings_tx) => return result,
+            result = accept_forever(&endpoint, &video_bus, &serial_tx, &capture_settings_tx, &mouse_mode_tx) => return result,
             changed = rotated.changed() => {
                 if changed.is_err() {
                     return Ok(());
@@ -61,6 +62,7 @@ async fn accept_forever(
     video_bus: &video_bus::Receiver,
     serial_tx: &mpsc::Sender<SerialCommand>,
     capture_settings_tx: &watch::Sender<CaptureSettings>,
+    mouse_mode_tx: &watch::Sender<MouseMode>,
 ) -> Result<()> {
     loop {
         let incoming = endpoint.accept().await;
@@ -68,6 +70,7 @@ async fn accept_forever(
             video_bus: video_bus.clone(),
             serial_tx: serial_tx.clone(),
             capture_settings_tx: capture_settings_tx.clone(),
+            mouse_mode_tx: mouse_mode_tx.clone(),
         };
         tokio::spawn(async move {
             if let Err(err) = handle_incoming(incoming, ctx).await {

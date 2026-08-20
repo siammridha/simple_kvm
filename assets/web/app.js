@@ -80,6 +80,8 @@ function populateResolutions(resolutions, defaultResolution) {
 async function connect() {
   const config = await loadConfig();
   populateResolutions(config.resolutions, config.default_resolution);
+  videoModeSelect.value = config.video_mode;
+  mouseModeSelect.value = config.mouse_mode;
 
   if (!config.video_available) {
     setStatus('no video device found', true);

@@ -10,6 +10,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use v4l::buffer::Type as BufferType;
 use v4l::format::FourCC;
 use v4l::io::mmap::Stream as MmapStream;
@@ -17,7 +18,7 @@ use v4l::io::traits::CaptureStream;
 use v4l::video::Capture;
 use v4l::{Device, Format};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Resolution {
     pub width: u32,
     pub height: u32,

@@ -38,14 +38,12 @@ impl CaptureManager {
         Some(CaptureSettings { video_mode: VideoMode::Mjpeg, resolution })
     }
 
-    /// The resolutions actually available in whichever pixel format
-    /// `default_settings` picked. The page's resolution dropdown must be
-    /// built from this (not just every resolution across every format
-    /// merged together) — otherwise it can default-select a resolution
-    /// the initial stream isn't actually using, since different formats
-    /// on the same card can support different resolution sets.
-    pub fn default_format_resolutions(&self) -> Vec<v4l2::Resolution> {
-        let Some((pixel_format, _)) = v4l2::pick_default(&self.formats) else {
+    /// The resolutions available in whichever pixel format `video_mode`
+    /// would actually use (see `pixel_format_for`). Used to build the
+    /// resolution dropdown so it matches whatever video mode the page
+    /// starts in, including a persisted mode from `settings_store`.
+    pub fn resolutions_for(&self, video_mode: VideoMode) -> Vec<v4l2::Resolution> {
+        let Some(pixel_format) = pixel_format_for(&self.formats, video_mode) else {
             return Vec::new();
         };
         self.formats
@@ -53,6 +51,17 @@ impl CaptureManager {
             .find(|f| f.pixel_format == pixel_format)
             .map(|f| f.resolutions.clone())
             .unwrap_or_default()
+    }
+
+    /// Whether the card can actually run in `video_mode` at `resolution`.
+    /// Used to validate a persisted setting before trusting it as the
+    /// startup default — the card on hand may have changed since the
+    /// setting was saved.
+    pub fn supports(&self, video_mode: VideoMode, resolution: v4l2::Resolution) -> bool {
+        let Some(pixel_format) = pixel_format_for(&self.formats, video_mode) else {
+            return false;
+        };
+        self.formats.iter().any(|f| f.pixel_format == pixel_format && f.resolutions.contains(&resolution))
     }
 
     /// Runs forever, restarting the capture loop whenever `settings`

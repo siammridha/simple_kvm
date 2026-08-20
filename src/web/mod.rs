@@ -14,6 +14,7 @@ use axum::{Json, Router};
 use serde::Serialize;
 use std::sync::Arc;
 
+use crate::config::{MouseMode, VideoMode};
 use crate::tls::{self, CertManager};
 
 const INDEX_HTML: &str = include_str!("../../assets/web/index.html");
@@ -37,6 +38,13 @@ pub struct AppState {
     pub default_resolution: Option<ResolutionOption>,
     pub webtransport_port: u16,
     pub cert_manager: Arc<CertManager>,
+    /// The video/mouse mode the server actually started with — either a
+    /// value loaded from the settings file by `settings_store`, or the
+    /// capture card's own default. The page uses this to pre-select its
+    /// dropdowns to match reality instead of always defaulting to
+    /// whichever `<option>` happens to be listed first.
+    pub video_mode: VideoMode,
+    pub mouse_mode: MouseMode,
 }
 
 #[derive(Serialize)]
@@ -45,6 +53,8 @@ struct ConfigResponse {
     resolutions: Vec<ResolutionOption>,
     default_resolution: Option<ResolutionOption>,
     webtransport_port: u16,
+    video_mode: VideoMode,
+    mouse_mode: MouseMode,
 }
 
 #[derive(Serialize)]
@@ -68,6 +78,8 @@ async fn config_handler(State(state): State<AppState>) -> Json<ConfigResponse> {
         resolutions: (*state.resolutions).clone(),
         default_resolution: state.default_resolution,
         webtransport_port: state.webtransport_port,
+        video_mode: state.video_mode,
+        mouse_mode: state.mouse_mode,
     })
 }
 

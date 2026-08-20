@@ -1,12 +1,14 @@
 mod capture;
 mod ch9329;
 mod config;
+mod settings_store;
 mod tls;
 mod video_bus;
 mod web;
 mod webtransport;
 
 use std::env;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -16,7 +18,7 @@ use tracing_subscriber::EnvFilter;
 use capture::v4l2::Resolution;
 use capture::CaptureManager;
 use ch9329::writer::{self, SerialCommand};
-use config::{CaptureSettings, VideoMode};
+use config::{CaptureSettings, MouseMode, VideoMode};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -41,25 +43,38 @@ async fn main() -> Result<()> {
         .collect();
     let tls_cert_path = env::var("TLS_CERT_PATH").ok();
     let tls_key_path = env::var("TLS_KEY_PATH").ok();
+    let settings_path = PathBuf::from(env::var("SETTINGS_PATH").unwrap_or_else(|_| "/etc/simple_kvm-settings.json".to_string()));
 
     // --- Capture: probing never fails — an absent card just means video
     // stays unavailable (soft "no device" state), so the rest of the
     // server still starts and the page still loads. ---
     let capture_manager = CaptureManager::probe(&video_path);
     let video_available = capture_manager.is_available();
-    let resolutions: Vec<web::ResolutionOption> =
-        capture_manager.default_format_resolutions().iter().map(|r| web::ResolutionOption { width: r.width, height: r.height }).collect();
-    // Both derived from the same `pick_default` call, so the dropdown's
-    // pre-selected value always matches what the first stream actually
-    // uses (see `default_format_resolutions`'s doc comment).
-    let default_settings = capture_manager.default_settings();
-    let default_resolution = default_settings.map(|s| web::ResolutionOption { width: s.resolution.width, height: s.resolution.height });
-    let default_capture_settings = default_settings.unwrap_or(CaptureSettings {
+
+    // A settings file from a previous run wins over the capture card's own
+    // default, but only if the card on hand can actually still run it —
+    // it may have changed since the setting was saved.
+    let persisted = settings_store::load(&settings_path);
+    let persisted_capture = persisted.filter(|p| capture_manager.supports(p.capture.video_mode, p.capture.resolution)).map(|p| p.capture);
+    let default_capture_settings = persisted_capture.or_else(|| capture_manager.default_settings()).unwrap_or(CaptureSettings {
         video_mode: VideoMode::Mjpeg,
         resolution: Resolution { width: 1280, height: 720 },
     });
+    let default_mouse_mode = persisted.map(|p| p.mouse_mode).unwrap_or(MouseMode::Absolute);
+
+    let resolutions: Vec<web::ResolutionOption> = capture_manager
+        .resolutions_for(default_capture_settings.video_mode)
+        .iter()
+        .map(|r| web::ResolutionOption { width: r.width, height: r.height })
+        .collect();
+    let default_resolution =
+        video_available.then_some(web::ResolutionOption { width: default_capture_settings.resolution.width, height: default_capture_settings.resolution.height });
+
     let (capture_settings_tx, capture_settings_rx) = watch::channel(default_capture_settings);
+    let (mouse_mode_tx, mouse_mode_rx) = watch::channel(default_mouse_mode);
     let (video_bus_tx, video_bus_rx) = video_bus::channel();
+
+    tokio::spawn(settings_store::run(settings_path, capture_settings_rx.clone(), mouse_mode_rx));
 
     // --- Serial: same soft-unavailable treatment as capture. ---
     let (serial_tx, serial_rx) = mpsc::channel::<SerialCommand>(256);
@@ -93,6 +108,8 @@ async fn main() -> Result<()> {
         default_resolution,
         webtransport_port,
         cert_manager: Arc::clone(&cert_manager),
+        video_mode: default_capture_settings.video_mode,
+        mouse_mode: default_mouse_mode,
     };
     let https_config = cert_manager.https_config().await?;
     let http_addr = std::net::SocketAddr::from(([0, 0, 0, 0], http_port));
@@ -106,7 +123,7 @@ async fn main() -> Result<()> {
     let capture_handle = tokio::spawn(capture_manager.run(capture_settings_rx, video_bus_tx));
 
     let webtransport_handle = tokio::spawn(async move {
-        if let Err(err) = webtransport::serve(webtransport_port, cert_manager, video_bus_rx, serial_tx, capture_settings_tx).await {
+        if let Err(err) = webtransport::serve(webtransport_port, cert_manager, video_bus_rx, serial_tx, capture_settings_tx, mouse_mode_tx).await {
             tracing::error!(%err, "WebTransport server exited");
         }
     });

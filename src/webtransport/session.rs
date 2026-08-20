@@ -14,15 +14,16 @@ use wtransport::{Connection, RecvStream};
 use crate::capture::v4l2::Resolution;
 use crate::ch9329::keymap::{self, KeyCode};
 use crate::ch9329::writer::SerialCommand;
-use crate::config::{CaptureSettings, VideoMode};
+use crate::config::{CaptureSettings, MouseMode, VideoMode};
 use crate::video_bus::{self, FrameKind};
 
-use super::protocol::{ControlMessage, InputEvent, VideoModeWire};
+use super::protocol::{ControlMessage, InputEvent, MouseModeWire, VideoModeWire};
 
 pub struct SessionContext {
     pub video_bus: video_bus::Receiver,
     pub serial_tx: mpsc::Sender<SerialCommand>,
     pub capture_settings_tx: watch::Sender<CaptureSettings>,
+    pub mouse_mode_tx: watch::Sender<MouseMode>,
 }
 
 #[derive(Default)]
@@ -146,10 +147,17 @@ fn handle_control_message(msg: ControlMessage, ctx: &SessionContext) {
         ControlMessage::SetResolution { width, height } => {
             ctx.capture_settings_tx.send_modify(|s| s.resolution = Resolution { width, height });
         }
-        // Mouse mode is purely a client-side choice of which datagram
-        // variant to send (see InputEvent) — the server doesn't need to
-        // track it to translate events correctly. Logged for visibility.
-        ControlMessage::SetMouseMode { mode } => tracing::debug!(?mode, "mouse mode changed"),
+        // The server doesn't need mouse mode to translate input events —
+        // that's purely which datagram variant the client sends (see
+        // `InputEvent`) — but it's tracked here anyway so it can be
+        // persisted and reported back as the default on the next page
+        // load (see `settings_store`).
+        ControlMessage::SetMouseMode { mode } => {
+            ctx.mouse_mode_tx.send_replace(match mode {
+                MouseModeWire::Absolute => MouseMode::Absolute,
+                MouseModeWire::Relative => MouseMode::Relative,
+            });
+        }
         ControlMessage::Paste { text } => {
             let tx = ctx.serial_tx.clone();
             tokio::spawn(async move {

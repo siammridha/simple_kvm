@@ -58,6 +58,14 @@ still loads, dropdowns just reflect "no video device," and keyboard/mouse
 input is silently dropped instead of the service failing to start. Useful
 for development without the hardware plugged in.
 
+**Dropdown changes are saved automatically** - there's no separate "save"
+step. Changing video mode, resolution, or mouse mode applies immediately
+(as before) and is also written to a small settings file on disk, so the
+next time the service starts (e.g. after a reboot) it comes back up with
+the same choices instead of resetting to the capture card's defaults. If
+you reload the page, the dropdowns show whatever the server is actually
+using right now.
+
 ### TLS for the page and the video/input connection
 
 Browsers only expose the `WebTransport` API on a secure context - an
@@ -150,6 +158,7 @@ if you need to change one):
 | `WEBTRANSPORT_PORT` | `4433` | UDP port for the video/input connection |
 | `TLS_SAN` | `localhost` | Comma-separated subject names for the self-signed cert |
 | `TLS_CERT_PATH`, `TLS_KEY_PATH` | unset | Use a specific cert/key PEM pair instead of generating a self-signed one. Set both to enable; loaded once at startup and never auto-rotated - that's on whoever manages the file pair. |
+| `SETTINGS_PATH` | `/etc/simple_kvm-settings.json` | Where video mode/resolution/mouse mode are saved whenever a dropdown changes, and read back on the next startup. |
 
 ## Releasing a new version
 
