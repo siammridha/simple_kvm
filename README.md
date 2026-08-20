@@ -24,7 +24,7 @@ to install.
 
 ## What it does
 
-Run the binary on the Wyse 3040 and it serves a page at `http://<device
+Run the binary on the Wyse 3040 and it serves a page at `https://<device
 ip>:3000` with:
 
 - **Live video**, streamed over WebTransport (not WebRTC). Two modes,
@@ -58,14 +58,26 @@ still loads, dropdowns just reflect "no video device," and keyboard/mouse
 input is silently dropped instead of the service failing to start. Useful
 for development without the hardware plugged in.
 
-### TLS for the video/input connection
+### TLS for the page and the video/input connection
 
-WebTransport requires TLS. There's no public domain for a LAN device, so
-the server generates its own self-signed certificate and the page pins it
-by hash (`serverCertificateHashes`) - no manual "accept this certificate"
-step needed in the browser. Chrome caps a self-signed cert used this way
-at 14 days, so the server regenerates it every 12 days automatically; any
-session connected at that moment reconnects on its own.
+Browsers only expose the `WebTransport` API on a secure context - an
+`https://` page (or `http://localhost`, which doesn't apply here since
+the device is reached by its LAN IP). So the page itself is served over
+HTTPS, using the same certificate as the WebTransport connection.
+
+There's no public domain for a LAN device, so by default the server
+generates its own self-signed certificate. The WebTransport connection
+pins it by hash (`serverCertificateHashes`), so there's no manual "accept
+this certificate" step needed for that part. The page itself, being
+regular HTTPS, does still need the browser to trust or accept the
+self-signed cert once (a normal "your connection isn't private" warning
+to click through, or add `TLS_CERT_PATH`/`TLS_KEY_PATH` pointing at a
+cert your browser already trusts to skip that entirely).
+
+Chrome caps a self-signed cert used with `serverCertificateHashes` at 14
+days, so the server regenerates it every 12 days automatically; the page's
+HTTPS listener picks up the new certificate immediately (no restart), and
+any WebTransport session connected at that moment reconnects on its own.
 
 ## How it's built
 
@@ -107,7 +119,10 @@ rc-service simple_kvm status
 cat /var/log/simple_kvm.log
 ```
 
-Then open `http://<device ip>:3000` from a browser on the same network.
+Then open `https://<device ip>:3000` from a browser on the same network
+(you'll likely need to click through a self-signed certificate warning
+the first time - see [TLS for the page and the video/input
+connection](#tls-for-the-page-and-the-videoinput-connection)).
 
 **Updating later:** push a new version tag on GitHub, then re-run the same
 `wget ... | sh` command on the device - it always grabs the latest release.
@@ -131,7 +146,7 @@ if you need to change one):
 |---|---|---|
 | `SERIAL_PATH` | `/dev/ttyUSB0` | CH9329/CH340 serial device |
 | `VIDEO_PATH` | `/dev/video0` | Capture card device |
-| `HTTP_PORT` | `3000` | Plain HTTP port for the page |
+| `HTTP_PORT` | `3000` | HTTPS port for the page |
 | `WEBTRANSPORT_PORT` | `4433` | UDP port for the video/input connection |
 | `TLS_SAN` | `localhost` | Comma-separated subject names for the self-signed cert |
 | `TLS_CERT_PATH`, `TLS_KEY_PATH` | unset | Use a specific cert/key PEM pair instead of generating a self-signed one. Set both to enable; loaded once at startup and never auto-rotated - that's on whoever manages the file pair. |

@@ -23,6 +23,13 @@ async fn main() -> Result<()> {
     init_logging();
     tracing::info!("simple_kvm starting");
 
+    // axum-server's rustls integration needs a process-default crypto
+    // provider installed; wtransport builds its own provider explicitly
+    // per-config and doesn't need or set this, so there's no conflict.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("installing rustls crypto provider"))?;
+
     let serial_path = env::var("SERIAL_PATH").unwrap_or_else(|_| "/dev/ttyUSB0".to_string());
     let video_path = env::var("VIDEO_PATH").unwrap_or_else(|_| "/dev/video0".to_string());
     let http_port: u16 = env_parsed("HTTP_PORT").unwrap_or(3000);
@@ -87,11 +94,12 @@ async fn main() -> Result<()> {
         webtransport_port,
         cert_manager: Arc::clone(&cert_manager),
     };
-    let http_listener = tokio::net::TcpListener::bind(("0.0.0.0", http_port)).await?;
-    tracing::info!(port = http_port, "HTTP server listening");
+    let https_config = cert_manager.https_config().await?;
+    let http_addr = std::net::SocketAddr::from(([0, 0, 0, 0], http_port));
+    tracing::info!(port = http_port, "HTTPS page server listening");
     let http_handle = tokio::spawn(async move {
-        if let Err(err) = axum::serve(http_listener, web::router(app_state)).await {
-            tracing::error!(%err, "HTTP server exited");
+        if let Err(err) = axum_server::bind_rustls(http_addr, https_config).serve(web::router(app_state).into_make_service()).await {
+            tracing::error!(%err, "HTTPS page server exited");
         }
     });
 

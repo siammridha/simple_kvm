@@ -16,6 +16,10 @@ export RUST_LOG="${RUST_LOG:-warn}"
 
 export AGENT_BROWSER_EXECUTABLE_PATH="/usr/bin/chromium"
 export AGENT_BROWSER_ARGS="--no-sandbox"
+# The page is served over HTTPS with a self-signed cert (required for
+# browsers to expose the WebTransport API outside a localhost origin) -
+# this lets agent-browser load it without a manual "accept the risk" step.
+export AGENT_BROWSER_IGNORE_HTTPS_ERRORS=1
 
 echo "Building..."
 cargo build --quiet
@@ -31,14 +35,14 @@ trap cleanup EXIT
 
 echo "Waiting for the server to come up..."
 for _ in $(seq 1 50); do
-	if curl -sf "http://localhost:$HTTP_PORT/" >/dev/null 2>&1; then
+	if curl -skf "https://localhost:$HTTP_PORT/" >/dev/null 2>&1; then
 		break
 	fi
 	sleep 0.1
 done
 
 echo "Loading the page..."
-agent-browser open "http://localhost:$HTTP_PORT/"
+agent-browser open "https://localhost:$HTTP_PORT/"
 agent-browser wait --load load
 
 DROPDOWN_COUNT=$(agent-browser get count select)

@@ -1,12 +1,15 @@
-//! TLS identity for the WebTransport endpoint (and, once it serves HTTPS
-//! too, the plain page). Two sources:
+//! TLS identity, shared by both the WebTransport endpoint and the page's own
+//! HTTPS listener (the page must be HTTPS for browsers to expose the
+//! `WebTransport` API at all outside a `localhost` origin). Two sources:
 //!
 //! - Self-signed, auto-rotated (the default). Chrome caps a self-signed
 //!   cert used with `serverCertificateHashes` at 14 days' validity, so
 //!   this regenerates well inside that window and publishes the new
 //!   identity for `webtransport::mod` (which must rebuild its `Endpoint`
-//!   on rotation — wtransport has no live-identity-swap API) and
-//!   `web::mod` (which serves the current hash for the page to fetch).
+//!   on rotation — wtransport has no live-identity-swap API), `web::mod`
+//!   (which serves the current hash for the page to fetch), and this
+//!   module's own `https_config` (which reloads the page's `RustlsConfig`
+//!   in place, no listener restart needed).
 //! - Loaded once from a cert/key file pair (e.g. an operator-provided
 //!   cert, or later a step-ca-issued one) and never rotated — rotating a
 //!   file-provided identity would mean this process silently starts
@@ -18,6 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use axum_server::tls_rustls::RustlsConfig;
 use tokio::sync::watch;
 use wtransport::tls::Sha256DigestFmt;
 use wtransport::Identity;
@@ -59,6 +63,36 @@ impl CertManager {
     pub fn watch(&self) -> watch::Receiver<Arc<Identity>> {
         self.identity.clone()
     }
+
+    /// Builds the `RustlsConfig` the page's HTTPS listener serves, from the
+    /// current identity, and spawns a task that reloads it in place on
+    /// rotation. For a file-loaded identity the watch channel never fires
+    /// again, so the task just idles forever — nothing to reload.
+    pub async fn https_config(&self) -> Result<RustlsConfig> {
+        let (cert_der, key_der) = identity_der(&self.current());
+        let config = RustlsConfig::from_der(cert_der, key_der).await.context("building HTTPS TLS config")?;
+
+        let mut rx = self.watch();
+        let reload_target = config.clone();
+        tokio::spawn(async move {
+            while rx.changed().await.is_ok() {
+                let identity = rx.borrow_and_update().clone();
+                let (cert_der, key_der) = identity_der(&identity);
+                match reload_target.reload_from_der(cert_der, key_der).await {
+                    Ok(()) => tracing::info!("reloaded HTTPS certificate"),
+                    Err(err) => tracing::error!(%err, "failed to reload HTTPS certificate, keeping the previous one"),
+                }
+            }
+        });
+
+        Ok(config)
+    }
+}
+
+fn identity_der(identity: &Identity) -> (Vec<Vec<u8>>, Vec<u8>) {
+    let cert_der = identity.certificate_chain().as_slice().iter().map(|cert| cert.der().to_vec()).collect();
+    let key_der = identity.private_key().secret_der().to_vec();
+    (cert_der, key_der)
 }
 
 fn generate(subject_alt_names: &[String]) -> Result<Identity> {

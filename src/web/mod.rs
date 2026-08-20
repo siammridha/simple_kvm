@@ -1,8 +1,10 @@
-//! The plain HTTP server on port 3000: serves the page/JS/CSS (embedded
+//! The HTTPS page server on port 3000: serves the page/JS/CSS (embedded
 //! in the binary — no files to copy alongside it, matching the
 //! single-binary install model) plus two small JSON endpoints the page
 //! needs before it can open its WebTransport session: the resolutions the
 //! capture card actually supports, and the current TLS certificate hash.
+//! HTTPS (not plain HTTP) because browsers only expose the `WebTransport`
+//! API on a secure context — see `crate::tls` for the shared identity.
 
 use axum::extract::State;
 use axum::http::header;
