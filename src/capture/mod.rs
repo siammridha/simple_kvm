@@ -1,6 +1,5 @@
 pub mod h264;
 pub mod mjpeg;
-mod uevent;
 pub mod v4l2;
 
 use std::path::Path;
@@ -11,6 +10,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use crate::config::{CaptureSettings, VideoMode};
+use crate::uevent;
 use crate::video_bus::{self, FrameEnvelope, FrameKind};
 use v4l2::{PixelFormat, SupportedFormat};
 

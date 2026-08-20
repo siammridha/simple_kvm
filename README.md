@@ -64,20 +64,22 @@ input is silently dropped instead of the service failing to start. Useful
 for development without the hardware plugged in. This also covers either
 device disconnecting after the service has already started, and both
 recover on their own once reconnected, no restart needed: the CH9329
-silently drops input while it's gone and picks back up the next time a key
-or click comes in; the capture card pauses video the same way and resumes
+silently drops input while it's gone and reconnects as soon as it's
+plugged back in (noticed immediately, not just on the next key or click -
+see below); the capture card pauses video the same way and resumes
 streaming once it's replugged (the page itself only picks up the "video is
 back" state on its next load or reconnect, since the resolution dropdown
 is filled in when the page connects, not continuously).
 
-The capture card's reconnect is noticed immediately: the server listens
-directly on the Linux kernel's own device-change broadcast
-(`NETLINK_KOBJECT_UEVENT`, the same channel udev listens on), rather than
-going through udev itself - the Wyse 3040 image this runs on has no udev
-daemon (it uses the simpler `mdev` instead), so udev's own notifications
-never fire there. Listening straight to the kernel works regardless of
-what (if anything) is managing devices. A slow, infrequent poll still runs
-alongside it as a safety net in case that listener can't be opened.
+Both the capture card's and the CH9329's reconnects are noticed
+immediately: the server listens directly on the Linux kernel's own
+device-change broadcast (`NETLINK_KOBJECT_UEVENT`, the same channel udev
+listens on), rather than going through udev itself - the Wyse 3040 image
+this runs on has no udev daemon (it uses the simpler `mdev` instead), so
+udev's own notifications never fire there. Listening straight to the
+kernel works regardless of what (if anything) is managing devices. A slow,
+infrequent poll still runs alongside it as a safety net in case that
+listener can't be opened.
 
 **Dropdown changes are saved automatically** - there's no separate "save"
 step required. Changing video mode, resolution, or mouse mode applies
@@ -193,7 +195,9 @@ if you need to change one):
 ## Releasing a new version
 
 1. Push this repo to GitHub, with Actions enabled.
-2. Push a version tag, e.g.:
+2. Bump `version` in `Cargo.toml` to match the tag you're about to push
+   (the server logs this version at startup, so it needs to stay in sync).
+3. Push a version tag, e.g.:
    ```sh
    git tag v0.1.0
    git push origin v0.1.0

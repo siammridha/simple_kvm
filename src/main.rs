@@ -3,6 +3,7 @@ mod ch9329;
 mod config;
 mod settings_store;
 mod tls;
+mod uevent;
 mod video_bus;
 mod web;
 mod webtransport;
@@ -24,7 +25,7 @@ use config::{CaptureSettings, MouseMode, VideoMode};
 #[tokio::main]
 async fn main() -> Result<()> {
     init_logging();
-    tracing::info!("simple_kvm starting");
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "simple_kvm starting");
 
     // axum-server's rustls integration needs a process-default crypto
     // provider installed; wtransport builds its own provider explicitly
@@ -83,7 +84,7 @@ async fn main() -> Result<()> {
     // so this delay doesn't hold up the HTTP page or WebTransport server
     // starting. ---
     let (serial_tx, serial_rx) = mpsc::channel::<SerialCommand>(256);
-    tokio::spawn(open_serial_after_delay(serial_path, serial_open_delay_secs, serial_rx));
+    tokio::spawn(open_serial_after_delay(serial_path, serial_open_delay_secs, serial_tx.clone(), serial_rx));
 
     let cert_manager = Arc::new(match (tls_cert_path, tls_key_path) {
         (Some(cert_path), Some(key_path)) => {
@@ -133,11 +134,12 @@ fn env_parsed<T: std::str::FromStr>(key: &str) -> Option<T> {
 /// checks whether the CH9329 is actually plugged in before every command,
 /// so it's a no-op whenever the device isn't there and picks back up on
 /// its own once it is — no need to decide that once, up front, here.
-async fn open_serial_after_delay(serial_path: String, delay_secs: u64, serial_rx: mpsc::Receiver<SerialCommand>) {
+async fn open_serial_after_delay(serial_path: String, delay_secs: u64, serial_tx: mpsc::Sender<SerialCommand>, serial_rx: mpsc::Receiver<SerialCommand>) {
     if delay_secs > 0 {
         tracing::info!(seconds = delay_secs, "waiting before opening CH9329 serial port");
         tokio::time::sleep(Duration::from_secs(delay_secs)).await;
     }
+    tokio::spawn(writer::watch_connection(serial_tx));
     let writer = writer::SerialWriter::new(serial_path);
     let _ = tokio::task::spawn_blocking(move || writer.run(serial_rx)).await;
 }

@@ -16,11 +16,18 @@ use anyhow::{Context, Result};
 use serialport::SerialPort;
 use tokio::sync::mpsc;
 
+use crate::uevent::UeventListener;
+
 use super::{paste, protocol};
 
 const BAUD_RATE: u32 = 9600;
 const OPEN_TIMEOUT: Duration = Duration::from_millis(500);
 const KEY_HOLD_DELAY: Duration = Duration::from_millis(20);
+/// Safety-net interval for noticing the CH9329 has reconnected, in case
+/// `watch_connection`'s kernel uevent listener couldn't be opened (or a
+/// notification was somehow missed) — mirrors `capture`'s
+/// `DEVICE_POLL_INTERVAL` for the same reason.
+const CONNECTION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub enum SerialCommand {
@@ -39,6 +46,12 @@ pub enum SerialCommand {
     MouseRelativeMove { buttons: u8, dx: i8, dy: i8, wheel: i8 },
     /// Types `text` out as a sequence of keystrokes (US QWERTY only).
     PasteText(String),
+    /// Sent by `watch_connection` whenever the kernel reports a `tty`
+    /// device change (or the fallback poll timer fires) — carries no data
+    /// of its own, just prompts `handle` to re-run `sync_connection_state`
+    /// so a reconnect is noticed immediately instead of waiting for the
+    /// next real keystroke or click.
+    CheckConnection,
 }
 
 /// Opens the CH9329's serial port. Returns `Ok(None)` (not an error) if no
@@ -117,6 +130,7 @@ impl SerialWriter {
                 self.write_packet(&protocol::mouse_relative(buttons, dx, dy, wheel))
             }
             SerialCommand::PasteText(text) => self.type_text(&text),
+            SerialCommand::CheckConnection => Ok(()), // sync_connection_state() above already did the work
         };
         if let Err(err) = result {
             tracing::error!(%err, "failed to write CH9329 command, dropping the connection until it reconnects");
@@ -141,5 +155,43 @@ impl SerialWriter {
         while let Some(cmd) = commands.blocking_recv() {
             self.handle(cmd);
         }
+    }
+}
+
+/// Runs forever, prompting `SerialWriter::run` (via `commands`) to re-check
+/// whether the CH9329 is plugged in as soon as the kernel reports a `tty`
+/// device change — the same immediate-detection treatment
+/// `capture::CaptureManager` gives the capture card, applied here to the
+/// CH9329/CH340 side. `CONNECTION_POLL_INTERVAL` is only a fallback for
+/// when the uevent listener can't be opened (or a notification is missed);
+/// it doesn't gate anything on its own.
+pub async fn watch_connection(commands: mpsc::Sender<SerialCommand>) {
+    let mut uevents = match UeventListener::open() {
+        Ok(listener) => Some(listener),
+        Err(err) => {
+            tracing::warn!(%err, "failed to open kernel uevent listener, falling back to polling only for CH9329 reconnects");
+            None
+        }
+    };
+    loop {
+        tokio::select! {
+            _ = wait_for_uevent(&mut uevents) => {}
+            _ = tokio::time::sleep(CONNECTION_POLL_INTERVAL) => {}
+        }
+        if commands.send(SerialCommand::CheckConnection).await.is_err() {
+            return; // writer loop exited, nothing left to watch for
+        }
+    }
+}
+
+/// `tty` is the kernel subsystem name for the character device a
+/// USB-serial adapter like the CH340 registers (`/dev/ttyUSB0`) — unrelated
+/// uevents (USB, video4linux, ...) are ignored. Never resolves when
+/// `uevents` is `None` (listener failed to open), so this branch simply
+/// never wins the `select!` above and the timer takes over instead.
+async fn wait_for_uevent(uevents: &mut Option<UeventListener>) {
+    match uevents {
+        Some(listener) => listener.wait_for_subsystem("tty").await,
+        None => std::future::pending().await,
     }
 }
