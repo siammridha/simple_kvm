@@ -42,16 +42,23 @@ ip>:3000` with:
     weak for real-time software video encoding - expect this mode to be
     choppy. MJPEG is the practical default. The encoder inserts a
     keyframe every 60 frames so a browser that (re)connects mid-stream
-    has something to start decoding from - without it, only the very
-    first frame of a capture session would ever be a keyframe, and
-    joining any later would leave the video stuck.
+    has something to start decoding from, and also produces one
+    immediately whenever a connected browser's own decoder asks for one
+    (standard WebRTC keyframe-request feedback) - without either, only
+    the very first frame of a capture session would ever be a keyframe,
+    and joining any later would leave the video stuck.
 - **Resolution dropdown**, populated from whatever the capture card
   actually reports supporting (queried at startup) - not a hardcoded
   list.
-- **Frame rate dropdown** (5, 10, or 25 fps, default 5) - sent to the
-  capture card via V4L2's frame-interval negotiation. The card is free to
-  negotiate a different rate than requested; a mismatch is logged, not
-  shown on the page.
+- **Frame rate dropdown**, populated from whatever the capture card
+  actually reports supporting for the current video mode and resolution
+  (queried at startup, like the resolution dropdown) - not a hardcoded
+  list, since real hardware supports different rates for MJPEG vs. YUYV
+  and for different resolutions. Sent to the capture card via V4L2's
+  frame-interval negotiation; the card is still free to negotiate a
+  different rate than requested (a mismatch is logged, not shown on the
+  page), but picking through the page only ever offers rates the card
+  itself reported.
 - **Mouse clicks and scroll wheel**, absolute or relative mode, also
   switched via **Save settings**; on the CH9329 hardware this repo was
   built against, clicks and scroll wheel only work through its *relative*
@@ -68,8 +75,10 @@ ip>:3000` with:
   meant for a trusted LAN, not the open internet.
 
 The server runs fine with no capture card or CH9329 attached - the page
-still loads, dropdowns just reflect "no video device," and keyboard/mouse
-input is silently dropped instead of the service failing to start. Useful
+still loads, video mode/frame rate/resolution dropdowns are disabled and
+reflect "no video device," the mouse mode dropdown is disabled too, and
+keyboard/mouse input is silently dropped instead of the service failing
+to start. Useful
 for development without the hardware plugged in. This also covers either
 device disconnecting after the service has already started, and both
 recover on their own once reconnected, no restart needed: the CH9329
@@ -78,7 +87,8 @@ plugged back in (noticed immediately, not just on the next key or click -
 see below); the capture card pauses video the same way and resumes
 streaming once it's replugged. The page picks this up live, too - the
 resolution dropdown and "no video device" status update immediately on an
-already-open tab, not just on the next load or reconnect.
+already-open tab, and the relevant dropdowns enable/disable to match, not
+just on the next load or reconnect.
 
 Both the capture card's and the CH9329's reconnects are noticed
 immediately: the server listens directly on the Linux kernel's own

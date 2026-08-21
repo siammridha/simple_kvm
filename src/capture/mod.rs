@@ -21,6 +21,13 @@ use v4l2::{PixelFormat, SupportedFormat};
 /// notification was somehow missed, so it doesn't need to be tight.
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Preferred fps for `CaptureManager::default_settings()` — picked from
+/// whatever the card actually supports at its default resolution rather
+/// than assumed, since fps support varies by both pixel format and
+/// resolution on real hardware (confirmed via `v4l2-ctl
+/// --list-formats-ext` on the real device).
+const DEFAULT_TARGET_FPS: u32 = 10;
+
 pub struct CaptureManager {
     device_path: String,
     formats: Vec<SupportedFormat>,
@@ -42,8 +49,15 @@ impl CaptureManager {
     }
 
     pub fn default_settings(&self) -> Option<CaptureSettings> {
-        let (_pixel_format, resolution) = v4l2::pick_default(&self.formats)?;
-        Some(CaptureSettings { video_mode: VideoMode::Mjpeg, resolution, fps: 5 })
+        let (pixel_format, resolution) = v4l2::pick_default(&self.formats)?;
+        let fps = self
+            .formats
+            .iter()
+            .find(|f| f.pixel_format == pixel_format)
+            .and_then(|f| f.frame_rates.get(&resolution))
+            .and_then(|rates| rates.iter().copied().filter(|&r| r <= DEFAULT_TARGET_FPS).max().or_else(|| rates.iter().copied().min()))
+            .unwrap_or(DEFAULT_TARGET_FPS);
+        Some(CaptureSettings { video_mode: VideoMode::Mjpeg, resolution, fps })
     }
 
     /// The card's current availability and resolution list for `settings`'s
@@ -69,7 +83,13 @@ impl CaptureManager {
     /// capture loop whenever `settings` changes and publishes frames onto
     /// `video_bus`; whenever it's absent (never plugged in, or unplugged
     /// mid-session), polls until it reappears instead of exiting for good.
-    pub async fn run(self, mut settings: watch::Receiver<CaptureSettings>, video_bus: video_bus::Sender, device_state_tx: watch::Sender<DeviceState>) {
+    pub async fn run(
+        self,
+        mut settings: watch::Receiver<CaptureSettings>,
+        video_bus: video_bus::Sender,
+        device_state_tx: watch::Sender<DeviceState>,
+        force_keyframe: Arc<AtomicBool>,
+    ) {
         let device_path = self.device_path;
         let mut known_present = false;
         let mut uevents = match uevent::UeventListener::open() {
@@ -121,9 +141,10 @@ impl CaptureManager {
             let stop = Arc::new(AtomicBool::new(false));
             let stop_task = Arc::clone(&stop);
             let video_bus_task = video_bus.clone();
+            let force_keyframe_task = force_keyframe.clone();
 
             let mut handle = tokio::task::spawn_blocking(move || {
-                run_one_pass(&device_path_task, &formats, &current, stop_task, video_bus_task)
+                run_one_pass(&device_path_task, &formats, &current, stop_task, video_bus_task, force_keyframe_task)
             });
 
             tokio::select! {
@@ -193,6 +214,7 @@ fn run_one_pass(
     settings: &CaptureSettings,
     stop: Arc<AtomicBool>,
     video_bus: video_bus::Sender,
+    force_keyframe: Arc<AtomicBool>,
 ) {
     let Some(pixel_format) = pixel_format_for(formats, settings.video_mode) else {
         tracing::error!(?settings.video_mode, "capture device doesn't support the pixel format this video mode needs, no video this pass");
@@ -217,7 +239,8 @@ fn run_one_pass(
             None
         };
 
-        move |frame: &[u8]| {
+        move |frame: &[u8], captured_at: v4l2::Timestamp| {
+            let captured_at = v4l2::timestamp_to_duration(captured_at);
             let envelope = match video_mode {
                 VideoMode::Mjpeg => {
                     let jpeg = match pixel_format {
@@ -230,14 +253,21 @@ fn run_one_pass(
                             }
                         },
                     };
-                    FrameEnvelope { kind: FrameKind::Mjpeg, data: jpeg.into() }
+                    FrameEnvelope { kind: FrameKind::Mjpeg, data: jpeg.into(), captured_at }
                 }
                 VideoMode::H264 => {
                     let Some(encoder) = h264_encoder.as_mut() else {
                         return;
                     };
+                    // A session asked (via RTCP PLI/FIR) for a fresh
+                    // keyframe sooner than the encoder's own periodic
+                    // schedule — see `rtc::session::handle`'s
+                    // `video_track.poll()` branch.
+                    if force_keyframe.swap(false, Ordering::Relaxed) {
+                        encoder.force_intra_frame();
+                    }
                     match encoder.encode_yuyv_frame(frame) {
-                        Ok(bytes) => FrameEnvelope { kind: FrameKind::H264, data: bytes.into() },
+                        Ok(bytes) => FrameEnvelope { kind: FrameKind::H264, data: bytes.into(), captured_at },
                         Err(err) => {
                             tracing::error!(%err, "H.264 encode failed");
                             return;
@@ -276,9 +306,11 @@ fn device_state_for(formats: &[SupportedFormat], settings: &CaptureSettings) -> 
     if formats.is_empty() {
         return DeviceState::default();
     }
-    let resolutions = pixel_format_for(formats, settings.video_mode)
-        .and_then(|pf| formats.iter().find(|f| f.pixel_format == pf))
-        .map(|f| f.resolutions.clone())
-        .unwrap_or_default();
-    DeviceState { available: true, resolutions, default_resolution: Some(settings.resolution) }
+    let format = pixel_format_for(formats, settings.video_mode).and_then(|pf| formats.iter().find(|f| f.pixel_format == pf));
+    let resolutions = format.map(|f| f.resolutions.clone()).unwrap_or_default();
+    // Falls back to just the currently-applied fps if the card didn't
+    // report a discrete list for this resolution — the dropdown should
+    // never be empty, and the applied value is always a valid option.
+    let frame_rates = format.and_then(|f| f.frame_rates.get(&settings.resolution)).cloned().unwrap_or_else(|| vec![settings.fps]);
+    DeviceState { available: true, resolutions, frame_rates, default_resolution: Some(settings.resolution) }
 }

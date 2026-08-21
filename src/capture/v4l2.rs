@@ -7,17 +7,21 @@
 //! anyway (per the concurrency design — a settings change stops the loop
 //! and starts a fresh one), so there's no need to fight the lifetime.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use v4l::buffer::Type as BufferType;
 use v4l::format::FourCC;
+use v4l::frameinterval::FrameIntervalEnum;
 use v4l::io::mmap::Stream as MmapStream;
 use v4l::io::traits::CaptureStream;
 use v4l::video::capture::Parameters;
 use v4l::video::Capture;
 use v4l::{Device, Format};
+
+pub use v4l::timestamp::Timestamp;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Resolution {
@@ -52,10 +56,19 @@ impl PixelFormat {
 pub struct SupportedFormat {
     pub pixel_format: PixelFormat,
     pub resolutions: Vec<Resolution>,
+    /// Frame rates (fps) the card actually reports for each resolution
+    /// (`VIDIOC_ENUM_FRAMEINTERVALS`) — support genuinely varies by both
+    /// pixel format and resolution on real hardware (confirmed via
+    /// `v4l2-ctl --list-formats-ext` on the real device: e.g. YUYV offers
+    /// only 5/10fps at 1080p but 10/25fps at 720p). A resolution missing
+    /// from this map (continuous/"stepwise" rates, or the query failing)
+    /// just means no discrete list is available for it.
+    pub frame_rates: HashMap<Resolution, Vec<u32>>,
 }
 
-/// Queries the card at `path` for every capture format/resolution it
-/// actually supports (formats we don't know how to use are skipped).
+/// Queries the card at `path` for every capture format/resolution/frame
+/// rate it actually supports (formats we don't know how to use are
+/// skipped).
 pub fn enumerate(path: &str) -> Result<Vec<SupportedFormat>> {
     let dev = Device::with_path(path).with_context(|| format!("opening {path}"))?;
     let mut out = Vec::new();
@@ -81,9 +94,44 @@ pub fn enumerate(path: &str) -> Result<Vec<SupportedFormat>> {
             .collect();
         resolutions.sort_by_key(|r| std::cmp::Reverse(r.width * r.height));
         resolutions.dedup();
-        out.push(SupportedFormat { pixel_format, resolutions });
+
+        let mut frame_rates = HashMap::new();
+        for resolution in &resolutions {
+            let rates = frame_rates_for(&dev, desc.fourcc, *resolution);
+            if !rates.is_empty() {
+                frame_rates.insert(*resolution, rates);
+            }
+        }
+
+        out.push(SupportedFormat { pixel_format, resolutions, frame_rates });
     }
     Ok(out)
+}
+
+/// Discrete frame rates (fps) the card reports for `fourcc` at
+/// `resolution`, sorted descending and deduped. Continuous/"stepwise"
+/// entries are skipped (none showed up on the real device this targets),
+/// and a failed query just yields an empty list rather than an error —
+/// callers already treat a missing/empty entry as "fall back to whatever's
+/// currently configured".
+fn frame_rates_for(dev: &Device, fourcc: FourCC, resolution: Resolution) -> Vec<u32> {
+    let intervals = match dev.enum_frameintervals(fourcc, resolution.width, resolution.height) {
+        Ok(intervals) => intervals,
+        Err(err) => {
+            tracing::debug!(%err, ?resolution, "failed to enumerate frame intervals for this resolution");
+            return Vec::new();
+        }
+    };
+    let mut rates: Vec<u32> = intervals
+        .into_iter()
+        .filter_map(|interval| match interval.interval {
+            FrameIntervalEnum::Discrete(fraction) if fraction.numerator != 0 => Some(fraction.denominator / fraction.numerator),
+            _ => None,
+        })
+        .collect();
+    rates.sort_unstable_by_key(|&fps| std::cmp::Reverse(fps));
+    rates.dedup();
+    rates
 }
 
 /// Picks a sensible default (format, resolution) from an enumeration:
@@ -125,7 +173,7 @@ pub fn run_capture_loop<H>(
     make_handler: impl FnOnce(Resolution) -> H,
 ) -> Result<()>
 where
-    H: FnMut(&[u8]),
+    H: FnMut(&[u8], Timestamp),
 {
     let dev = Device::with_path(path).with_context(|| format!("opening {path}"))?;
     let requested = Format::new(resolution.width, resolution.height, pixel_format.fourcc());
@@ -148,12 +196,20 @@ where
 
     while !should_stop() {
         match stream.next() {
-            Ok((buf, _meta)) => on_frame(buf),
+            Ok((buf, meta)) => on_frame(buf, meta.timestamp),
             Err(err) if err.kind() == std::io::ErrorKind::TimedOut => continue,
             Err(err) => return Err(err).context("reading capture frame"),
         }
     }
     Ok(())
+}
+
+/// Converts a driver capture timestamp to a `Duration` since some
+/// arbitrary but consistent monotonic origin — only meaningful as a delta
+/// between two frames, never as an absolute value (see
+/// `video_bus::FrameEnvelope::captured_at`).
+pub fn timestamp_to_duration(ts: Timestamp) -> Duration {
+    Duration::new(ts.sec.max(0) as u64, (ts.usec.max(0) as u32).saturating_mul(1000))
 }
 
 /// `None` if `interval` matches `requested` fps (or is degenerate); `Some`
@@ -178,6 +234,7 @@ mod tests {
             .map(|(pixel_format, resolutions)| SupportedFormat {
                 pixel_format: *pixel_format,
                 resolutions: resolutions.iter().map(|&(width, height)| Resolution { width, height }).collect(),
+                frame_rates: HashMap::new(),
             })
             .collect()
     }

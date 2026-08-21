@@ -9,15 +9,20 @@
 use anyhow::Result;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use rtc::media::Sample;
+use rtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
+use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+use rtc::rtcp::Packet;
 use rtc::rtp_transceiver::PayloadType;
 use tokio::sync::{mpsc, watch};
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
+use webrtc::media_stream::track_local::{TrackLocal, TrackLocalEvent};
 use webrtc::media_stream::Track;
 use webrtc::peer_connection::PeerConnection;
 use webrtc::rtp_transceiver::RtpSender;
@@ -41,6 +46,7 @@ pub struct SessionContext {
     pub device_state_rx: watch::Receiver<DeviceState>,
     pub hid_connected_rx: watch::Receiver<bool>,
     pub settings_path: PathBuf,
+    pub force_keyframe: Arc<AtomicBool>,
 }
 
 /// The three data channels the browser creates before sending its offer
@@ -110,6 +116,12 @@ pub async fn handle(
     let mut mjpeg_active = true;
     let mut input_active = true;
     let mut control_open = false;
+    // The real capture-time delta between consecutive H.264 frames, used
+    // as each RTP sample's duration so the browser's jitter buffer gets
+    // correct pacing info — see `send_frame`. `None` only for the very
+    // first H.264 frame of a session, which has no prior frame to diff
+    // against.
+    let mut last_h264_captured_at: Option<Duration> = None;
     // Set once the video_bus sender is gone for good (only happens if the
     // capture task itself is torn down, e.g. process shutdown - it no
     // longer exits just because the card is absent or unplugged, see
@@ -125,10 +137,25 @@ pub async fn handle(
                     Ok(()) => {
                         let frame = video_rx.borrow_and_update().clone();
                         if let Some(frame) = frame {
-                            send_frame(frame.kind, &frame.data, mjpeg_open, &mjpeg, &video_track, video_target.as_ref().ok().copied()).await;
+                            let duration = if frame.kind == FrameKind::H264 {
+                                last_h264_captured_at.map(|t| frame.captured_at.saturating_sub(t)).unwrap_or(Duration::ZERO)
+                            } else {
+                                Duration::ZERO
+                            };
+                            if frame.kind == FrameKind::H264 {
+                                last_h264_captured_at = Some(frame.captured_at);
+                            }
+                            send_frame(frame.kind, &frame.data, duration, mjpeg_open, &mjpeg, &video_track, video_target.as_ref().ok().copied()).await;
                         }
                     }
                     Err(_) => video_closed = true,
+                }
+            }
+            event = video_track.poll(), if video_target.is_ok() => {
+                if let Some(TrackLocalEvent::OnRtcpPacket(packets)) = event {
+                    if packets.iter().any(is_keyframe_request) {
+                        ctx.force_keyframe.store(true, Ordering::Relaxed);
+                    }
                 }
             }
             event = mjpeg.poll(), if mjpeg_active => {
@@ -284,6 +311,7 @@ async fn send_server_message(control: &Arc<dyn DataChannel>, msg: &ServerMessage
 async fn send_frame(
     kind: FrameKind,
     data: &Arc<[u8]>,
+    duration: Duration,
     mjpeg_open: bool,
     mjpeg: &Arc<dyn DataChannel>,
     video_track: &TrackLocalStaticSample,
@@ -297,12 +325,20 @@ async fn send_frame(
         }
         FrameKind::H264 => {
             let Some((ssrc, payload_type)) = video_target else { return };
-            let sample = Sample { data: Bytes::copy_from_slice(data), duration: Duration::ZERO, ..Default::default() };
+            let sample = Sample { data: Bytes::copy_from_slice(data), duration, ..Default::default() };
             if let Err(err) = video_track.sample_writer(ssrc, payload_type).write_sample(&sample).await {
                 tracing::debug!(%err, "failed to send H.264 frame, dropping it");
             }
         }
     }
+}
+
+/// Whether any packet in an incoming RTCP batch is a keyframe request
+/// (PLI or FIR) — the browser sends these automatically when its decoder
+/// can't make progress without a fresh keyframe (see `handle`'s
+/// `video_track.poll()` branch).
+fn is_keyframe_request(packet: &Box<dyn Packet>) -> bool {
+    packet.as_any().downcast_ref::<PictureLossIndication>().is_some() || packet.as_any().downcast_ref::<FullIntraRequest>().is_some()
 }
 
 /// Above this, the queue-time log below fires at `warn` instead of `debug`
@@ -368,6 +404,14 @@ fn handle_control_message(msg: ControlMessage, ctx: &SessionContext) {
 
             if had_update {
                 let settings = PersistedSettings { capture: *ctx.capture_settings_rx.borrow(), mouse_mode: *ctx.mouse_mode_rx.borrow() };
+                tracing::info!(
+                    ?settings.capture.video_mode,
+                    width = settings.capture.resolution.width,
+                    height = settings.capture.resolution.height,
+                    fps = settings.capture.fps,
+                    ?settings.mouse_mode,
+                    "settings updated"
+                );
                 let path = ctx.settings_path.clone();
                 tokio::spawn(async move {
                     if let Err(err) = tokio::task::spawn_blocking(move || settings_store::save(&path, settings)).await {
@@ -410,6 +454,7 @@ mod tests {
             device_state_rx,
             hid_connected_rx,
             settings_path,
+            force_keyframe: Arc::new(AtomicBool::new(false)),
         }
     }
 

@@ -5,6 +5,7 @@
 //! CPU-constrained device.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::watch;
 
@@ -18,6 +19,13 @@ pub enum FrameKind {
 pub struct FrameEnvelope {
     pub kind: FrameKind,
     pub data: Arc<[u8]>,
+    /// When the capture driver says this frame actually came off the
+    /// card (`v4l::buffer::Metadata::timestamp`, converted to a
+    /// `Duration` since some arbitrary but consistent monotonic origin)
+    /// — used to pace H.264 RTP timestamps by the real inter-frame
+    /// interval instead of a nominal fps. Only the delta between two
+    /// frames' values is meaningful, never the absolute value.
+    pub captured_at: Duration,
 }
 
 pub type Sender = watch::Sender<Option<FrameEnvelope>>;

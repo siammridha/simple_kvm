@@ -68,11 +68,42 @@ function updateVideoElementVisibility() {
   canvas.style.display = showVideoEl ? 'none' : '';
 }
 
+function populateFrameRates(frameRates, currentFps) {
+  frameRateSelect.innerHTML = '';
+  if (frameRates.length === 0) {
+    const opt = document.createElement('option');
+    opt.textContent = 'no video device';
+    opt.disabled = true;
+    frameRateSelect.appendChild(opt);
+    return;
+  }
+  for (const fps of frameRates) {
+    const opt = document.createElement('option');
+    opt.value = fps;
+    opt.textContent = `${fps} fps`;
+    frameRateSelect.appendChild(opt);
+  }
+  if (currentFps !== undefined) {
+    frameRateSelect.value = currentFps;
+  }
+}
+
+// Reflects device_state/hid_state availability onto the controls
+// themselves - Save already silently drops whichever half isn't
+// available (see the click handler below), this just makes that visible.
+function updateSettingsAvailability() {
+  videoModeSelect.disabled = !captureAvailable;
+  frameRateSelect.disabled = !captureAvailable;
+  resolutionSelect.disabled = !captureAvailable || resolutionSelect.options.length === 0;
+  mouseModeSelect.disabled = !hidAvailable;
+}
+
 async function connect() {
   const { version } = window.SERVER_CONFIG;
   versionEl.textContent = `v${version}`;
 
   setStatus('connecting…');
+  updateSettingsAvailability();
   const pc = new RTCPeerConnection();
 
   pc.addEventListener('connectionstatechange', () => {
@@ -138,6 +169,8 @@ function handleServerMessage(msg) {
   if (msg.type === 'device_state') {
     captureAvailable = msg.available;
     populateResolutions(msg.resolutions, msg.default_resolution);
+    populateFrameRates(msg.frame_rates, undefined);
+    updateSettingsAvailability();
     if (!msg.available) {
       setStatus('no video device found', true);
     } else if (statusEl.textContent === 'no video device found') {
@@ -145,6 +178,7 @@ function handleServerMessage(msg) {
     }
   } else if (msg.type === 'hid_state') {
     hidAvailable = msg.available;
+    updateSettingsAvailability();
   } else if (msg.type === 'settings') {
     videoModeSelect.value = msg.capture.video_mode;
     frameRateSelect.value = msg.capture.fps;

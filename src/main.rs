@@ -9,6 +9,8 @@ mod web;
 
 use std::env;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -54,6 +56,7 @@ async fn main() -> Result<()> {
     let (mouse_mode_tx, _mouse_mode_rx) = watch::channel(default_mouse_mode);
     let (video_bus_tx, video_bus_rx) = video_bus::channel();
     let (hid_connected_tx, hid_connected_rx) = watch::channel(false);
+    let force_keyframe = Arc::new(AtomicBool::new(false));
 
     // --- Serial: same soft-unavailable treatment as capture. Commands sent
     // to `serial_tx` before the port is open just queue up in the channel,
@@ -69,6 +72,7 @@ async fn main() -> Result<()> {
         device_state_rx,
         hid_connected_rx,
         settings_path,
+        force_keyframe: force_keyframe.clone(),
     };
     let http_addr = std::net::SocketAddr::from(([0, 0, 0, 0], http_port));
     tracing::info!(port = http_port, "page and WebRTC signaling server listening");
@@ -85,7 +89,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    let capture_handle = tokio::spawn(capture_manager.run(capture_settings_rx, video_bus_tx, device_state_tx));
+    let capture_handle = tokio::spawn(capture_manager.run(capture_settings_rx, video_bus_tx, device_state_tx, force_keyframe));
 
     let _ = tokio::join!(http_handle, capture_handle);
     Ok(())

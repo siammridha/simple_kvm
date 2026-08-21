@@ -30,6 +30,14 @@ impl H264Encoder {
         Ok(Self { encoder, width: width as usize, height: height as usize })
     }
 
+    /// Forces the next encoded frame to be a keyframe, ahead of the
+    /// periodic schedule (`INTRA_FRAME_PERIOD`) — used when a session's
+    /// RTCP feedback (PLI/FIR) says its decoder needs one sooner, see
+    /// `rtc::session::handle` and `capture::run_one_pass`.
+    pub fn force_intra_frame(&mut self) {
+        self.encoder.force_intra_frame();
+    }
+
     /// Encodes one raw YUYV (4:2:2) frame into an H.264 access unit.
     pub fn encode_yuyv_frame(&mut self, yuyv: &[u8]) -> Result<Vec<u8>> {
         let i420 = yuyv_to_i420(yuyv, self.width, self.height);

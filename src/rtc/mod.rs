@@ -2,6 +2,7 @@ pub mod protocol;
 pub mod session;
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -11,6 +12,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use rtc::peer_connection::configuration::media_engine::MIME_TYPE_H264;
+use rtc::peer_connection::configuration::setting_engine::{SctpMaxMessageSize, SettingEngine};
 use rtc::rtp_transceiver::rtp_sender::{RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind};
 use webrtc::data_channel::DataChannel;
 use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
@@ -39,6 +41,11 @@ pub struct SharedChannels {
     pub device_state_rx: watch::Receiver<DeviceState>,
     pub hid_connected_rx: watch::Receiver<bool>,
     pub settings_path: PathBuf,
+    /// Set by a session on an RTCP keyframe request (PLI/FIR), cleared by
+    /// the capture task once it's forced a fresh keyframe — see
+    /// `session::handle`'s `video_track.poll()` branch and
+    /// `capture::run_one_pass`.
+    pub force_keyframe: Arc<AtomicBool>,
 }
 
 #[derive(Deserialize)]
@@ -128,6 +135,15 @@ async fn negotiate(offer_sdp: String, channels: SharedChannels) -> Result<String
     media_engine.register_codec(h264_codec.clone(), RtpCodecKind::Video).context("registering H.264 codec")?;
     let registry = register_default_interceptors(Registry::new(), &mut media_engine).context("registering RTP interceptors")?;
 
+    // Neither side configures this otherwise, so both fall back to the RFC
+    // 8841 default of 64KB — and since the crate takes the min of our
+    // configured value and the browser's, our default is what ends up
+    // binding. A JPEG frame from the capture card routinely exceeds 64KB,
+    // so every MJPEG send fails outright without this. A generous local
+    // value has no downside: the browser's own (lower) cap still applies.
+    let mut setting_engine = SettingEngine::default();
+    setting_engine.set_sctp_max_message_size(SctpMaxMessageSize::Bounded(4 * 1024 * 1024));
+
     let (gather_complete, gather_complete_rx) = OnceSignal::new();
     let (dc_tx, dc_rx) = mpsc::unbounded_channel();
     let handler = Arc::new(Handler { gather_complete, dc_tx });
@@ -137,6 +153,7 @@ async fn negotiate(offer_sdp: String, channels: SharedChannels) -> Result<String
             .with_configuration(RTCConfigurationBuilder::new().build())
             .with_media_engine(media_engine)
             .with_interceptor_registry(registry)
+            .with_setting_engine(setting_engine)
             .with_handler(handler)
             .with_udp_addrs(vec!["0.0.0.0:0".to_string()])
             .build()
@@ -178,6 +195,7 @@ async fn negotiate(offer_sdp: String, channels: SharedChannels) -> Result<String
         device_state_rx: channels.device_state_rx,
         hid_connected_rx: channels.hid_connected_rx,
         settings_path: channels.settings_path,
+        force_keyframe: channels.force_keyframe,
     };
     let pc_for_session = peer_connection.clone();
     tokio::spawn(async move {

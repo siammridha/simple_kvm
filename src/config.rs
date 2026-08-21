@@ -33,6 +33,9 @@ pub struct DeviceState {
     pub available: bool,
     pub resolutions: Vec<Resolution>,
     pub default_resolution: Option<Resolution>,
+    /// Frame rates (fps) the card reports for the currently-applied
+    /// resolution — populated by `capture::device_state_for`.
+    pub frame_rates: Vec<u32>,
 }
 
 /// Mouse mode doesn't affect the capture pipeline — it's purely which
