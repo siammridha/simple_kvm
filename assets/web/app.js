@@ -1,10 +1,11 @@
-// simple_kvm client: reads bootstrap data (WebTransport port, version) from
-// window.SERVER_CONFIG, embedded server-side into the page itself, opens a
-// WebTransport session, streams video frames from server-opened
-// unidirectional streams onto the canvas, and relays keyboard/mouse input
-// back as small binary datagrams. One bidirectional stream carries settings
-// updates and paste text as JSON-lines, and receives device-state/settings
-// pushes from the server the same way.
+// simple_kvm client: opens an RTCPeerConnection over plain HTTP signaling
+// (POST /rtc/offer, no trickle ICE — see connect()), receives H.264 video
+// as a native WebRTC track rendered into a <video> element, and receives
+// MJPEG frames as blobs on a data channel drawn onto a <canvas>. Keyboard
+// and mouse input goes out as small binary messages on an
+// unreliable/unordered data channel, and settings updates/paste text go
+// out as JSON on a reliable data channel, which also carries
+// device-state/settings pushes back from the server.
 
 const TAG_KEY_EVENT = 1;
 const TAG_MOUSE_RELATIVE_MOVE = 3;
@@ -13,6 +14,8 @@ const TAG_MOUSE_BUTTONS = 4;
 const statusEl = document.getElementById('status');
 const canvas = document.getElementById('video');
 const ctx2d = canvas.getContext('2d');
+const videoEl = document.getElementById('video-el');
+const inputSurface = document.getElementById('video-surface');
 const videoModeSelect = document.getElementById('video-mode');
 const frameRateSelect = document.getElementById('frame-rate');
 const resolutionSelect = document.getElementById('resolution');
@@ -23,21 +26,14 @@ const saveSettings = document.getElementById('save-settings');
 const saveSettingsStatus = document.getElementById('save-settings-status');
 const versionEl = document.getElementById('version');
 
-let controlWriter = null;
-let datagramWriter = null;
-let videoDecoder = null;
-let decoderConfigured = false;
+let controlChannel = null;
+let inputChannel = null;
 // Whether the capture card / CH9329 are actually connected right now, per
 // the server's device_state/hid_state pushes - gates which half of a Save
 // gets sent, since there's nothing meaningful to save for a device that
 // isn't there.
 let captureAvailable = false;
 let hidAvailable = false;
-// A fresh decoder (or one that just errored) can't decode a delta frame
-// until it's seen a keyframe - feeding it one throws and, per WebCodecs,
-// permanently closes the decoder. Dropping delta frames until the next
-// real keyframe avoids that instead of erroring on every frame forever.
-let awaitingKeyframe = true;
 
 function setStatus(text, isError) {
   statusEl.textContent = text;
@@ -66,58 +62,76 @@ function populateResolutions(resolutions, defaultResolution) {
   }
 }
 
+function updateVideoElementVisibility() {
+  const showVideoEl = videoModeSelect.value === 'h264';
+  videoEl.style.display = showVideoEl ? '' : 'none';
+  canvas.style.display = showVideoEl ? 'none' : '';
+}
+
 async function connect() {
-  const { webtransportPort, version, certHash } = window.SERVER_CONFIG;
+  const { version } = window.SERVER_CONFIG;
   versionEl.textContent = `v${version}`;
 
-  const url = `https://${location.hostname}:${webtransportPort}/kvm`;
-
   setStatus('connecting…');
-  const transport = new WebTransport(url, {
-    serverCertificateHashes: [{ algorithm: 'sha-256', value: new Uint8Array(certHash) }],
-    allowPooling: false,
+  const pc = new RTCPeerConnection();
+
+  pc.addEventListener('connectionstatechange', () => {
+    if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+      setStatus('disconnected - reload the page to reconnect', true);
+    } else if (pc.connectionState === 'disconnected') {
+      setStatus('connection lost - reload the page to reconnect', true);
+    }
   });
 
-  transport.closed
-    .then(() => {
-      setStatus('disconnected - reload the page to reconnect', true);
-    })
-    .catch(() => {
-      setStatus('connection lost - reload the page to reconnect', true);
-    });
+  pc.addTransceiver('video', { direction: 'recvonly' });
+  pc.addEventListener('track', (event) => {
+    videoEl.srcObject = event.streams[0] ?? new MediaStream([event.track]);
+  });
 
-  await transport.ready;
+  const mjpegChannel = pc.createDataChannel('mjpeg', { ordered: false, maxRetransmits: 0 });
+  mjpegChannel.binaryType = 'arraybuffer';
+  mjpegChannel.addEventListener('message', (event) => {
+    renderJpeg(event.data).catch((err) => console.error('failed to render MJPEG frame', err));
+  });
+
+  inputChannel = pc.createDataChannel('input', { ordered: false, maxRetransmits: 0 });
+
+  controlChannel = pc.createDataChannel('control');
+  controlChannel.binaryType = 'arraybuffer';
+  controlChannel.addEventListener('message', (event) => {
+    handleServerMessage(JSON.parse(new TextDecoder().decode(event.data)));
+  });
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await waitForIceGatheringComplete(pc);
+
+  const response = await fetch('/rtc/offer', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ sdp: pc.localDescription.sdp }),
+  });
+  if (!response.ok) {
+    throw new Error(`signaling failed: HTTP ${response.status}`);
+  }
+  const { sdp } = await response.json();
+  await pc.setRemoteDescription({ type: 'answer', sdp });
+
   setStatus('connected');
-
-  datagramWriter = transport.datagrams.writable.getWriter();
-
-  const controlStream = await transport.createBidirectionalStream();
-  controlWriter = controlStream.writable.getWriter();
-  readControlReplies(controlStream.readable);
-
-  readVideoStreams(transport);
+  updateVideoElementVisibility();
   wireInput();
 }
 
-async function readControlReplies(readable) {
-  const reader = readable.getReader();
-  const decoder = new TextDecoder();
-  let buf = '';
-  try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      let newlineIndex;
-      while ((newlineIndex = buf.indexOf('\n')) !== -1) {
-        const line = buf.slice(0, newlineIndex);
-        buf = buf.slice(newlineIndex + 1);
-        if (line) handleServerMessage(JSON.parse(line));
+function waitForIceGatheringComplete(pc) {
+  if (pc.iceGatheringState === 'complete') return Promise.resolve();
+  return new Promise((resolve) => {
+    pc.addEventListener('icegatheringstatechange', function onChange() {
+      if (pc.iceGatheringState === 'complete') {
+        pc.removeEventListener('icegatheringstatechange', onChange);
+        resolve();
       }
-    }
-  } catch {
-    // Session ending; transport.closed's handler above already updates the status.
-  }
+    });
+  });
 }
 
 function handleServerMessage(msg) {
@@ -136,42 +150,7 @@ function handleServerMessage(msg) {
     frameRateSelect.value = msg.capture.fps;
     resolutionSelect.value = `${msg.capture.resolution.width}x${msg.capture.resolution.height}`;
     mouseModeSelect.value = msg.mouse_mode;
-  }
-}
-
-async function readVideoStreams(transport) {
-  const reader = transport.incomingUnidirectionalStreams.getReader();
-  while (true) {
-    const { value: stream, done } = await reader.read();
-    if (done) break;
-    handleVideoStream(stream).catch((err) => console.error('video stream error', err));
-  }
-}
-
-async function handleVideoStream(stream) {
-  const chunks = [];
-  let total = 0;
-  const reader = stream.getReader();
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    total += value.length;
-  }
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.length;
-  }
-  if (bytes.length === 0) return;
-
-  const kind = bytes[0];
-  const payload = bytes.subarray(1);
-  if (kind === 0) {
-    await renderJpeg(payload);
-  } else {
-    renderH264(payload);
+    updateVideoElementVisibility();
   }
 }
 
@@ -185,91 +164,31 @@ async function renderJpeg(payload) {
   bitmap.close();
 }
 
-function naluIsKeyframe(bytes) {
-  // Scans Annex-B start codes for an IDR (type 5) or SPS (type 7) NAL.
-  for (let i = 0; i + 4 <= bytes.length; i++) {
-    if (bytes[i] === 0 && bytes[i + 1] === 0 && bytes[i + 2] === 1) {
-      const nalType = bytes[i + 3] & 0x1f;
-      if (nalType === 5 || nalType === 7) return true;
-    }
-  }
-  return false;
-}
-
-function resetH264Decoder() {
-  if (videoDecoder && videoDecoder.state !== 'closed') {
-    try {
-      videoDecoder.close();
-    } catch {
-      // Already closing/closed - nothing to do.
-    }
-  }
-  videoDecoder = null;
-  decoderConfigured = false;
-  awaitingKeyframe = true;
-}
-
-function renderH264(payload) {
-  if (typeof VideoDecoder === 'undefined') {
-    setStatus('this browser has no WebCodecs support for H.264', true);
-    return;
-  }
-  if (!videoDecoder) {
-    videoDecoder = new VideoDecoder({
-      output: (frame) => {
-        if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
-          canvas.width = frame.displayWidth;
-          canvas.height = frame.displayHeight;
-        }
-        ctx2d.drawImage(frame, 0, 0);
-        frame.close();
-      },
-      error: (err) => {
-        console.error('VideoDecoder error', err);
-        resetH264Decoder();
-      },
-    });
-    decoderConfigured = false;
-  }
-  if (!decoderConfigured) {
-    videoDecoder.configure({ codec: 'avc1.42E01E', avc: { format: 'annexb' }, optimizeForLatency: true });
-    decoderConfigured = true;
-  }
-
-  const isKeyframe = naluIsKeyframe(payload);
-  if (awaitingKeyframe && !isKeyframe) {
-    return;
-  }
-  awaitingKeyframe = false;
-
+function sendInput(bytes) {
+  if (!inputChannel || inputChannel.readyState !== 'open') return;
   try {
-    const type = isKeyframe ? 'key' : 'delta';
-    videoDecoder.decode(new EncodedVideoChunk({ type, timestamp: performance.now() * 1000, data: payload }));
-  } catch (err) {
-    console.error('VideoDecoder decode failed', err);
-    resetH264Decoder();
+    inputChannel.send(bytes);
+  } catch {
+    // Channel not open yet, or closing - drop the event, same tolerance
+    // as a dropped datagram.
   }
-}
-
-function sendDatagram(bytes) {
-  datagramWriter.write(bytes).catch(() => {});
 }
 
 function wireInput() {
-  canvas.addEventListener('keydown', (e) => {
+  inputSurface.addEventListener('keydown', (e) => {
     e.preventDefault();
     sendKeyEvent(e.code, true);
   });
-  canvas.addEventListener('keyup', (e) => {
+  inputSurface.addEventListener('keyup', (e) => {
     e.preventDefault();
     sendKeyEvent(e.code, false);
   });
 
-  canvas.addEventListener('mousedown', handleMouseButtons);
-  canvas.addEventListener('mouseup', handleMouseButtons);
-  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+  inputSurface.addEventListener('mousedown', handleMouseButtons);
+  inputSurface.addEventListener('mouseup', handleMouseButtons);
+  inputSurface.addEventListener('contextmenu', (e) => e.preventDefault());
 
-  canvas.addEventListener('wheel', (e) => {
+  inputSurface.addEventListener('wheel', (e) => {
     e.preventDefault();
     const wheel = clampWheel(-e.deltaY);
     if (mouseModeSelect.value === 'absolute') {
@@ -283,6 +202,8 @@ function wireInput() {
     sendControl({ type: 'paste', text: pasteText.value });
     pasteText.value = '';
   });
+
+  videoModeSelect.addEventListener('change', updateVideoElementVisibility);
 
   saveSettings.addEventListener('click', () => {
     // Only include the half of the settings a device is actually present
@@ -327,7 +248,7 @@ function sendKeyEvent(code, pressed) {
   bytes[0] = TAG_KEY_EVENT;
   bytes[1] = pressed ? 1 : 0;
   bytes.set(codeBytes, 2);
-  sendDatagram(bytes);
+  sendInput(bytes);
 }
 
 function sendMouseRelativeMove(buttons, dx, dy, wheel) {
@@ -337,7 +258,7 @@ function sendMouseRelativeMove(buttons, dx, dy, wheel) {
   bytes[2] = clampByte(dx);
   bytes[3] = clampByte(dy);
   bytes[4] = clampByte(wheel);
-  sendDatagram(bytes);
+  sendInput(bytes);
 }
 
 function sendMouseButtons(buttons, wheel) {
@@ -345,7 +266,7 @@ function sendMouseButtons(buttons, wheel) {
   bytes[0] = TAG_MOUSE_BUTTONS;
   bytes[1] = buttons;
   bytes[2] = clampByte(wheel);
-  sendDatagram(bytes);
+  sendInput(bytes);
 }
 
 function clampByte(value) {
@@ -353,13 +274,16 @@ function clampByte(value) {
 }
 
 function sendControl(message) {
-  if (!controlWriter) return;
-  const bytes = new TextEncoder().encode(JSON.stringify(message) + '\n');
-  controlWriter.write(bytes).catch(() => {});
+  if (!controlChannel || controlChannel.readyState !== 'open') return;
+  try {
+    controlChannel.send(JSON.stringify(message));
+  } catch {
+    // Channel closing - drop it.
+  }
 }
 
-if (typeof WebTransport === 'undefined') {
-  setStatus('this browser has no WebTransport support', true);
+if (typeof RTCPeerConnection === 'undefined') {
+  setStatus('this browser has no WebRTC support', true);
 } else {
   connect().catch((err) => {
     console.error(err);

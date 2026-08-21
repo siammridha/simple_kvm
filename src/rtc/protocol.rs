@@ -1,13 +1,13 @@
-//! Wire formats for the two input channels: small binary datagrams for
-//! high-frequency mouse/key events, and JSON-lines on the one
-//! bidirectional control stream per session for low-frequency settings
-//! changes and paste submissions.
+//! Wire formats for the two data channels: small binary messages on the
+//! unreliable/unordered `input` channel for high-frequency mouse/key
+//! events, and JSON objects on the reliable `control` channel for
+//! low-frequency settings changes and paste submissions.
 
 use serde::{Deserialize, Serialize};
 
-/// Parsed from a WebTransport datagram. Loss-tolerant by design — the
-/// next event supersedes a dropped one for mouse moves, and a dropped key
-/// event is rare enough on a LAN not to design around further.
+/// Parsed from an `input` data channel message. Loss-tolerant by design —
+/// the next event supersedes a dropped one for mouse moves, and a dropped
+/// key event is rare enough on a LAN not to design around further.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputEvent {
     /// A physical key's press/release state changed. `code` is a
@@ -79,9 +79,9 @@ pub enum ControlMessage {
     Paste { text: String },
 }
 
-/// Server-to-client messages, pushed down the same control stream's send
-/// half whenever server-side state changes that the page can't otherwise
-/// learn about without a reload (see `session::handle`'s device-state and
+/// Server-to-client messages, pushed down the `control` data channel
+/// whenever server-side state changes that the page can't otherwise learn
+/// about without a reload (see `session::handle`'s device-state and
 /// settings arms).
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

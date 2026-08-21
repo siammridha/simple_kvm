@@ -24,24 +24,27 @@ to install.
 
 ## What it does
 
-Run the binary on the Wyse 3040 and it serves a page at `https://<device
+Run the binary on the Wyse 3040 and it serves a page at `http://<device
 ip>:3000` with:
 
-- **Live video**, streamed over WebTransport (not WebRTC). Two modes,
-  picked from a dropdown and applied when you click **Save settings** (see
-  below):
-  - **MJPEG** (default) - if the capture card has hardware MJPEG (most
-    UVC capture cards do), frames are forwarded as-is, essentially free on
-    the CPU. If not, frames are JPEG-compressed in software from the raw
-    feed - still much cheaper than video encoding, just not free.
-  - **H.264**, software-encoded. Included because it was asked for, but
-    the Wyse 3040's Atom CPU is genuinely weak for real-time software
-    video encoding - expect this mode to be choppy. MJPEG is the
-    practical default. The encoder inserts a keyframe every 60 frames so
-    a browser that (re)connects mid-stream has something to start
-    decoding from - without it, only the very first frame of a capture
-    session would ever be a keyframe, and joining any later would leave
-    the video stuck.
+- **Live video**, streamed over WebRTC. Two modes, picked from a dropdown
+  and applied when you click **Save settings** (see below), each using a
+  different WebRTC transport under the hood:
+  - **MJPEG** (default) - sent as raw JPEG frames over a WebRTC data
+    channel, decoded and drawn to a canvas in the page. If the capture
+    card has hardware MJPEG (most UVC capture cards do), frames are
+    forwarded as-is, essentially free on the CPU. If not, frames are
+    JPEG-compressed in software from the raw feed - still much cheaper
+    than video encoding, just not free.
+  - **H.264**, software-encoded and sent as a real WebRTC video track,
+    decoded natively by the browser into a `<video>` element. Included
+    because it was asked for, but the Wyse 3040's Atom CPU is genuinely
+    weak for real-time software video encoding - expect this mode to be
+    choppy. MJPEG is the practical default. The encoder inserts a
+    keyframe every 60 frames so a browser that (re)connects mid-stream
+    has something to start decoding from - without it, only the very
+    first frame of a capture session would ever be a keyframe, and
+    joining any later would leave the video stuck.
 - **Resolution dropdown**, populated from whatever the capture card
   actually reports supporting (queried at startup) - not a hardcoded
   list.
@@ -92,7 +95,7 @@ noticed on the next real keystroke or click instead of immediately.
 **Dropdown changes only take effect when you click Save settings.**
 Changing video mode, frame rate, resolution, or mouse mode does nothing on
 its own - picking a new value just moves the dropdown. Clicking **Save
-settings** sends one message over the WebTransport connection that both
+settings** sends one message over the WebRTC control channel that both
 applies the new settings live and writes them to the settings file on
 disk, together, in one step. If you reload the page (or open a second
 tab) without saving, the dropdowns show whatever the server is actually
@@ -107,40 +110,16 @@ plugged in, and mouse mode only if the CH9329 is - there's nothing
 meaningful to save for a device that isn't there. If only one is
 connected, Save updates just that half and leaves the other as it was.
 
-### TLS for the page and the video/input connection
+### No TLS to set up
 
-Browsers only expose the `WebTransport` API on a secure context - an
-`https://` page (or `http://localhost`, which doesn't apply here since
-the device is reached by its LAN IP). So the page itself is served over
-HTTPS, using the same certificate as the WebTransport connection.
-
-The server doesn't generate its own certificate - you must provide one via
-`TLS_CERT_PATH`/`TLS_KEY_PATH`, loaded once at startup and never rotated;
-regenerating it is on whoever manages the file pair.
-
-The WebTransport connection doesn't check who signed this certificate - it
-pins itself to the certificate's exact SHA-256 hash instead
-(`serverCertificateHashes`, computed from the same file and sent to the
-page so the browser can check it). This is the mechanism browsers actually
-provide for exactly this situation (a device with no public hostname), and
-it means a self-signed certificate works fine here. It comes with two hard
-rules the certificate must meet, or the browser rejects the connection
-outright regardless of whether the hash matches:
-
-- **Valid for 14 days or less.** A longer-lived certificate (e.g. a normal
-  multi-year one) will not work - you need to regenerate the certificate
-  at least that often.
-- **Signed with an ECDSA key, not RSA.**
-
-The page itself still just needs a certificate the browser will accept for
-a plain HTTPS load - a self-signed one shows the usual browser warning
-(see [Installing on the device](#installing-on-the-device)) but works fine
-once you click through it.
-
-**Safari does not support this.** Apple has said WebKit doesn't intend to
-implement `serverCertificateHashes`, so the WebTransport connection won't
-work in Safari no matter what certificate you use. This affects Chrome and
-Firefox, both of which support it.
+The page is served over plain HTTP - no certificate to provide, no
+warning to click through. The video/input connection (WebRTC) still gets
+encrypted end to end: WebRTC's DTLS-SRTP is mandatory and automatic,
+generating a fresh self-signed certificate per connection that's verified
+via a fingerprint exchanged during signaling, not checked against any
+certificate authority. There's nothing for an operator to provide, rotate,
+or configure. See [docs/transport-comparison.md](docs/transport-comparison.md)
+for why this replaced an earlier WebTransport-based design.
 
 ## How it's built
 
@@ -182,10 +161,9 @@ rc-service simple_kvm status
 cat /var/log/simple_kvm.log
 ```
 
-Then open `https://<device ip>:3000` from a browser on the same network
-(you'll likely need to click through a self-signed certificate warning
-the first time - see [TLS for the page and the video/input
-connection](#tls-for-the-page-and-the-videoinput-connection)).
+Then open `http://<device ip>:3000` from a browser on the same network -
+no certificate warning to click through, see [No TLS to
+set up](#no-tls-to-set-up).
 
 **Updating later:** push a new version tag on GitHub, then re-run the same
 `wget ... | sh` command on the device - it always grabs the latest release.
@@ -218,11 +196,13 @@ if you need to change one):
 | `SERIAL_PATH` | `/dev/ttyUSB0` | CH9329/CH340 serial device |
 | `SERIAL_OPEN_DELAY_SECS` | `30` | How long to wait before opening the CH9329 serial port, for the same reason as the capture card's boot delay below — set to `0` to disable. |
 | `VIDEO_PATH` | `/dev/video0` | Capture card device |
-| `HTTP_PORT` | `3000` | HTTPS port for the page |
-| `WEBTRANSPORT_PORT` | `4433` | UDP port for the video/input connection |
-| `TLS_CERT_PATH`, `TLS_KEY_PATH` | **required** | The cert/key PEM pair the server presents. Loaded once at startup and never auto-rotated - that's on whoever manages the file pair. The WebTransport connection pins to this certificate's hash rather than requiring browser trust, but only if it's valid for 14 days or less and uses an ECDSA key - see [TLS for the page and the video/input connection](#tls-for-the-page-and-the-videoinput-connection). |
+| `HTTP_PORT` | `3000` | Port for the page and WebRTC signaling (`POST /rtc/offer`) |
 | `SETTINGS_PATH` | `/etc/simple_kvm-settings.json` | Where video mode/frame rate/resolution/mouse mode are written when you click **Save settings** on the page, and read back on the next startup. |
-| `RUST_LOG` | `info,simple_kvm::webtransport::session=debug,simple_kvm::ch9329::writer=debug` | Standard `tracing` log filter. By default, every keystroke/click is already logged at `debug` - no configuration needed first - since each log line includes how long that event took to queue/write, which is useful for tracking down input lag. A command that takes more than 50ms logs at `warn` regardless. Setting `RUST_LOG` yourself (e.g. `RUST_LOG=debug` for everything, or `RUST_LOG=warn` to quiet the per-keystroke lines) fully overrides the default above. |
+| `RUST_LOG` | `info,simple_kvm::rtc::session=debug,simple_kvm::ch9329::writer=debug` | Standard `tracing` log filter. By default, every keystroke/click is already logged at `debug` - no configuration needed first - since each log line includes how long that event took to queue/write, which is useful for tracking down input lag. A command that takes more than 50ms logs at `warn` regardless. Setting `RUST_LOG` yourself (e.g. `RUST_LOG=debug` for everything, or `RUST_LOG=warn` to quiet the per-keystroke lines) fully overrides the default above. |
+
+Each browser tab's video/input connection (WebRTC) picks its own UDP port
+automatically - there's no fixed port to configure for it, and nothing to
+open in a firewall today, since `deploy/install.sh` doesn't set one up.
 
 ## Releasing a new version
 
@@ -251,7 +231,7 @@ needed: the capture card stays in its soft "no device" state (no
 faked with `socat` (a linked PTY pair - the app just needs something to
 open at `SERIAL_PATH`, real hardware or not), which is enough to exercise
 the mouse-mode half of Save. The capture half of that same scoping logic
-is covered by Rust tests in `src/webtransport/session.rs` instead, since
+is covered by Rust tests in `src/rtc/session.rs` instead, since
 it can't be exercised without real capture hardware. This script needs
 `socat` installed; it's a layer on top of the Rust tests, not a
 replacement for them.

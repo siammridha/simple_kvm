@@ -1,19 +1,18 @@
 mod capture;
 mod ch9329;
 mod config;
+mod rtc;
 mod settings_store;
-mod tls;
 mod uevent;
 mod video_bus;
 mod web;
-mod webtransport;
 
 use std::env;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tracing_subscriber::EnvFilter;
 
@@ -27,25 +26,9 @@ async fn main() -> Result<()> {
     init_logging();
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "simple_kvm starting");
 
-    // axum-server's rustls integration needs a process-default crypto
-    // provider installed; wtransport builds its own provider explicitly
-    // per-config and doesn't need or set this, so there's no conflict.
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .map_err(|_| anyhow::anyhow!("installing rustls crypto provider"))?;
-
     let serial_path = env::var("SERIAL_PATH").unwrap_or_else(|_| "/dev/ttyUSB0".to_string());
     let video_path = env::var("VIDEO_PATH").unwrap_or_else(|_| "/dev/video0".to_string());
     let http_port: u16 = env_parsed("HTTP_PORT").unwrap_or(3000);
-    let webtransport_port: u16 = env_parsed("WEBTRANSPORT_PORT").unwrap_or(4433);
-    let Ok(tls_cert_path) = env::var("TLS_CERT_PATH") else {
-        tracing::error!("TLS_CERT_PATH must be set to a certificate file the browser will trust");
-        std::process::exit(1);
-    };
-    let Ok(tls_key_path) = env::var("TLS_KEY_PATH") else {
-        tracing::error!("TLS_KEY_PATH must be set to the matching private key file");
-        std::process::exit(1);
-    };
     let settings_path = PathBuf::from(env::var("SETTINGS_PATH").unwrap_or_else(|_| "/etc/simple_kvm-settings.json".to_string()));
     let serial_open_delay_secs: u64 = env_parsed("SERIAL_OPEN_DELAY_SECS").unwrap_or(30);
 
@@ -74,45 +57,37 @@ async fn main() -> Result<()> {
 
     // --- Serial: same soft-unavailable treatment as capture. Commands sent
     // to `serial_tx` before the port is open just queue up in the channel,
-    // so this delay doesn't hold up the HTTP page or WebTransport server
-    // starting. ---
+    // so this delay doesn't hold up the HTTP page starting. ---
     let (serial_tx, serial_rx) = mpsc::channel::<SerialCommand>(256);
     tokio::spawn(open_serial_after_delay(serial_path, serial_open_delay_secs, serial_tx.clone(), serial_rx, hid_connected_tx));
 
-    tracing::info!(tls_cert_path, tls_key_path, "loading TLS identity from files");
-    let cert_manager = Arc::new(tls::CertManager::start_from_files(tls_cert_path, tls_key_path).await?);
-
-    let app_state = web::AppState { webtransport_port, cert_hash: cert_manager.cert_hash() };
-    let https_config = cert_manager.https_config().await?;
+    let channels = rtc::SharedChannels {
+        video_bus: video_bus_rx,
+        serial_tx,
+        capture_settings_tx,
+        mouse_mode_tx,
+        device_state_rx,
+        hid_connected_rx,
+        settings_path,
+    };
     let http_addr = std::net::SocketAddr::from(([0, 0, 0, 0], http_port));
-    tracing::info!(port = http_port, "HTTPS page server listening");
+    tracing::info!(port = http_port, "page and WebRTC signaling server listening");
     let http_handle = tokio::spawn(async move {
-        if let Err(err) = axum_server::bind_rustls(http_addr, https_config).serve(web::router(app_state).into_make_service()).await {
-            tracing::error!(%err, "HTTPS page server exited");
+        let listener = match TcpListener::bind(http_addr).await {
+            Ok(listener) => listener,
+            Err(err) => {
+                tracing::error!(%err, "failed to bind HTTP listener");
+                return;
+            }
+        };
+        if let Err(err) = axum::serve(listener, web::router(channels)).await {
+            tracing::error!(%err, "page server exited");
         }
     });
 
     let capture_handle = tokio::spawn(capture_manager.run(capture_settings_rx, video_bus_tx, device_state_tx));
 
-    let webtransport_handle = tokio::spawn(async move {
-        if let Err(err) = webtransport::serve(
-            webtransport_port,
-            cert_manager,
-            video_bus_rx,
-            serial_tx,
-            capture_settings_tx,
-            mouse_mode_tx,
-            device_state_rx,
-            hid_connected_rx,
-            settings_path,
-        )
-        .await
-        {
-            tracing::error!(%err, "WebTransport server exited");
-        }
-    });
-
-    let _ = tokio::join!(http_handle, capture_handle, webtransport_handle);
+    let _ = tokio::join!(http_handle, capture_handle);
     Ok(())
 }
 
@@ -147,7 +122,7 @@ async fn open_serial_after_delay(
 /// reports are visible in the log immediately, with no configuration step
 /// needed first - setting `RUST_LOG` explicitly still overrides this
 /// entirely, same as any `EnvFilter`.
-const DEFAULT_LOG_FILTER: &str = "info,simple_kvm::webtransport::session=debug,simple_kvm::ch9329::writer=debug";
+const DEFAULT_LOG_FILTER: &str = "info,simple_kvm::rtc::session=debug,simple_kvm::ch9329::writer=debug";
 
 fn init_logging() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));

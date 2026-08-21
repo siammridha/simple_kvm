@@ -42,7 +42,10 @@
   <span id="version"></span>
 </div>
 
-<canvas id="video" tabindex="0"></canvas>
+<div id="video-surface" tabindex="0">
+  <canvas id="video"></canvas>
+  <video id="video-el" autoplay playsinline muted></video>
+</div>
 
 <div id="paste-bar">
   <textarea id="paste-text" placeholder="Type or paste text here, then Send to type it on the target (US QWERTY only)"></textarea>

@@ -1,5 +1,5 @@
 //! Shared, live-mutable settings — changed by a dropdown on the page,
-//! read by the capture task and the WebTransport session layer via
+//! read by the capture task and the WebRTC session layer via
 //! `tokio::sync::watch`, so a change never has to touch the connection
 //! itself. Also the on-disk shape used by `settings_store` to persist the
 //! current choices across a service restart.
@@ -25,8 +25,8 @@ pub struct CaptureSettings {
 /// Live state of the capture card itself — whether it's plugged in right
 /// now, and what it supports. Published by `CaptureManager::run`'s hot-plug
 /// loop over a `watch` channel, and pushed to the web page over the
-/// WebTransport control stream (see `webtransport::session::handle`) so an
-/// already-open tab reflects a hot-plug/unplug instead of being frozen at
+/// `control` data channel (see `rtc::session::handle`) so an already-open
+/// tab reflects a hot-plug/unplug instead of being frozen at
 /// server-startup values.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct DeviceState {

@@ -31,9 +31,9 @@ const SLOW_COMMAND_THRESHOLD: Duration = Duration::from_millis(50);
 #[derive(Debug, Clone)]
 pub enum SerialCommand {
     /// A full keyboard HID report: the modifier bitmask plus up to 6
-    /// simultaneously-held HID usage codes. Callers (the WebTransport
-    /// session's per-connection key-state tracker) are responsible for
-    /// sending the all-zero report on key-up.
+    /// simultaneously-held HID usage codes. Callers (the WebRTC session's
+    /// per-connection key-state tracker) are responsible for sending the
+    /// all-zero report on key-up.
     KeyReport { modifiers: u8, keys: [u8; 6] },
     /// Absolute cursor position, as a fraction of the video frame.
     MouseAbsoluteMove { x_frac: f32, y_frac: f32 },
@@ -91,9 +91,9 @@ pub struct SerialWriter {
 }
 
 impl SerialWriter {
-    /// `connected_tx` lets the WebTransport session layer know whether the
+    /// `connected_tx` lets the WebRTC session layer know whether the
     /// CH9329 is plugged in right now, the HID counterpart of the capture
-    /// card's `DeviceState` — see `webtransport::session`.
+    /// card's `DeviceState` — see `rtc::session`.
     pub fn new(path: String, connected_tx: watch::Sender<bool>) -> Self {
         Self { path, port: None, connected_tx }
     }

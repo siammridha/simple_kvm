@@ -1,8 +1,8 @@
 //! The single source of truth for "the latest video frame". Deliberately a
 //! `watch` channel, not `broadcast`: only the newest value is ever kept,
-//! which gives free frame-dropping under load — a slow WebTransport
-//! session just misses frames instead of building an unbounded backlog on
-//! this CPU-constrained device.
+//! which gives free frame-dropping under load — a slow WebRTC session
+//! just misses frames instead of building an unbounded backlog on this
+//! CPU-constrained device.
 
 use std::sync::Arc;
 

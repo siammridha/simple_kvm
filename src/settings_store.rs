@@ -2,7 +2,7 @@
 //! mode) to a JSON file, so a change survives a service restart instead of
 //! resetting to the capture card's defaults every time. Saving only happens
 //! when the page's Save button sends an `update_settings` control message
-//! (see `webtransport::session::handle_control_message`), which applies and
+//! (see `rtc::session::handle_control_message`), which applies and
 //! persists the settings together — dropdown changes on their own do
 //! nothing until Save is clicked.
 
