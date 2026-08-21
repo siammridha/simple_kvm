@@ -54,12 +54,28 @@ impl InputEvent {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct CaptureSettingsWire {
+    pub video_mode: VideoModeWire,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlMessage {
-    /// Applies and persists video mode/resolution/frame rate/mouse mode
-    /// together, sent once when the page's Save button is clicked (see
-    /// `assets/web/app.js`) — dropdowns no longer apply live on their own.
-    UpdateSettings { video_mode: VideoModeWire, width: u32, height: u32, fps: u32, mouse_mode: MouseModeWire },
+    /// Applies and persists whichever of capture settings / mouse mode the
+    /// page included, sent once when the page's Save button is clicked
+    /// (see `assets/web/app.js`) — dropdowns no longer apply live on their
+    /// own. Each half is only present if the corresponding hardware
+    /// (capture card / CH9329) is actually connected — the page has
+    /// nothing meaningful to save for a device that isn't there.
+    UpdateSettings {
+        #[serde(default)]
+        capture: Option<CaptureSettingsWire>,
+        #[serde(default)]
+        mouse_mode: Option<MouseModeWire>,
+    },
     Paste { text: String },
 }
 
@@ -71,6 +87,9 @@ pub enum ControlMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
     DeviceState(crate::config::DeviceState),
+    /// Whether the CH9329 is plugged in right now — the HID counterpart of
+    /// `DeviceState` (which only covers the capture card).
+    HidState { available: bool },
     Settings { capture: crate::config::CaptureSettings, mouse_mode: crate::config::MouseMode },
 }
 
@@ -128,14 +147,30 @@ mod tests {
 
     #[test]
     fn control_message_deserializes_from_json() {
-        let msg: ControlMessage =
-            serde_json::from_str(r#"{"type":"update_settings","video_mode":"h264","width":1920,"height":1080,"fps":10,"mouse_mode":"relative"}"#).unwrap();
-        assert!(matches!(
-            msg,
-            ControlMessage::UpdateSettings { video_mode: VideoModeWire::H264, width: 1920, height: 1080, fps: 10, mouse_mode: MouseModeWire::Relative }
-        ));
+        let msg: ControlMessage = serde_json::from_str(
+            r#"{"type":"update_settings","capture":{"video_mode":"h264","width":1920,"height":1080,"fps":10},"mouse_mode":"relative"}"#,
+        )
+        .unwrap();
+        let ControlMessage::UpdateSettings { capture, mouse_mode } = msg else { panic!("expected UpdateSettings") };
+        let capture = capture.unwrap();
+        assert!(matches!(capture.video_mode, VideoModeWire::H264));
+        assert_eq!((capture.width, capture.height, capture.fps), (1920, 1080, 10));
+        assert!(matches!(mouse_mode, Some(MouseModeWire::Relative)));
 
         let msg: ControlMessage = serde_json::from_str(r#"{"type":"paste","text":"hi"}"#).unwrap();
         assert!(matches!(msg, ControlMessage::Paste { text } if text == "hi"));
+    }
+
+    #[test]
+    fn update_settings_allows_capture_and_mouse_mode_to_be_omitted_independently() {
+        let msg: ControlMessage = serde_json::from_str(r#"{"type":"update_settings","mouse_mode":"absolute"}"#).unwrap();
+        assert!(matches!(msg, ControlMessage::UpdateSettings { capture: None, mouse_mode: Some(MouseModeWire::Absolute) }));
+
+        let msg: ControlMessage =
+            serde_json::from_str(r#"{"type":"update_settings","capture":{"video_mode":"mjpeg","width":1280,"height":720,"fps":5}}"#).unwrap();
+        assert!(matches!(msg, ControlMessage::UpdateSettings { capture: Some(_), mouse_mode: None }));
+
+        let msg: ControlMessage = serde_json::from_str(r#"{"type":"update_settings"}"#).unwrap();
+        assert!(matches!(msg, ControlMessage::UpdateSettings { capture: None, mouse_mode: None }));
     }
 }

@@ -27,34 +27,21 @@ let controlWriter = null;
 let datagramWriter = null;
 let videoDecoder = null;
 let decoderConfigured = false;
+// Whether the capture card / CH9329 are actually connected right now, per
+// the server's device_state/hid_state pushes - gates which half of a Save
+// gets sent, since there's nothing meaningful to save for a device that
+// isn't there.
+let captureAvailable = false;
+let hidAvailable = false;
 // A fresh decoder (or one that just errored) can't decode a delta frame
 // until it's seen a keyframe - feeding it one throws and, per WebCodecs,
 // permanently closes the decoder. Dropping delta frames until the next
 // real keyframe avoids that instead of erroring on every frame forever.
 let awaitingKeyframe = true;
-let reconnectScheduled = false;
 
 function setStatus(text, isError) {
   statusEl.textContent = text;
   statusEl.classList.toggle('error', Boolean(isError));
-}
-
-// Every failure path below funnels here instead of calling connect()
-// directly, so a failed reconnect attempt is always caught (an uncaught
-// rejection from a bare `setTimeout(connect, ...)` would otherwise surface
-// as a page error on every retry) and so concurrent failures don't stack
-// up multiple parallel retry loops.
-function scheduleReconnect() {
-  if (reconnectScheduled) return;
-  reconnectScheduled = true;
-  setTimeout(() => {
-    reconnectScheduled = false;
-    connect().catch((err) => {
-      console.error(err);
-      setStatus('failed to connect: ' + err.message, true);
-      scheduleReconnect();
-    });
-  }, 1000);
 }
 
 function populateResolutions(resolutions, defaultResolution) {
@@ -80,22 +67,23 @@ function populateResolutions(resolutions, defaultResolution) {
 }
 
 async function connect() {
-  const { webtransportPort, version } = window.SERVER_CONFIG;
+  const { webtransportPort, version, certHash } = window.SERVER_CONFIG;
   versionEl.textContent = `v${version}`;
 
   const url = `https://${location.hostname}:${webtransportPort}/kvm`;
 
   setStatus('connecting…');
-  const transport = new WebTransport(url);
+  const transport = new WebTransport(url, {
+    serverCertificateHashes: [{ algorithm: 'sha-256', value: new Uint8Array(certHash) }],
+    allowPooling: false,
+  });
 
   transport.closed
     .then(() => {
-      setStatus('disconnected, reconnecting…', true);
-      scheduleReconnect();
+      setStatus('disconnected - reload the page to reconnect', true);
     })
     .catch(() => {
-      setStatus('connection lost, reconnecting…', true);
-      scheduleReconnect();
+      setStatus('connection lost - reload the page to reconnect', true);
     });
 
   await transport.ready;
@@ -128,18 +116,21 @@ async function readControlReplies(readable) {
       }
     }
   } catch {
-    // Session ending; the top-level reconnect logic handles it.
+    // Session ending; transport.closed's handler above already updates the status.
   }
 }
 
 function handleServerMessage(msg) {
   if (msg.type === 'device_state') {
+    captureAvailable = msg.available;
     populateResolutions(msg.resolutions, msg.default_resolution);
     if (!msg.available) {
       setStatus('no video device found', true);
     } else if (statusEl.textContent === 'no video device found') {
       setStatus('connected');
     }
+  } else if (msg.type === 'hid_state') {
+    hidAvailable = msg.available;
   } else if (msg.type === 'settings') {
     videoModeSelect.value = msg.capture.video_mode;
     frameRateSelect.value = msg.capture.fps;
@@ -294,15 +285,19 @@ function wireInput() {
   });
 
   saveSettings.addEventListener('click', () => {
-    const [width, height] = resolutionSelect.value.split('x').map(Number);
-    sendControl({
-      type: 'update_settings',
-      video_mode: videoModeSelect.value,
-      width,
-      height,
-      fps: Number(frameRateSelect.value),
-      mouse_mode: mouseModeSelect.value,
-    });
+    // Only include the half of the settings a device is actually present
+    // for - there's nothing meaningful to save for a device that isn't
+    // there (e.g. the resolution dropdown holds a "no video device"
+    // placeholder, not a real WxH, when there's no capture card).
+    const message = { type: 'update_settings' };
+    if (captureAvailable) {
+      const [width, height] = resolutionSelect.value.split('x').map(Number);
+      message.capture = { video_mode: videoModeSelect.value, width, height, fps: Number(frameRateSelect.value) };
+    }
+    if (hidAvailable) {
+      message.mouse_mode = mouseModeSelect.value;
+    }
+    sendControl(message);
     saveSettingsStatus.textContent = 'Saved';
     setTimeout(() => { saveSettingsStatus.textContent = ''; }, 2000);
   });
@@ -369,6 +364,5 @@ if (typeof WebTransport === 'undefined') {
   connect().catch((err) => {
     console.error(err);
     setStatus('failed to connect: ' + err.message, true);
-    scheduleReconnect();
   });
 }

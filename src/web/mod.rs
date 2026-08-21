@@ -26,6 +26,7 @@ const SERVER_CONFIG_PLACEHOLDER: &str = "<!--SERVER_CONFIG-->";
 #[derive(Clone)]
 pub struct AppState {
     pub webtransport_port: u16,
+    pub cert_hash: [u8; 32],
 }
 
 /// Every asset here is embedded in the binary itself, so the only way its
@@ -44,10 +45,12 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn index_handler(State(state): State<AppState>) -> ([(header::HeaderName, &'static str); 1], Html<String>) {
+    let cert_hash_json = serde_json::to_string(&state.cert_hash).expect("byte array serialization can't fail");
     let config = format!(
-        r#"<script>window.SERVER_CONFIG = {{"webtransportPort":{},"version":"{}"}};</script>"#,
+        r#"<script>window.SERVER_CONFIG = {{"webtransportPort":{},"version":"{}","certHash":{}}};</script>"#,
         state.webtransport_port,
         env!("CARGO_PKG_VERSION"),
+        cert_hash_json,
     );
     let page = INDEX_HTML.replacen(SERVER_CONFIG_PLACEHOLDER, &config, 1);
     ([NO_CACHE], Html(page))

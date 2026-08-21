@@ -2,19 +2,21 @@
 //! HTTPS listener (the page must be HTTPS for browsers to expose the
 //! `WebTransport` API at all outside a `localhost` origin). Loaded once from
 //! an operator-provided cert/key file pair and never rotated — that's on
-//! whoever manages the file pair. The server does no certificate-hash
-//! pinning of its own, so this needs to be a certificate chaining to a CA
-//! the browser already trusts — a self-signed certificate does not work
-//! even if manually added to the browser's trust store, since Chrome's
-//! `WebTransport` connection verifies only against its built-in CA list
-//! and ignores locally-added trust (confirmed by testing; regular page
-//! loads over plain HTTPS aren't affected by this, only the WebTransport
-//! connection itself).
+//! whoever manages the file pair. The WebTransport connection pins itself
+//! to this certificate's exact SHA-256 hash (`serverCertificateHashes`,
+//! see `cert_hash` below and `assets/web/app.js`) rather than relying on it
+//! chaining to a CA the browser trusts, so the cert must be valid for 14
+//! days or less and use an ECDSA key - browsers reject hash-pinned
+//! connections outside those bounds regardless of whether the hash
+//! matches. The page's own plain HTTPS load is unaffected by any of this
+//! and still just needs the browser to accept (or be told to accept) the
+//! certificate normally.
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use axum_server::tls_rustls::RustlsConfig;
+use sha2::{Digest, Sha256};
 use wtransport::Identity;
 
 pub struct CertManager {
@@ -38,6 +40,14 @@ impl CertManager {
     pub async fn https_config(&self) -> Result<RustlsConfig> {
         let (cert_der, key_der) = identity_der(&self.identity);
         RustlsConfig::from_der(cert_der, key_der).await.context("building HTTPS TLS config")
+    }
+
+    /// SHA-256 of the leaf certificate's DER bytes, for pinning the
+    /// WebTransport connection to it via `serverCertificateHashes` instead
+    /// of requiring it to chain to a trusted CA.
+    pub fn cert_hash(&self) -> [u8; 32] {
+        let leaf = &self.identity.certificate_chain().as_slice()[0];
+        Sha256::digest(leaf.der()).into()
     }
 }
 

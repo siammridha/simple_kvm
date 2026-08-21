@@ -70,18 +70,19 @@ async fn main() -> Result<()> {
     let (capture_settings_tx, capture_settings_rx) = watch::channel(default_capture_settings);
     let (mouse_mode_tx, _mouse_mode_rx) = watch::channel(default_mouse_mode);
     let (video_bus_tx, video_bus_rx) = video_bus::channel();
+    let (hid_connected_tx, hid_connected_rx) = watch::channel(false);
 
     // --- Serial: same soft-unavailable treatment as capture. Commands sent
     // to `serial_tx` before the port is open just queue up in the channel,
     // so this delay doesn't hold up the HTTP page or WebTransport server
     // starting. ---
     let (serial_tx, serial_rx) = mpsc::channel::<SerialCommand>(256);
-    tokio::spawn(open_serial_after_delay(serial_path, serial_open_delay_secs, serial_tx.clone(), serial_rx));
+    tokio::spawn(open_serial_after_delay(serial_path, serial_open_delay_secs, serial_tx.clone(), serial_rx, hid_connected_tx));
 
     tracing::info!(tls_cert_path, tls_key_path, "loading TLS identity from files");
     let cert_manager = Arc::new(tls::CertManager::start_from_files(tls_cert_path, tls_key_path).await?);
 
-    let app_state = web::AppState { webtransport_port };
+    let app_state = web::AppState { webtransport_port, cert_hash: cert_manager.cert_hash() };
     let https_config = cert_manager.https_config().await?;
     let http_addr = std::net::SocketAddr::from(([0, 0, 0, 0], http_port));
     tracing::info!(port = http_port, "HTTPS page server listening");
@@ -94,8 +95,18 @@ async fn main() -> Result<()> {
     let capture_handle = tokio::spawn(capture_manager.run(capture_settings_rx, video_bus_tx, device_state_tx));
 
     let webtransport_handle = tokio::spawn(async move {
-        if let Err(err) =
-            webtransport::serve(webtransport_port, cert_manager, video_bus_rx, serial_tx, capture_settings_tx, mouse_mode_tx, device_state_rx, settings_path).await
+        if let Err(err) = webtransport::serve(
+            webtransport_port,
+            cert_manager,
+            video_bus_rx,
+            serial_tx,
+            capture_settings_tx,
+            mouse_mode_tx,
+            device_state_rx,
+            hid_connected_rx,
+            settings_path,
+        )
+        .await
         {
             tracing::error!(%err, "WebTransport server exited");
         }
@@ -115,13 +126,19 @@ fn env_parsed<T: std::str::FromStr>(key: &str) -> Option<T> {
 /// checks whether the CH9329 is actually plugged in before every command,
 /// so it's a no-op whenever the device isn't there and picks back up on
 /// its own once it is — no need to decide that once, up front, here.
-async fn open_serial_after_delay(serial_path: String, delay_secs: u64, serial_tx: mpsc::Sender<SerialCommand>, serial_rx: mpsc::Receiver<SerialCommand>) {
+async fn open_serial_after_delay(
+    serial_path: String,
+    delay_secs: u64,
+    serial_tx: mpsc::Sender<SerialCommand>,
+    serial_rx: mpsc::Receiver<SerialCommand>,
+    hid_connected_tx: watch::Sender<bool>,
+) {
     if delay_secs > 0 {
         tracing::info!(seconds = delay_secs, "waiting before opening CH9329 serial port");
         tokio::time::sleep(Duration::from_secs(delay_secs)).await;
     }
     tokio::spawn(writer::watch_connection(serial_tx));
-    let writer = writer::SerialWriter::new(serial_path);
+    let writer = writer::SerialWriter::new(serial_path, hid_connected_tx);
     let _ = tokio::task::spawn_blocking(move || writer.run(serial_rx)).await;
 }
 

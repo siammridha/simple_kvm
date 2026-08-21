@@ -83,9 +83,11 @@ device-change broadcast (`NETLINK_KOBJECT_UEVENT`, the same channel udev
 listens on), rather than going through udev itself - the Wyse 3040 image
 this runs on has no udev daemon (it uses the simpler `mdev` instead), so
 udev's own notifications never fire there. Listening straight to the
-kernel works regardless of what (if anything) is managing devices. A slow,
-infrequent poll still runs alongside it as a safety net in case that
-listener can't be opened.
+kernel works regardless of what (if anything) is managing devices. For the
+capture card, a slow, infrequent poll still runs alongside it as a safety
+net in case that listener can't be opened; the CH9329 side has no such
+fallback, so if its listener fails to open, its reconnects are only
+noticed on the next real keystroke or click instead of immediately.
 
 **Dropdown changes only take effect when you click Save settings.**
 Changing video mode, frame rate, resolution, or mouse mode does nothing on
@@ -99,6 +101,12 @@ using right now, not your unsaved picks - and if the service restarts
 up with whatever was last saved, or the capture card's own defaults if
 nothing ever was.
 
+Save only includes the settings for hardware that's actually connected:
+video mode/resolution/frame rate are sent only if the capture card is
+plugged in, and mouse mode only if the CH9329 is - there's nothing
+meaningful to save for a device that isn't there. If only one is
+connected, Save updates just that half and leaves the other as it was.
+
 ### TLS for the page and the video/input connection
 
 Browsers only expose the `WebTransport` API on a secure context - an
@@ -107,15 +115,32 @@ the device is reached by its LAN IP). So the page itself is served over
 HTTPS, using the same certificate as the WebTransport connection.
 
 The server doesn't generate its own certificate - you must provide one via
-`TLS_CERT_PATH`/`TLS_KEY_PATH`. It needs to be a certificate that chains to
-a certificate authority your browser already trusts (e.g. a step-ca-issued
-one). There's no certificate-hash pinning on the WebTransport connection
-anymore, and **a self-signed certificate does not work here even if you
-manually add it to the browser's trust store** - regular page loads accept
-a manually-trusted certificate, but Chrome's `WebTransport` connection
-verifies against the browser's built-in certificate authority list only
-and ignores locally-added trust, so it will keep failing to connect no
-matter how thoroughly the browser trusts the page itself.
+`TLS_CERT_PATH`/`TLS_KEY_PATH`, loaded once at startup and never rotated;
+regenerating it is on whoever manages the file pair.
+
+The WebTransport connection doesn't check who signed this certificate - it
+pins itself to the certificate's exact SHA-256 hash instead
+(`serverCertificateHashes`, computed from the same file and sent to the
+page so the browser can check it). This is the mechanism browsers actually
+provide for exactly this situation (a device with no public hostname), and
+it means a self-signed certificate works fine here. It comes with two hard
+rules the certificate must meet, or the browser rejects the connection
+outright regardless of whether the hash matches:
+
+- **Valid for 14 days or less.** A longer-lived certificate (e.g. a normal
+  multi-year one) will not work - you need to regenerate the certificate
+  at least that often.
+- **Signed with an ECDSA key, not RSA.**
+
+The page itself still just needs a certificate the browser will accept for
+a plain HTTPS load - a self-signed one shows the usual browser warning
+(see [Installing on the device](#installing-on-the-device)) but works fine
+once you click through it.
+
+**Safari does not support this.** Apple has said WebKit doesn't intend to
+implement `serverCertificateHashes`, so the WebTransport connection won't
+work in Safari no matter what certificate you use. This affects Chrome and
+Firefox, both of which support it.
 
 ## How it's built
 
@@ -195,7 +220,7 @@ if you need to change one):
 | `VIDEO_PATH` | `/dev/video0` | Capture card device |
 | `HTTP_PORT` | `3000` | HTTPS port for the page |
 | `WEBTRANSPORT_PORT` | `4433` | UDP port for the video/input connection |
-| `TLS_CERT_PATH`, `TLS_KEY_PATH` | **required** | The cert/key PEM pair the server presents. Loaded once at startup and never auto-rotated - that's on whoever manages the file pair. The browser must already trust this certificate (a real CA-issued cert, or one manually added to the device's trust store). |
+| `TLS_CERT_PATH`, `TLS_KEY_PATH` | **required** | The cert/key PEM pair the server presents. Loaded once at startup and never auto-rotated - that's on whoever manages the file pair. The WebTransport connection pins to this certificate's hash rather than requiring browser trust, but only if it's valid for 14 days or less and uses an ECDSA key - see [TLS for the page and the video/input connection](#tls-for-the-page-and-the-videoinput-connection). |
 | `SETTINGS_PATH` | `/etc/simple_kvm-settings.json` | Where video mode/frame rate/resolution/mouse mode are written when you click **Save settings** on the page, and read back on the next startup. |
 | `RUST_LOG` | `info,simple_kvm::webtransport::session=debug,simple_kvm::ch9329::writer=debug` | Standard `tracing` log filter. By default, every keystroke/click is already logged at `debug` - no configuration needed first - since each log line includes how long that event took to queue/write, which is useful for tracking down input lag. A command that takes more than 50ms logs at `warn` regardless. Setting `RUST_LOG` yourself (e.g. `RUST_LOG=debug` for everything, or `RUST_LOG=warn` to quiet the per-keystroke lines) fully overrides the default above. |
 
@@ -220,6 +245,13 @@ cargo nextest run
 ```
 
 `e2e/browser-test.sh` drives the actual page with `agent-browser` against
-the container's system Chromium (no capture card/CH9329 needed - it runs
-against the same soft "no device" state described above). It's a layer on
-top of the Rust tests, not a replacement for them.
+the container's system Chromium. No real capture card or CH9329 is
+needed: the capture card stays in its soft "no device" state (no
+`v4l2loopback` support in the container to fake one), while the CH9329 is
+faked with `socat` (a linked PTY pair - the app just needs something to
+open at `SERIAL_PATH`, real hardware or not), which is enough to exercise
+the mouse-mode half of Save. The capture half of that same scoping logic
+is covered by Rust tests in `src/webtransport/session.rs` instead, since
+it can't be exercised without real capture hardware. This script needs
+`socat` installed; it's a layer on top of the Rust tests, not a
+replacement for them.

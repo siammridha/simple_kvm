@@ -28,12 +28,13 @@ pub async fn serve(
     capture_settings_tx: watch::Sender<CaptureSettings>,
     mouse_mode_tx: watch::Sender<MouseMode>,
     device_state_rx: watch::Receiver<DeviceState>,
+    hid_connected_rx: watch::Receiver<bool>,
     settings_path: PathBuf,
 ) -> Result<()> {
     let endpoint = build_endpoint(port, cert_manager.identity())?;
     tracing::info!(port, "WebTransport endpoint listening");
 
-    accept_forever(&endpoint, &video_bus, &serial_tx, &capture_settings_tx, &mouse_mode_tx, &device_state_rx, &settings_path).await
+    accept_forever(&endpoint, &video_bus, &serial_tx, &capture_settings_tx, &mouse_mode_tx, &device_state_rx, &hid_connected_rx, &settings_path).await
 }
 
 fn build_endpoint(port: u16, identity: Identity) -> Result<Endpoint<Server>> {
@@ -52,6 +53,7 @@ async fn accept_forever(
     capture_settings_tx: &watch::Sender<CaptureSettings>,
     mouse_mode_tx: &watch::Sender<MouseMode>,
     device_state_rx: &watch::Receiver<DeviceState>,
+    hid_connected_rx: &watch::Receiver<bool>,
     settings_path: &PathBuf,
 ) -> Result<()> {
     loop {
@@ -64,6 +66,7 @@ async fn accept_forever(
             mouse_mode_tx: mouse_mode_tx.clone(),
             mouse_mode_rx: mouse_mode_tx.subscribe(),
             device_state_rx: device_state_rx.clone(),
+            hid_connected_rx: hid_connected_rx.clone(),
             settings_path: settings_path.clone(),
         };
         tokio::spawn(async move {
