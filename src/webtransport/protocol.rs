@@ -56,20 +56,22 @@ impl InputEvent {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlMessage {
-    SetVideoMode { mode: VideoModeWire },
-    SetResolution { width: u32, height: u32 },
-    SetFrameRate { fps: u32 },
-    SetMouseMode { mode: MouseModeWire },
+    /// Applies and persists video mode/resolution/frame rate/mouse mode
+    /// together, sent once when the page's Save button is clicked (see
+    /// `assets/web/app.js`) — dropdowns no longer apply live on their own.
+    UpdateSettings { video_mode: VideoModeWire, width: u32, height: u32, fps: u32, mouse_mode: MouseModeWire },
     Paste { text: String },
 }
 
 /// Server-to-client messages, pushed down the same control stream's send
 /// half whenever server-side state changes that the page can't otherwise
-/// learn about without a reload (see `session::handle`'s device-state arm).
+/// learn about without a reload (see `session::handle`'s device-state and
+/// settings arms).
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
     DeviceState(crate::config::DeviceState),
+    Settings { capture: crate::config::CaptureSettings, mouse_mode: crate::config::MouseMode },
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -126,13 +128,14 @@ mod tests {
 
     #[test]
     fn control_message_deserializes_from_json() {
-        let msg: ControlMessage = serde_json::from_str(r#"{"type":"set_video_mode","mode":"h264"}"#).unwrap();
-        assert!(matches!(msg, ControlMessage::SetVideoMode { mode: VideoModeWire::H264 }));
+        let msg: ControlMessage =
+            serde_json::from_str(r#"{"type":"update_settings","video_mode":"h264","width":1920,"height":1080,"fps":10,"mouse_mode":"relative"}"#).unwrap();
+        assert!(matches!(
+            msg,
+            ControlMessage::UpdateSettings { video_mode: VideoModeWire::H264, width: 1920, height: 1080, fps: 10, mouse_mode: MouseModeWire::Relative }
+        ));
 
         let msg: ControlMessage = serde_json::from_str(r#"{"type":"paste","text":"hi"}"#).unwrap();
         assert!(matches!(msg, ControlMessage::Paste { text } if text == "hi"));
-
-        let msg: ControlMessage = serde_json::from_str(r#"{"type":"set_frame_rate","fps":10}"#).unwrap();
-        assert!(matches!(msg, ControlMessage::SetFrameRate { fps: 10 }));
     }
 }

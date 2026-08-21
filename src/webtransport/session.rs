@@ -1,13 +1,14 @@
 //! Per-connection handling: one task juggling three jobs over
 //! `tokio::select!` — sending video frames as they arrive on the shared
 //! `video_bus`, translating input datagrams into `SerialCommand`s, and
-//! reading control-stream JSON (dropdown changes, paste). Settings
-//! changes only touch the shared `watch<Settings>` — the connection
-//! itself is never disturbed, so switching video/resolution/mouse mode
-//! never drops the session.
+//! reading control-stream JSON (the Save button's settings update, paste).
+//! Settings changes only touch the shared `watch<Settings>` and the
+//! settings file — the connection itself is never disturbed, so applying
+//! new settings never drops the session.
 
 use anyhow::Result;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use wtransport::{Connection, RecvStream};
@@ -15,7 +16,8 @@ use wtransport::{Connection, RecvStream};
 use crate::capture::v4l2::Resolution;
 use crate::ch9329::keymap::{self, KeyCode};
 use crate::ch9329::writer::SerialCommand;
-use crate::config::{CaptureSettings, DeviceState, MouseMode, VideoMode};
+use crate::config::{CaptureSettings, DeviceState, MouseMode, PersistedSettings, VideoMode};
+use crate::settings_store;
 use crate::video_bus::{self, FrameKind};
 
 use super::protocol::{ControlMessage, InputEvent, MouseModeWire, ServerMessage, VideoModeWire};
@@ -24,8 +26,11 @@ pub struct SessionContext {
     pub video_bus: video_bus::Receiver,
     pub serial_tx: mpsc::Sender<SerialCommand>,
     pub capture_settings_tx: watch::Sender<CaptureSettings>,
+    pub capture_settings_rx: watch::Receiver<CaptureSettings>,
     pub mouse_mode_tx: watch::Sender<MouseMode>,
+    pub mouse_mode_rx: watch::Receiver<MouseMode>,
     pub device_state_rx: watch::Receiver<DeviceState>,
+    pub settings_path: PathBuf,
 }
 
 #[derive(Default)]
@@ -64,6 +69,8 @@ impl KeyboardState {
 pub async fn handle(connection: Connection, ctx: SessionContext) -> Result<()> {
     let mut video_rx = ctx.video_bus.clone();
     let mut device_state_rx = ctx.device_state_rx.clone();
+    let mut capture_settings_rx = ctx.capture_settings_rx.clone();
+    let mut mouse_mode_rx = ctx.mouse_mode_rx.clone();
     let mut keyboard = KeyboardState::default();
     let mut control: Option<(wtransport::SendStream, RecvStream)> = None;
     let mut control_buf: Vec<u8> = Vec::new();
@@ -115,17 +122,43 @@ pub async fn handle(connection: Connection, ctx: SessionContext) -> Result<()> {
                     let state = device_state_rx.borrow_and_update().clone();
                     if let Some((send, _)) = control.as_mut() {
                         let msg = ServerMessage::DeviceState(state);
-                        if let Ok(mut line) = serde_json::to_string(&msg) {
-                            line.push('\n');
-                            if send.write_all(line.as_bytes()).await.is_err() {
-                                control = None;
-                            }
+                        if send_server_message(send, &msg).await.is_err() {
+                            control = None;
+                        }
+                    }
+                }
+            }
+            changed = capture_settings_rx.changed(), if control.is_some() => {
+                if changed.is_ok() {
+                    let capture = *capture_settings_rx.borrow_and_update();
+                    if let Some((send, _)) = control.as_mut() {
+                        let msg = ServerMessage::Settings { capture, mouse_mode: *mouse_mode_rx.borrow() };
+                        if send_server_message(send, &msg).await.is_err() {
+                            control = None;
+                        }
+                    }
+                }
+            }
+            changed = mouse_mode_rx.changed(), if control.is_some() => {
+                if changed.is_ok() {
+                    let mouse_mode = *mouse_mode_rx.borrow_and_update();
+                    if let Some((send, _)) = control.as_mut() {
+                        let msg = ServerMessage::Settings { capture: *capture_settings_rx.borrow(), mouse_mode };
+                        if send_server_message(send, &msg).await.is_err() {
+                            control = None;
                         }
                     }
                 }
             }
         }
     }
+}
+
+async fn send_server_message(send: &mut wtransport::SendStream, msg: &ServerMessage) -> Result<()> {
+    let mut line = serde_json::to_string(msg)?;
+    line.push('\n');
+    send.write_all(line.as_bytes()).await?;
+    Ok(())
 }
 
 async fn send_frame(connection: &Connection, kind: FrameKind, data: &[u8]) -> Result<()> {
@@ -171,27 +204,34 @@ async fn handle_input_event(event: InputEvent, keyboard: &mut KeyboardState, ctx
 
 fn handle_control_message(msg: ControlMessage, ctx: &SessionContext) {
     match msg {
-        ControlMessage::SetVideoMode { mode } => ctx.capture_settings_tx.send_modify(|s| {
-            s.video_mode = match mode {
-                VideoModeWire::Mjpeg => VideoMode::Mjpeg,
-                VideoModeWire::H264 => VideoMode::H264,
-            };
-        }),
-        ControlMessage::SetResolution { width, height } => {
-            ctx.capture_settings_tx.send_modify(|s| s.resolution = Resolution { width, height });
-        }
-        ControlMessage::SetFrameRate { fps } => {
-            ctx.capture_settings_tx.send_modify(|s| s.fps = fps);
-        }
-        // The server doesn't need mouse mode to translate input events —
-        // that's purely which datagram variant the client sends (see
-        // `InputEvent`) — but it's tracked here anyway so it can be
-        // persisted and reported back as the default on the next page
-        // load (see `settings_store`).
-        ControlMessage::SetMouseMode { mode } => {
-            ctx.mouse_mode_tx.send_replace(match mode {
+        // Applies and persists together — dropdowns no longer apply live,
+        // so this only fires when the page's Save button is clicked (see
+        // `assets/web/app.js`).
+        ControlMessage::UpdateSettings { video_mode, width, height, fps, mouse_mode } => {
+            ctx.capture_settings_tx.send_modify(|s| {
+                s.video_mode = match video_mode {
+                    VideoModeWire::Mjpeg => VideoMode::Mjpeg,
+                    VideoModeWire::H264 => VideoMode::H264,
+                };
+                s.resolution = Resolution { width, height };
+                s.fps = fps;
+            });
+            // The server doesn't need mouse mode to translate input events —
+            // that's purely which datagram variant the client sends (see
+            // `InputEvent`) — but it's tracked here anyway so it can be
+            // persisted and reported back as the default on the next page
+            // load.
+            ctx.mouse_mode_tx.send_replace(match mouse_mode {
                 MouseModeWire::Absolute => MouseMode::Absolute,
                 MouseModeWire::Relative => MouseMode::Relative,
+            });
+
+            let settings = PersistedSettings { capture: *ctx.capture_settings_rx.borrow(), mouse_mode: *ctx.mouse_mode_rx.borrow() };
+            let path = ctx.settings_path.clone();
+            tokio::spawn(async move {
+                if let Err(err) = tokio::task::spawn_blocking(move || settings_store::save(&path, settings)).await {
+                    tracing::error!(%err, "settings save task panicked");
+                }
             });
         }
         ControlMessage::Paste { text } => {

@@ -1,9 +1,10 @@
 //! Persists the live-adjustable settings (video mode, resolution, mouse
-//! mode) to a JSON file, so a dropdown change survives a service restart
-//! instead of resetting to the capture card's defaults every time. Saving
-//! only happens when the page's Save button sends `POST /api/settings/save`
-//! (see `web::save_settings_handler`) — dropdown changes apply immediately
-//! but are not written to disk on their own.
+//! mode) to a JSON file, so a change survives a service restart instead of
+//! resetting to the capture card's defaults every time. Saving only happens
+//! when the page's Save button sends an `update_settings` control message
+//! (see `webtransport::session::handle_control_message`), which applies and
+//! persists the settings together — dropdown changes on their own do
+//! nothing until Save is clicked.
 
 use std::path::Path;
 

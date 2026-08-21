@@ -1,6 +1,7 @@
 pub mod protocol;
 pub mod session;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,10 +17,9 @@ use crate::tls::CertManager;
 use crate::video_bus;
 use session::SessionContext;
 
-/// Serves the WebTransport endpoint forever, rebuilding it whenever
-/// `cert_manager` rotates the TLS identity (wtransport has no live
-/// identity-swap API — active sessions on the old endpoint end when it's
-/// dropped; the client is expected to reconnect, see `assets/web/app.js`).
+/// Serves the WebTransport endpoint forever. The TLS identity is fixed for
+/// the process lifetime (see `tls::CertManager`), so the endpoint is built
+/// once up front.
 pub async fn serve(
     port: u16,
     cert_manager: Arc<CertManager>,
@@ -28,25 +28,12 @@ pub async fn serve(
     capture_settings_tx: watch::Sender<CaptureSettings>,
     mouse_mode_tx: watch::Sender<MouseMode>,
     device_state_rx: watch::Receiver<DeviceState>,
+    settings_path: PathBuf,
 ) -> Result<()> {
-    let identity_rx = cert_manager.watch();
+    let endpoint = build_endpoint(port, cert_manager.identity())?;
+    tracing::info!(port, "WebTransport endpoint listening");
 
-    loop {
-        let identity = identity_rx.borrow().clone_identity();
-        let endpoint = build_endpoint(port, identity)?;
-        tracing::info!(port, "WebTransport endpoint listening");
-
-        let mut rotated = identity_rx.clone();
-        tokio::select! {
-            result = accept_forever(&endpoint, &video_bus, &serial_tx, &capture_settings_tx, &mouse_mode_tx, &device_state_rx) => return result,
-            changed = rotated.changed() => {
-                if changed.is_err() {
-                    return Ok(());
-                }
-                tracing::info!("TLS certificate rotated, rebuilding WebTransport endpoint");
-            }
-        }
-    }
+    accept_forever(&endpoint, &video_bus, &serial_tx, &capture_settings_tx, &mouse_mode_tx, &device_state_rx, &settings_path).await
 }
 
 fn build_endpoint(port: u16, identity: Identity) -> Result<Endpoint<Server>> {
@@ -65,6 +52,7 @@ async fn accept_forever(
     capture_settings_tx: &watch::Sender<CaptureSettings>,
     mouse_mode_tx: &watch::Sender<MouseMode>,
     device_state_rx: &watch::Receiver<DeviceState>,
+    settings_path: &PathBuf,
 ) -> Result<()> {
     loop {
         let incoming = endpoint.accept().await;
@@ -72,8 +60,11 @@ async fn accept_forever(
             video_bus: video_bus.clone(),
             serial_tx: serial_tx.clone(),
             capture_settings_tx: capture_settings_tx.clone(),
+            capture_settings_rx: capture_settings_tx.subscribe(),
             mouse_mode_tx: mouse_mode_tx.clone(),
+            mouse_mode_rx: mouse_mode_tx.subscribe(),
             device_state_rx: device_state_rx.clone(),
+            settings_path: settings_path.clone(),
         };
         tokio::spawn(async move {
             if let Err(err) = handle_incoming(incoming, ctx).await {

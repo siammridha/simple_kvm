@@ -28,7 +28,8 @@ Run the binary on the Wyse 3040 and it serves a page at `https://<device
 ip>:3000` with:
 
 - **Live video**, streamed over WebTransport (not WebRTC). Two modes,
-  switchable live from a dropdown:
+  picked from a dropdown and applied when you click **Save settings** (see
+  below):
   - **MJPEG** (default) - if the capture card has hardware MJPEG (most
     UVC capture cards do), frames are forwarded as-is, essentially free on
     the CPU. If not, frames are JPEG-compressed in software from the raw
@@ -48,9 +49,10 @@ ip>:3000` with:
   capture card via V4L2's frame-interval negotiation. The card is free to
   negotiate a different rate than requested; a mismatch is logged, not
   shown on the page.
-- **Mouse clicks and scroll wheel**, absolute or relative mode
-  switchable live; on the CH9329 hardware this repo was built against,
-  clicks and scroll wheel only work through its *relative* HID report,
+- **Mouse clicks and scroll wheel**, absolute or relative mode, also
+  switched via **Save settings**; on the CH9329 hardware this repo was
+  built against, clicks and scroll wheel only work through its *relative*
+  HID report,
   so both modes send them via a zero-motion relative report - invisible
   from the browser, just how `ch9329::writer` talks to this chip. Mouse
   *movement* is not sent at all - moving the mouse over the video was
@@ -85,14 +87,14 @@ kernel works regardless of what (if anything) is managing devices. A slow,
 infrequent poll still runs alongside it as a safety net in case that
 listener can't be opened.
 
-**Dropdown changes are not saved automatically.** Changing video mode,
-frame rate, resolution, or mouse mode applies immediately, but the choice
-is only written to the settings file on disk when you click **Save
-settings** - that button sends a plain `POST /api/settings/save` request
-(a normal HTTPS call, not through the WebTransport connection) that
-writes whatever is in effect right now. If you reload the page without
-saving, the dropdowns still show whatever the server is actually using
-right now (nothing is lost mid-session) - but if the service restarts
+**Dropdown changes only take effect when you click Save settings.**
+Changing video mode, frame rate, resolution, or mouse mode does nothing on
+its own - picking a new value just moves the dropdown. Clicking **Save
+settings** sends one message over the WebTransport connection that both
+applies the new settings live and writes them to the settings file on
+disk, together, in one step. If you reload the page (or open a second
+tab) without saving, the dropdowns show whatever the server is actually
+using right now, not your unsaved picks - and if the service restarts
 (e.g. after a reboot) without a save having happened first, it comes back
 up with whatever was last saved, or the capture card's own defaults if
 nothing ever was.
@@ -104,19 +106,16 @@ Browsers only expose the `WebTransport` API on a secure context - an
 the device is reached by its LAN IP). So the page itself is served over
 HTTPS, using the same certificate as the WebTransport connection.
 
-There's no public domain for a LAN device, so by default the server
-generates its own self-signed certificate. The WebTransport connection
-pins it by hash (`serverCertificateHashes`), so there's no manual "accept
-this certificate" step needed for that part. The page itself, being
-regular HTTPS, does still need the browser to trust or accept the
-self-signed cert once (a normal "your connection isn't private" warning
-to click through, or add `TLS_CERT_PATH`/`TLS_KEY_PATH` pointing at a
-cert your browser already trusts to skip that entirely).
-
-Chrome caps a self-signed cert used with `serverCertificateHashes` at 14
-days, so the server regenerates it every 12 days automatically; the page's
-HTTPS listener picks up the new certificate immediately (no restart), and
-any WebTransport session connected at that moment reconnects on its own.
+The server doesn't generate its own certificate - you must provide one via
+`TLS_CERT_PATH`/`TLS_KEY_PATH`. It needs to be a certificate that chains to
+a certificate authority your browser already trusts (e.g. a step-ca-issued
+one). There's no certificate-hash pinning on the WebTransport connection
+anymore, and **a self-signed certificate does not work here even if you
+manually add it to the browser's trust store** - regular page loads accept
+a manually-trusted certificate, but Chrome's `WebTransport` connection
+verifies against the browser's built-in certificate authority list only
+and ignores locally-added trust, so it will keep failing to connect no
+matter how thoroughly the browser trusts the page itself.
 
 ## How it's built
 
@@ -196,8 +195,7 @@ if you need to change one):
 | `VIDEO_PATH` | `/dev/video0` | Capture card device |
 | `HTTP_PORT` | `3000` | HTTPS port for the page |
 | `WEBTRANSPORT_PORT` | `4433` | UDP port for the video/input connection |
-| `TLS_SAN` | `localhost` | Comma-separated subject names for the self-signed cert |
-| `TLS_CERT_PATH`, `TLS_KEY_PATH` | unset | Use a specific cert/key PEM pair instead of generating a self-signed one. Set both to enable; loaded once at startup and never auto-rotated - that's on whoever manages the file pair. |
+| `TLS_CERT_PATH`, `TLS_KEY_PATH` | **required** | The cert/key PEM pair the server presents. Loaded once at startup and never auto-rotated - that's on whoever manages the file pair. The browser must already trust this certificate (a real CA-issued cert, or one manually added to the device's trust store). |
 | `SETTINGS_PATH` | `/etc/simple_kvm-settings.json` | Where video mode/frame rate/resolution/mouse mode are written when you click **Save settings** on the page, and read back on the next startup. |
 | `RUST_LOG` | `info,simple_kvm::webtransport::session=debug,simple_kvm::ch9329::writer=debug` | Standard `tracing` log filter. By default, every keystroke/click is already logged at `debug` - no configuration needed first - since each log line includes how long that event took to queue/write, which is useful for tracking down input lag. A command that takes more than 50ms logs at `warn` regardless. Setting `RUST_LOG` yourself (e.g. `RUST_LOG=debug` for everything, or `RUST_LOG=warn` to quiet the per-keystroke lines) fully overrides the default above. |
 

@@ -1,8 +1,10 @@
-// simple_kvm client: fetches config + the current TLS cert hash, opens a
-// WebTransport session pinned to that hash, streams video frames from
-// server-opened unidirectional streams onto the canvas, and relays
-// keyboard/mouse input back as small binary datagrams. One bidirectional
-// stream carries settings changes and paste text as JSON-lines.
+// simple_kvm client: reads bootstrap data (WebTransport port, version) from
+// window.SERVER_CONFIG, embedded server-side into the page itself, opens a
+// WebTransport session, streams video frames from server-opened
+// unidirectional streams onto the canvas, and relays keyboard/mouse input
+// back as small binary datagrams. One bidirectional stream carries settings
+// updates and paste text as JSON-lines, and receives device-state/settings
+// pushes from the server the same way.
 
 const TAG_KEY_EVENT = 1;
 const TAG_MOUSE_RELATIVE_MOVE = 3;
@@ -55,16 +57,6 @@ function scheduleReconnect() {
   }, 1000);
 }
 
-async function loadConfig() {
-  const res = await fetch('/api/config');
-  return res.json();
-}
-
-async function loadCertInfo() {
-  const res = await fetch('/api/cert-info');
-  return res.json();
-}
-
 function populateResolutions(resolutions, defaultResolution) {
   resolutionSelect.innerHTML = '';
   if (resolutions.length === 0) {
@@ -75,6 +67,7 @@ function populateResolutions(resolutions, defaultResolution) {
     resolutionSelect.disabled = true;
     return;
   }
+  resolutionSelect.disabled = false;
   for (const { width, height } of resolutions) {
     const opt = document.createElement('option');
     opt.value = `${width}x${height}`;
@@ -87,25 +80,13 @@ function populateResolutions(resolutions, defaultResolution) {
 }
 
 async function connect() {
-  const config = await loadConfig();
-  populateResolutions(config.resolutions, config.default_resolution);
-  videoModeSelect.value = config.video_mode;
-  frameRateSelect.value = config.fps;
-  mouseModeSelect.value = config.mouse_mode;
-  versionEl.textContent = `v${config.version}`;
+  const { webtransportPort, version } = window.SERVER_CONFIG;
+  versionEl.textContent = `v${version}`;
 
-  if (!config.available) {
-    setStatus('no video device found', true);
-  }
-
-  const certInfo = await loadCertInfo();
-  const hashBytes = Uint8Array.from(JSON.parse(certInfo.hash));
-  const url = `https://${location.hostname}:${config.webtransport_port}/kvm`;
+  const url = `https://${location.hostname}:${webtransportPort}/kvm`;
 
   setStatus('connecting…');
-  const transport = new WebTransport(url, {
-    serverCertificateHashes: [{ algorithm: 'sha-256', value: hashBytes }],
-  });
+  const transport = new WebTransport(url);
 
   transport.closed
     .then(() => {
@@ -152,12 +133,18 @@ async function readControlReplies(readable) {
 }
 
 function handleServerMessage(msg) {
-  if (msg.type !== 'device_state') return;
-  populateResolutions(msg.resolutions, msg.default_resolution);
-  if (!msg.available) {
-    setStatus('no video device found', true);
-  } else if (statusEl.textContent === 'no video device found') {
-    setStatus('connected');
+  if (msg.type === 'device_state') {
+    populateResolutions(msg.resolutions, msg.default_resolution);
+    if (!msg.available) {
+      setStatus('no video device found', true);
+    } else if (statusEl.textContent === 'no video device found') {
+      setStatus('connected');
+    }
+  } else if (msg.type === 'settings') {
+    videoModeSelect.value = msg.capture.video_mode;
+    frameRateSelect.value = msg.capture.fps;
+    resolutionSelect.value = `${msg.capture.resolution.width}x${msg.capture.resolution.height}`;
+    mouseModeSelect.value = msg.mouse_mode;
   }
 }
 
@@ -301,26 +288,22 @@ function wireInput() {
     }
   });
 
-  videoModeSelect.addEventListener('change', () => sendControl({ type: 'set_video_mode', mode: videoModeSelect.value }));
-  frameRateSelect.addEventListener('change', () => sendControl({ type: 'set_frame_rate', fps: Number(frameRateSelect.value) }));
-  resolutionSelect.addEventListener('change', () => {
-    const [width, height] = resolutionSelect.value.split('x').map(Number);
-    sendControl({ type: 'set_resolution', width, height });
-  });
-  mouseModeSelect.addEventListener('change', () => sendControl({ type: 'set_mouse_mode', mode: mouseModeSelect.value }));
   pasteSend.addEventListener('click', () => {
     sendControl({ type: 'paste', text: pasteText.value });
     pasteText.value = '';
   });
 
-  saveSettings.addEventListener('click', async () => {
-    try {
-      const res = await fetch('/api/settings/save', { method: 'POST' });
-      saveSettingsStatus.textContent = res.ok ? 'Saved' : 'Save failed';
-    } catch (err) {
-      console.error('save settings failed', err);
-      saveSettingsStatus.textContent = 'Save failed';
-    }
+  saveSettings.addEventListener('click', () => {
+    const [width, height] = resolutionSelect.value.split('x').map(Number);
+    sendControl({
+      type: 'update_settings',
+      video_mode: videoModeSelect.value,
+      width,
+      height,
+      fps: Number(frameRateSelect.value),
+      mouse_mode: mouseModeSelect.value,
+    });
+    saveSettingsStatus.textContent = 'Saved';
     setTimeout(() => { saveSettingsStatus.textContent = ''; }, 2000);
   });
 

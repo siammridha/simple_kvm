@@ -38,13 +38,14 @@ async fn main() -> Result<()> {
     let video_path = env::var("VIDEO_PATH").unwrap_or_else(|_| "/dev/video0".to_string());
     let http_port: u16 = env_parsed("HTTP_PORT").unwrap_or(3000);
     let webtransport_port: u16 = env_parsed("WEBTRANSPORT_PORT").unwrap_or(4433);
-    let tls_sans: Vec<String> = env::var("TLS_SAN")
-        .unwrap_or_else(|_| "localhost".to_string())
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .collect();
-    let tls_cert_path = env::var("TLS_CERT_PATH").ok();
-    let tls_key_path = env::var("TLS_KEY_PATH").ok();
+    let Ok(tls_cert_path) = env::var("TLS_CERT_PATH") else {
+        tracing::error!("TLS_CERT_PATH must be set to a certificate file the browser will trust");
+        std::process::exit(1);
+    };
+    let Ok(tls_key_path) = env::var("TLS_KEY_PATH") else {
+        tracing::error!("TLS_KEY_PATH must be set to the matching private key file");
+        std::process::exit(1);
+    };
     let settings_path = PathBuf::from(env::var("SETTINGS_PATH").unwrap_or_else(|_| "/etc/simple_kvm-settings.json".to_string()));
     let serial_open_delay_secs: u64 = env_parsed("SERIAL_OPEN_DELAY_SECS").unwrap_or(30);
 
@@ -67,7 +68,7 @@ async fn main() -> Result<()> {
 
     let (device_state_tx, device_state_rx) = watch::channel(capture_manager.device_state(&default_capture_settings));
     let (capture_settings_tx, capture_settings_rx) = watch::channel(default_capture_settings);
-    let (mouse_mode_tx, mouse_mode_rx) = watch::channel(default_mouse_mode);
+    let (mouse_mode_tx, _mouse_mode_rx) = watch::channel(default_mouse_mode);
     let (video_bus_tx, video_bus_rx) = video_bus::channel();
 
     // --- Serial: same soft-unavailable treatment as capture. Commands sent
@@ -77,25 +78,10 @@ async fn main() -> Result<()> {
     let (serial_tx, serial_rx) = mpsc::channel::<SerialCommand>(256);
     tokio::spawn(open_serial_after_delay(serial_path, serial_open_delay_secs, serial_tx.clone(), serial_rx));
 
-    let cert_manager = Arc::new(match (tls_cert_path, tls_key_path) {
-        (Some(cert_path), Some(key_path)) => {
-            tracing::info!(cert_path, key_path, "loading TLS identity from files (no auto-rotation)");
-            tls::CertManager::start_from_files(cert_path, key_path).await?
-        }
-        _ => tls::CertManager::start_self_signed(tls_sans)?,
-    });
+    tracing::info!(tls_cert_path, tls_key_path, "loading TLS identity from files");
+    let cert_manager = Arc::new(tls::CertManager::start_from_files(tls_cert_path, tls_key_path).await?);
 
-    let app_state = web::AppState {
-        device_state_rx: device_state_rx.clone(),
-        webtransport_port,
-        cert_manager: Arc::clone(&cert_manager),
-        video_mode: default_capture_settings.video_mode,
-        fps: default_capture_settings.fps,
-        mouse_mode: default_mouse_mode,
-        capture_settings_rx: capture_settings_rx.clone(),
-        mouse_mode_rx,
-        settings_path,
-    };
+    let app_state = web::AppState { webtransport_port };
     let https_config = cert_manager.https_config().await?;
     let http_addr = std::net::SocketAddr::from(([0, 0, 0, 0], http_port));
     tracing::info!(port = http_port, "HTTPS page server listening");
@@ -108,7 +94,9 @@ async fn main() -> Result<()> {
     let capture_handle = tokio::spawn(capture_manager.run(capture_settings_rx, video_bus_tx, device_state_tx));
 
     let webtransport_handle = tokio::spawn(async move {
-        if let Err(err) = webtransport::serve(webtransport_port, cert_manager, video_bus_rx, serial_tx, capture_settings_tx, mouse_mode_tx, device_state_rx).await {
+        if let Err(err) =
+            webtransport::serve(webtransport_port, cert_manager, video_bus_rx, serial_tx, capture_settings_tx, mouse_mode_tx, device_state_rx, settings_path).await
+        {
             tracing::error!(%err, "WebTransport server exited");
         }
     });

@@ -24,9 +24,10 @@ pub struct CaptureSettings {
 
 /// Live state of the capture card itself — whether it's plugged in right
 /// now, and what it supports. Published by `CaptureManager::run`'s hot-plug
-/// loop over a `watch` channel so the web page (both a fresh `/api/config`
-/// load and an already-open tab, via a control-stream push) reflects a
-/// hot-plug/unplug instead of being frozen at server-startup values.
+/// loop over a `watch` channel, and pushed to the web page over the
+/// WebTransport control stream (see `webtransport::session::handle`) so an
+/// already-open tab reflects a hot-plug/unplug instead of being frozen at
+/// server-startup values.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct DeviceState {
     pub available: bool,
