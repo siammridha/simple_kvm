@@ -253,6 +253,7 @@ fn run_one_pass(
                             }
                         },
                     };
+                    tracing::warn!(bytes = jpeg.len(), "TEMP DEBUG: mjpeg frame size");
                     FrameEnvelope { kind: FrameKind::Mjpeg, data: jpeg.into(), captured_at }
                 }
                 VideoMode::H264 => {
