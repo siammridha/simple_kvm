@@ -7,3 +7,19 @@ rustflags = ["-C", "target-feature=-crt-static"]
 
 [target.x86_64-unknown-linux-musl]
 rustflags = ["-C", "target-feature=-crt-static"]
+
+# The bindgen/libclang dlopen problem above also breaks bindgen's own
+# build.rs (a host-compiled binary) during cross-compilation, since a
+# fully-static host build (Cargo's default) can't dlopen either: `[target]`
+# rustflags only apply to the target binary, not host build scripts, so
+# without this the same crt-static fix has to be applied separately. Lets
+# local cross-compiles (e.g. `cargo zigbuild --target
+# x86_64-unknown-linux-musl`) build without needing a git tag + CI release
+# for every debug iteration. Only in effect on the stable toolchain when
+# `RUSTC_BOOTSTRAP=1` is set (these two options aren't stabilized yet).
+[unstable]
+host-config = true
+target-applies-to-host = true
+
+[host]
+rustflags = ["-C", "target-feature=-crt-static"]

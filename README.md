@@ -147,6 +147,26 @@ with `bindgen` at build time) and `nasm` (speeds up the `openh264`
 encoder, which matters on this CPU). Both the devcontainer and the release
 workflow already install these.
 
+**Fast local iteration, without a tag/release for every change:** the
+devcontainer can cross-compile a debug binary directly, for testing
+against the real device without waiting on CI:
+
+```sh
+apk add --no-cache zig cargo-zigbuild
+rustup target add x86_64-unknown-linux-musl
+RUSTC_BOOTSTRAP=1 cargo zigbuild --release --target x86_64-unknown-linux-musl
+```
+
+`.cargo/config.toml`'s `[unstable]`/`[host]` section (needing
+`RUSTC_BOOTSTRAP=1` since it's not stabilized) is what makes this work:
+without it, `bindgen`'s own build script fails to cross-compile with a
+"dynamic loading not supported" error, since Cargo doesn't apply
+`[target]` rustflags to host-compiled build scripts. Copy the resulting
+`target/x86_64-unknown-linux-musl/release/simple_kvm` to the device (e.g.
+via `scp` to `/usr/local/bin/simple_kvm.new`, then `chmod 755` and `mv`
+over the running binary - the rename avoids "Text file busy") and `rc-service
+simple_kvm restart`.
+
 ## Target platform
 
 - **Device:** Dell Wyse 3040 (Intel Atom x5-Z8350, x86_64)

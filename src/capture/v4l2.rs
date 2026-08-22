@@ -196,7 +196,14 @@ where
 
     while !should_stop() {
         match stream.next() {
-            Ok((buf, meta)) => on_frame(buf, meta.timestamp),
+            Ok((buf, meta)) => {
+                // `buf` is the full fixed-size mmap buffer slot, not the
+                // real frame: for compressed formats like MJPEG the actual
+                // encoded frame only fills the first `bytesused` bytes, the
+                // rest is leftover data from a previous capture.
+                let len = (meta.bytesused as usize).min(buf.len());
+                on_frame(&buf[..len], meta.timestamp);
+            }
             Err(err) if err.kind() == std::io::ErrorKind::TimedOut => continue,
             Err(err) => return Err(err).context("reading capture frame"),
         }
