@@ -65,22 +65,32 @@ ip>:3000` with:
   a different rate than requested (a mismatch is logged, not shown on the
   page), but picking through the page only ever offers rates the card
   itself reported.
-- **Mouse clicks and scroll wheel**, absolute or relative mode, also
-  switched via **Save settings**; on the CH9329 hardware this repo was
-  built against, clicks and scroll wheel only work through its *relative*
-  HID report,
-  so both modes send them via a zero-motion relative report - invisible
+- **Mouse movement, clicks, and scroll wheel**, absolute or relative mode,
+  switched via **Save settings**. Absolute mode positions the cursor
+  exactly where you point in the video; on the CH9329 hardware this repo
+  was built against, clicks and scroll wheel only work through its
+  *relative* HID report, so absolute mode sends position via the absolute
+  report and clicks/scroll via a zero-motion relative report - invisible
   from the browser, just how `ch9329::writer` talks to this chip. Mouse
-  *movement* is not sent at all - moving the mouse over the video was
-  crashing the Wyse 3040, so cursor tracking has been removed for now
-  and only clicks/scroll go through.
-- **A paste box** - text typed or pasted into it is sent to the target as
-  simulated keystrokes (US QWERTY only; there's no OS-level clipboard
-  access over a HID-only link).
+  movement used to be sent on every native `mousemove` event, which was
+  fast enough to crash-reboot the Wyse 3040 (a power/brownout issue), so
+  it's now throttled to send at most once per video frame - matching
+  whatever fps is currently configured, and re-sampling automatically if
+  fps changes.
+- **A mouse on/off toggle** - the cursor icon next to the gear icon turns
+  all mouse forwarding (movement, clicks, scroll) on or off. It's a local,
+  browser-only switch (nothing is saved or sent to the server); keyboard
+  input keeps working either way. Useful for typing without stray clicks
+  landing on the target.
+- **A paste box** - pasting into it sends the text to the target right away
+  as simulated keystrokes, then clears the box (US QWERTY only; there's no
+  OS-level clipboard access over a HID-only link).
 - **An auto-hiding controls bar** - the bar with video mode/resolution/mouse
   mode/paste controls and status tucks itself away 5 seconds after it's
   opened while a browser is connected and nothing else is going on, and
-  reopens on tap/click, or on its own if the connection drops.
+  reopens on tap/click, or on its own if the connection drops. Hovering
+  over the bar pauses the countdown so it won't close out from under the
+  pointer; it resumes once the pointer leaves.
 - **No login.** Anyone who can reach port 3000 has full control. This is
   meant for a trusted LAN, not the open internet.
 

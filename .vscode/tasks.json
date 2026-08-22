@@ -7,7 +7,7 @@
             "label": "start-server",
             "detail": "Kill any running simple_kvm, then cargo run",
             "type": "shell",
-            "command": "pkill -x simple_kvm 2>/dev/null; pkill -x cargo 2>/dev/null; sleep 1; HTTP_PORT=3000 cargo run",
+            "command": "./test-on-device.sh",
             "presentation": {
                 "reveal": "always",
                 "panel": "dedicated",

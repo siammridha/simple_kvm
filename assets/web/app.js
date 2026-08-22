@@ -8,6 +8,7 @@
 // device-state/settings pushes back from the server.
 
 const TAG_KEY_EVENT = 1;
+const TAG_MOUSE_ABSOLUTE_MOVE = 2;
 const TAG_MOUSE_RELATIVE_MOVE = 3;
 const TAG_MOUSE_BUTTONS = 4;
 
@@ -19,6 +20,7 @@ const inputSurface = document.getElementById('video-surface');
 const topbarHandle = document.getElementById('topbar-handle');
 const topbar = document.getElementById('topbar');
 const settingsButton = document.getElementById('settings-button');
+const mouseToggleButton = document.getElementById('mouse-toggle-button');
 const settingsModal = document.getElementById('settings-modal');
 const pasteButton = document.getElementById('paste-button');
 const pastePanel = document.getElementById('paste-panel');
@@ -27,7 +29,6 @@ const frameRateSelect = document.getElementById('frame-rate');
 const resolutionSelect = document.getElementById('resolution');
 const mouseModeSelect = document.getElementById('mouse-mode');
 const pasteText = document.getElementById('paste-text');
-const pasteSend = document.getElementById('paste-send');
 const saveSettings = document.getElementById('save-settings');
 const saveSettingsStatus = document.getElementById('save-settings-status');
 const versionEl = document.getElementById('version');
@@ -62,9 +63,23 @@ let deviceModes = { mjpeg: emptyModeState(), h264: emptyModeState() };
 // Whether the settings modal is open - suppresses the topbar's
 // outside-click auto-hide (see wireTopbar()) while it's up.
 let settingsOpen = false;
+// Latest mouse position/movement since the last flush, sent out at most
+// once per video frame period instead of on every native mousemove event -
+// sending on every event once flooded the CH9329's serial link with enough
+// traffic to crash-reboot the target machine. See scheduleMouseMoveFlush().
+let pendingAbsoluteMove = null;
+let pendingRelativeDx = 0;
+let pendingRelativeDy = 0;
+let lastMouseMoveButtons = 0;
+// Local, unsaved toggle - when off, no mouse event (move, click, or scroll)
+// is sent to the target at all. Keyboard input is unaffected.
+let mouseEnabled = true;
 // Whether the paste flyout is open - suppresses the topbar's outside-click
 // auto-hide the same way settingsOpen does (see wireTopbar()).
 let pasteOpen = false;
+// Whether the pointer is over the topbar - suppresses auto-hide while
+// hovering, same as settingsOpen/pasteOpen (see wireTopbar()).
+let topbarHovered = false;
 
 function setStatus(text, isError) {
   statusEl.textContent = text;
@@ -78,7 +93,7 @@ let autoHideTimer = null;
 // up - same gating as the outside-click auto-hide in wireTopbar().
 function armAutoHide() {
   clearAutoHide();
-  if (!topbar.classList.contains('open') || !rtcConnected || settingsOpen || pasteOpen) return;
+  if (!topbar.classList.contains('open') || !rtcConnected || settingsOpen || pasteOpen || topbarHovered) return;
   autoHideTimer = setTimeout(closeTopbar, 5000);
 }
 
@@ -115,6 +130,7 @@ function openPastePanel() {
   pastePanel.classList.add('open');
   pasteOpen = true;
   clearAutoHide();
+  pasteText.focus();
 }
 
 function closePastePanel() {
@@ -257,6 +273,16 @@ function wireTopbar() {
     if (topbar.contains(e.target) || topbarHandle.contains(e.target) || settingsModal.contains(e.target) || pastePanel.contains(e.target)) return;
     closeTopbar();
   });
+
+  topbar.addEventListener('mouseenter', () => {
+    topbarHovered = true;
+    clearAutoHide();
+  });
+
+  topbar.addEventListener('mouseleave', () => {
+    topbarHovered = false;
+    armAutoHide();
+  });
 }
 
 // Settings modal wiring - gear icon toggles it, backdrop click closes it,
@@ -289,6 +315,44 @@ function wireSettingsModal() {
   for (const el of [videoModeSelect, frameRateSelect, resolutionSelect, mouseModeSelect]) {
     el.addEventListener('change', updateSaveButtonState);
   }
+}
+
+function onMouseMove(e) {
+  if (appliedSettings.mouse_mode === 'absolute') {
+    const rect = inputSurface.getBoundingClientRect();
+    pendingAbsoluteMove = { xFrac: (e.clientX - rect.left) / rect.width, yFrac: (e.clientY - rect.top) / rect.height };
+  } else {
+    pendingRelativeDx += e.movementX;
+    pendingRelativeDy += e.movementY;
+    lastMouseMoveButtons = buttonMask(e.buttons);
+  }
+}
+
+// Removing the listener outright when the mouse is off (rather than
+// leaving it attached and no-op'ing inside) means the highest-frequency
+// input event just isn't handled at all while disabled. Written as
+// remove-then-conditionally-add so it's idempotent regardless of whether
+// it's called from wireInput()'s initial setup or a later toggle.
+function updateMouseMoveListener() {
+  inputSurface.removeEventListener('mousemove', onMouseMove);
+  if (mouseEnabled) inputSurface.addEventListener('mousemove', onMouseMove);
+}
+
+// Mouse enable/disable toggle - purely local, nothing sent to the server.
+// Turning it off also drops any queued movement so re-enabling doesn't
+// flush a stale position/delta from before it was switched off.
+function wireMouseToggle() {
+  mouseToggleButton.addEventListener('click', () => {
+    mouseEnabled = !mouseEnabled;
+    updateMouseMoveListener();
+    if (!mouseEnabled) {
+      pendingAbsoluteMove = null;
+      pendingRelativeDx = 0;
+      pendingRelativeDy = 0;
+    }
+    mouseToggleButton.setAttribute('aria-pressed', String(!mouseEnabled));
+    mouseToggleButton.setAttribute('aria-label', mouseEnabled ? 'Disable mouse' : 'Enable mouse');
+  });
 }
 
 // Paste flyout wiring - paste icon toggles it, and (since it's a small
@@ -428,6 +492,11 @@ function handleServerMessage(msg) {
     refreshOptionsForMode(msg.capture.video_mode, msg.capture.resolution, msg.capture.fps);
     mouseModeSelect.value = msg.mouse_mode;
     updateVideoElementVisibility();
+    // Drop anything queued under the old mode so a mode switch can't flush a
+    // stale absolute position or relative delta under the new one.
+    pendingAbsoluteMove = null;
+    pendingRelativeDx = 0;
+    pendingRelativeDy = 0;
     if (savePending) {
       savePending = false;
       saveSettingsStatus.textContent = 'Saved';
@@ -472,9 +541,15 @@ function wireInput() {
 
   inputSurface.addEventListener('mousedown', handleMouseButtons);
   inputSurface.addEventListener('mouseup', handleMouseButtons);
-  inputSurface.addEventListener('contextmenu', (e) => e.preventDefault());
+  inputSurface.addEventListener('contextmenu', (e) => {
+    if (mouseEnabled) e.preventDefault();
+  });
+
+  updateMouseMoveListener();
+  scheduleMouseMoveFlush();
 
   inputSurface.addEventListener('wheel', (e) => {
+    if (!mouseEnabled) return;
     e.preventDefault();
     const wheel = clampWheel(-e.deltaY);
     if (appliedSettings.mouse_mode === 'absolute') {
@@ -484,8 +559,9 @@ function wireInput() {
     }
   });
 
-  pasteSend.addEventListener('click', () => {
-    sendControl({ type: 'paste', text: pasteText.value });
+  pasteText.addEventListener('paste', (e) => {
+    e.preventDefault();
+    sendControl({ type: 'paste', text: e.clipboardData.getData('text') });
     pasteText.value = '';
   });
 
@@ -509,6 +585,7 @@ function wireInput() {
   });
 
   function handleMouseButtons(e) {
+    if (!mouseEnabled) return;
     if (appliedSettings.mouse_mode === 'absolute') {
       sendMouseButtons(buttonMask(e.buttons), 0);
     } else {
@@ -533,6 +610,39 @@ function sendKeyEvent(code, pressed) {
   bytes[0] = TAG_KEY_EVENT;
   bytes[1] = pressed ? 1 : 0;
   bytes.set(codeBytes, 2);
+  sendInput(bytes);
+}
+
+// Re-arms itself at the current video frame rate (falling back to 30 if
+// unknown, e.g. before the server's first settings push) so the flush
+// cadence tracks fps live, including across a Save that changes it.
+function scheduleMouseMoveFlush() {
+  const fps = appliedSettings.fps > 0 ? appliedSettings.fps : 30;
+  setTimeout(() => {
+    flushMouseMove();
+    scheduleMouseMoveFlush();
+  }, 1000 / fps);
+}
+
+function flushMouseMove() {
+  if (appliedSettings.mouse_mode === 'absolute') {
+    if (!pendingAbsoluteMove) return;
+    sendMouseAbsoluteMove(pendingAbsoluteMove.xFrac, pendingAbsoluteMove.yFrac);
+    pendingAbsoluteMove = null;
+  } else {
+    if (pendingRelativeDx === 0 && pendingRelativeDy === 0) return;
+    sendMouseRelativeMove(lastMouseMoveButtons, clampByte(pendingRelativeDx), clampByte(pendingRelativeDy), 0);
+    pendingRelativeDx = 0;
+    pendingRelativeDy = 0;
+  }
+}
+
+function sendMouseAbsoluteMove(xFrac, yFrac) {
+  const bytes = new Uint8Array(9);
+  const view = new DataView(bytes.buffer);
+  bytes[0] = TAG_MOUSE_ABSOLUTE_MOVE;
+  view.setFloat32(1, xFrac, true);
+  view.setFloat32(5, yFrac, true);
   sendInput(bytes);
 }
 
@@ -569,6 +679,7 @@ function sendControl(message) {
 
 wireTopbar();
 wireSettingsModal();
+wireMouseToggle();
 wirePastePanel();
 // Forced open pre-connect, same as the disconnected state handled in
 // connect()'s connectionstatechange listener above.

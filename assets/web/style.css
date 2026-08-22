@@ -127,6 +127,34 @@ body {
   background: #222;
 }
 
+#mouse-toggle-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.3rem;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: #eee;
+  cursor: pointer;
+}
+
+#mouse-toggle-button:hover {
+  background: #222;
+}
+
+#mouse-toggle-button[aria-pressed="true"] {
+  color: #e77;
+}
+
+#mouse-toggle-button .disabled-slash {
+  display: none;
+}
+
+#mouse-toggle-button[aria-pressed="true"] .disabled-slash {
+  display: inline;
+}
+
 #settings-modal {
   position: fixed;
   inset: 0;
@@ -196,19 +224,6 @@ body {
   border: 1px solid #444;
   border-radius: 4px;
   padding: 0.4rem;
-}
-
-#paste-send {
-  padding: 0 1rem;
-  border: none;
-  border-radius: 4px;
-  background: #2a6;
-  color: #fff;
-  cursor: pointer;
-}
-
-#paste-send:hover {
-  background: #3b7;
 }
 
 #save-settings {
