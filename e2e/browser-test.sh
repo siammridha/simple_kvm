@@ -93,6 +93,16 @@ agent-browser click "#video-surface"
 agent-browser press "a"
 sleep 0.5
 
+# The top bar slides off-screen once connected (clicking the video surface
+# above just closed it, since we're connected by this point) - the handle
+# re-opens it. The dropdowns/Save button now live in the settings modal,
+# opened via the gear icon in the bar.
+echo "Opening the top bar..."
+agent-browser click "#topbar-handle"
+
+echo "Opening the settings modal..."
+agent-browser click "#settings-button"
+
 echo "Changing mouse mode and clicking Save settings..."
 agent-browser select "#mouse-mode" relative
 agent-browser click "#save-settings"

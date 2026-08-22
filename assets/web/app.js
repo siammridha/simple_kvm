@@ -16,6 +16,12 @@ const canvas = document.getElementById('video');
 const ctx2d = canvas.getContext('2d');
 const videoEl = document.getElementById('video-el');
 const inputSurface = document.getElementById('video-surface');
+const topbarHandle = document.getElementById('topbar-handle');
+const topbar = document.getElementById('topbar');
+const settingsButton = document.getElementById('settings-button');
+const settingsModal = document.getElementById('settings-modal');
+const pasteButton = document.getElementById('paste-button');
+const pastePanel = document.getElementById('paste-panel');
 const videoModeSelect = document.getElementById('video-mode');
 const frameRateSelect = document.getElementById('frame-rate');
 const resolutionSelect = document.getElementById('resolution');
@@ -34,10 +40,55 @@ let inputChannel = null;
 // isn't there.
 let captureAvailable = false;
 let hidAvailable = false;
+// Settings actually confirmed by the server (last `settings` push, on
+// connect and after a Save is applied) - never written optimistically on a
+// dropdown change or Save click, so live reads of this always reflect what
+// the server is actually doing.
+let appliedSettings = { video_mode: 'mjpeg', width: undefined, height: undefined, fps: undefined, mouse_mode: 'absolute' };
+let savePending = false;
+// Whether the RTCPeerConnection has actually reached 'connected'. Starts
+// false so the bar stays forced open from page load until the connection
+// comes up - see openTopbar()/closeTopbar() and the connectionstatechange
+// handler in connect().
+let rtcConnected = false;
+// Whether the settings modal is open - suppresses the topbar's
+// outside-click auto-hide (see wireTopbar()) while it's up.
+let settingsOpen = false;
+// Whether the paste flyout is open - suppresses the topbar's outside-click
+// auto-hide the same way settingsOpen does (see wireTopbar()).
+let pasteOpen = false;
 
 function setStatus(text, isError) {
   statusEl.textContent = text;
   statusEl.classList.toggle('error', Boolean(isError));
+}
+
+function openTopbar() {
+  topbar.classList.add('open');
+}
+
+function closeTopbar() {
+  topbar.classList.remove('open');
+}
+
+function openSettingsModal() {
+  settingsModal.classList.add('open');
+  settingsOpen = true;
+}
+
+function closeSettingsModal() {
+  settingsModal.classList.remove('open');
+  settingsOpen = false;
+}
+
+function openPastePanel() {
+  pastePanel.classList.add('open');
+  pasteOpen = true;
+}
+
+function closePastePanel() {
+  pastePanel.classList.remove('open');
+  pasteOpen = false;
 }
 
 function populateResolutions(resolutions, defaultResolution) {
@@ -63,7 +114,7 @@ function populateResolutions(resolutions, defaultResolution) {
 }
 
 function updateVideoElementVisibility() {
-  const showVideoEl = videoModeSelect.value === 'h264';
+  const showVideoEl = appliedSettings.video_mode === 'h264';
   videoEl.style.display = showVideoEl ? '' : 'none';
   canvas.style.display = showVideoEl ? 'none' : '';
 }
@@ -98,6 +149,83 @@ function updateSettingsAvailability() {
   mouseModeSelect.disabled = !hidAvailable;
 }
 
+// True if a dropdown's current value differs from appliedSettings (the
+// server-confirmed baseline) for whichever half of settings is actually
+// available - a device that isn't present has nothing meaningful to save,
+// so its dropdowns (which may hold placeholder values) don't count.
+function settingsAreDirty() {
+  if (captureAvailable) {
+    if (videoModeSelect.value !== appliedSettings.video_mode) return true;
+    if (Number(frameRateSelect.value) !== appliedSettings.fps) return true;
+    const [width, height] = resolutionSelect.value.split('x').map(Number);
+    if (width !== appliedSettings.width || height !== appliedSettings.height) return true;
+  }
+  if (hidAvailable) {
+    if (mouseModeSelect.value !== appliedSettings.mouse_mode) return true;
+  }
+  return false;
+}
+
+function updateSaveButtonState() {
+  saveSettings.disabled = savePending || !settingsAreDirty();
+}
+
+// Bar handle/outside-click wiring - independent of the WebRTC connection
+// itself, so the handle works even before/if connect() ever succeeds.
+function wireTopbar() {
+  topbarHandle.addEventListener('click', () => {
+    openTopbar();
+  });
+
+  document.addEventListener('click', (e) => {
+    if (!rtcConnected) return;
+    if (settingsOpen || pasteOpen) return;
+    if (topbar.contains(e.target) || topbarHandle.contains(e.target) || settingsModal.contains(e.target) || pastePanel.contains(e.target)) return;
+    closeTopbar();
+  });
+}
+
+// Settings modal wiring - gear icon toggles it, backdrop click closes it,
+// and each dropdown's change recomputes whether Save should be enabled.
+function wireSettingsModal() {
+  settingsButton.addEventListener('click', () => {
+    if (settingsOpen) {
+      closeSettingsModal();
+    } else {
+      openSettingsModal();
+    }
+  });
+
+  settingsModal.addEventListener('click', (e) => {
+    if (e.target === settingsModal) {
+      closeSettingsModal();
+    }
+  });
+
+  for (const el of [videoModeSelect, frameRateSelect, resolutionSelect, mouseModeSelect]) {
+    el.addEventListener('change', updateSaveButtonState);
+  }
+}
+
+// Paste flyout wiring - paste icon toggles it, and (since it's a small
+// fixed panel rather than a full-screen backdrop like the settings modal)
+// a document-level click outside the panel/button closes it.
+function wirePastePanel() {
+  pasteButton.addEventListener('click', () => {
+    if (pasteOpen) {
+      closePastePanel();
+    } else {
+      openPastePanel();
+    }
+  });
+
+  document.addEventListener('click', (e) => {
+    if (!pasteOpen) return;
+    if (pastePanel.contains(e.target) || pasteButton.contains(e.target)) return;
+    closePastePanel();
+  });
+}
+
 async function connect() {
   const { version } = window.SERVER_CONFIG;
   versionEl.textContent = `v${version}`;
@@ -107,6 +235,16 @@ async function connect() {
   const pc = new RTCPeerConnection();
 
   pc.addEventListener('connectionstatechange', () => {
+    if (pc.connectionState === 'connected') {
+      // Auto-hide is only allowed once we're actually connected - see
+      // wireTopbar()'s outside-click listener.
+      rtcConnected = true;
+    } else if (pc.connectionState === 'failed' || pc.connectionState === 'closed' || pc.connectionState === 'disconnected') {
+      // Force the bar back open any time we're not actively connected, same
+      // as the pre-connect state below - so status/version stay visible.
+      rtcConnected = false;
+      openTopbar();
+    }
     if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
       setStatus('disconnected - reload the page to reconnect', true);
     } else if (pc.connectionState === 'disconnected') {
@@ -131,6 +269,15 @@ async function connect() {
   controlChannel.binaryType = 'arraybuffer';
   controlChannel.addEventListener('message', (event) => {
     handleServerMessage(JSON.parse(new TextDecoder().decode(event.data)));
+  });
+  controlChannel.addEventListener('close', () => {
+    // Connection dropped mid-save - clear the loading state without
+    // claiming success, since no confirmation is coming.
+    if (savePending) {
+      savePending = false;
+      saveSettingsStatus.textContent = '';
+      updateSaveButtonState();
+    }
   });
 
   const offer = await pc.createOffer();
@@ -171,6 +318,7 @@ function handleServerMessage(msg) {
     populateResolutions(msg.resolutions, msg.default_resolution);
     populateFrameRates(msg.frame_rates, undefined);
     updateSettingsAvailability();
+    updateSaveButtonState();
     if (!msg.available) {
       setStatus('no video device found', true);
     } else if (statusEl.textContent === 'no video device found') {
@@ -179,12 +327,29 @@ function handleServerMessage(msg) {
   } else if (msg.type === 'hid_state') {
     hidAvailable = msg.available;
     updateSettingsAvailability();
+    updateSaveButtonState();
   } else if (msg.type === 'settings') {
+    appliedSettings = {
+      video_mode: msg.capture.video_mode,
+      width: msg.capture.resolution.width,
+      height: msg.capture.resolution.height,
+      fps: msg.capture.fps,
+      mouse_mode: msg.mouse_mode,
+    };
     videoModeSelect.value = msg.capture.video_mode;
     frameRateSelect.value = msg.capture.fps;
     resolutionSelect.value = `${msg.capture.resolution.width}x${msg.capture.resolution.height}`;
     mouseModeSelect.value = msg.mouse_mode;
     updateVideoElementVisibility();
+    if (savePending) {
+      savePending = false;
+      saveSettingsStatus.textContent = 'Saved';
+      setTimeout(() => { saveSettingsStatus.textContent = ''; }, 2000);
+    }
+    // Dropdowns now match appliedSettings (either from this being the
+    // confirmation of a Save, or an unrelated push) - recompute so Save
+    // re-disables itself rather than staying force-enabled.
+    updateSaveButtonState();
   }
 }
 
@@ -225,7 +390,7 @@ function wireInput() {
   inputSurface.addEventListener('wheel', (e) => {
     e.preventDefault();
     const wheel = clampWheel(-e.deltaY);
-    if (mouseModeSelect.value === 'absolute') {
+    if (appliedSettings.mouse_mode === 'absolute') {
       sendMouseButtons(buttonMask(e.buttons), wheel);
     } else {
       sendMouseRelativeMove(buttonMask(e.buttons), 0, 0, wheel);
@@ -236,8 +401,6 @@ function wireInput() {
     sendControl({ type: 'paste', text: pasteText.value });
     pasteText.value = '';
   });
-
-  videoModeSelect.addEventListener('change', updateVideoElementVisibility);
 
   saveSettings.addEventListener('click', () => {
     // Only include the half of the settings a device is actually present
@@ -253,12 +416,13 @@ function wireInput() {
       message.mouse_mode = mouseModeSelect.value;
     }
     sendControl(message);
-    saveSettingsStatus.textContent = 'Saved';
-    setTimeout(() => { saveSettingsStatus.textContent = ''; }, 2000);
+    savePending = true;
+    saveSettings.disabled = true;
+    saveSettingsStatus.textContent = 'Saving…';
   });
 
   function handleMouseButtons(e) {
-    if (mouseModeSelect.value === 'absolute') {
+    if (appliedSettings.mouse_mode === 'absolute') {
       sendMouseButtons(buttonMask(e.buttons), 0);
     } else {
       sendMouseRelativeMove(buttonMask(e.buttons), 0, 0, 0);
@@ -315,6 +479,13 @@ function sendControl(message) {
     // Channel closing - drop it.
   }
 }
+
+wireTopbar();
+wireSettingsModal();
+wirePastePanel();
+// Forced open pre-connect, same as the disconnected state handled in
+// connect()'s connectionstatechange listener above.
+openTopbar();
 
 if (typeof RTCPeerConnection === 'undefined') {
   setStatus('this browser has no WebRTC support', true);

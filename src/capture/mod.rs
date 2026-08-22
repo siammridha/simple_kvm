@@ -92,6 +92,7 @@ impl CaptureManager {
     ) {
         let device_path = self.device_path;
         let mut known_present = false;
+        let mut previous_video_mode: Option<VideoMode> = None;
         let mut uevents = match uevent::UeventListener::open() {
             Ok(listener) => Some(listener),
             Err(err) => {
@@ -127,6 +128,13 @@ impl CaptureManager {
             }
 
             let current = *settings.borrow();
+            if let Some(prev) = previous_video_mode {
+                if prev != current.video_mode {
+                    tracing::info!(mode = ?prev, "video encoding stopped");
+                    tracing::info!(mode = ?current.video_mode, "video encoding started");
+                }
+            }
+            previous_video_mode = Some(current.video_mode);
             let new_state = device_state_for(&formats, &current);
             device_state_tx.send_if_modified(|s| {
                 if *s == new_state {
