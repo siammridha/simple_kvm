@@ -1,6 +1,7 @@
 /target
 .DS_Store
 .claude
+/test-on-device.sh
 
 
 # Added by cargo

@@ -174,7 +174,11 @@ function updateSaveButtonState() {
 // itself, so the handle works even before/if connect() ever succeeds.
 function wireTopbar() {
   topbarHandle.addEventListener('click', () => {
-    openTopbar();
+    if (topbar.classList.contains('open')) {
+      closeTopbar();
+    } else {
+      openTopbar();
+    }
   });
 
   document.addEventListener('click', (e) => {

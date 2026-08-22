@@ -24,12 +24,32 @@ body {
   display: block;
 }
 
-#topbar-handle {
+#topbar {
   position: fixed;
   top: 0;
+  left: 0;
+  right: 0;
+  z-index: 10;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.5rem 1rem;
+  background: #1a1a1a;
+  border-bottom: 1px solid #333;
+  transform: translateY(-100%);
+  transition: transform 0.2s ease;
+}
+
+/* Anchored to the bar's own bottom edge (not the viewport), so it slides
+   down together with the bar instead of staying pinned at the top. When
+   the bar is closed (translated fully off-screen) this is the only part
+   of it still poking out, acting as the visible tab. */
+#topbar-handle {
+  position: absolute;
+  top: 100%;
   left: 50%;
   transform: translateX(-50%);
-  z-index: 20;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -46,21 +66,12 @@ body {
   background: #222;
 }
 
-#topbar {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  z-index: 10;
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 1rem;
-  padding: 0.5rem 1rem;
-  background: #1a1a1a;
-  border-bottom: 1px solid #333;
-  transform: translateY(-100%);
+#topbar-handle svg {
   transition: transform 0.2s ease;
+}
+
+#topbar.open #topbar-handle svg {
+  transform: rotate(180deg);
 }
 
 #topbar.open {

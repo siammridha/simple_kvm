@@ -167,6 +167,17 @@ via `scp` to `/usr/local/bin/simple_kvm.new`, then `chmod 755` and `mv`
 over the running binary - the rename avoids "Text file busy") and `rc-service
 simple_kvm restart`.
 
+`test-on-device.sh`, in the repo root, automates all of the above (build,
+copy, install, restart) over password-authenticated SSH:
+
+```sh
+./test-on-device.sh
+```
+
+This file holds the device's IP and root password directly, so it's listed
+in `.gitignore` and never committed. It won't exist in a fresh clone - copy
+it back in (or recreate it) if it's missing.
+
 ## Target platform
 
 - **Device:** Dell Wyse 3040 (Intel Atom x5-Z8350, x86_64)
