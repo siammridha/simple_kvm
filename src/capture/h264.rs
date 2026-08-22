@@ -39,7 +39,15 @@ impl H264Encoder {
     }
 
     /// Encodes one raw YUYV (4:2:2) frame into an H.264 access unit.
+    ///
+    /// Real capture hardware occasionally hands back a short/incomplete
+    /// frame (e.g. a dropped USB packet) whose buffer is smaller than
+    /// `width * height * 2` — checked up front rather than trusting the
+    /// driver, since indexing into it as if it were full-sized would read
+    /// past the end of the buffer.
     pub fn encode_yuyv_frame(&mut self, yuyv: &[u8]) -> Result<Vec<u8>> {
+        let expected_len = self.width * self.height * 2;
+        anyhow::ensure!(yuyv.len() >= expected_len, "short capture frame: got {} bytes, expected {expected_len}", yuyv.len());
         let i420 = yuyv_to_i420(yuyv, self.width, self.height);
         let yuv = YUVBuffer::from_vec(i420, self.width, self.height);
         let bitstream = self.encoder.encode(&yuv).context("encoding H.264 frame")?;

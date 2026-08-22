@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
-use crate::config::{CaptureSettings, DeviceState, VideoMode};
+use crate::config::{CaptureSettings, DeviceState, ResolutionFrameRates, VideoMode, VideoModeState};
 use crate::uevent;
 use crate::video_bus::{self, FrameEnvelope, FrameKind};
 use v4l2::{PixelFormat, SupportedFormat};
@@ -79,20 +79,22 @@ impl CaptureManager {
         self.formats.iter().any(|f| f.pixel_format == pixel_format && f.resolutions.contains(&resolution))
     }
 
-    /// Runs forever: whenever the capture card is present, restarts the
-    /// capture loop whenever `settings` changes and publishes frames onto
-    /// `video_bus`; whenever it's absent (never plugged in, or unplugged
-    /// mid-session), polls until it reappears instead of exiting for good.
+    /// Runs forever: whenever the capture card is present and at least one
+    /// WebRTC client is connected, restarts the capture loop whenever
+    /// `settings` changes and publishes frames onto `video_bus`; pauses
+    /// (without restarting) while the client count is zero; whenever the
+    /// device is absent (never plugged in, or unplugged mid-session), polls
+    /// until it reappears instead of exiting for good.
     pub async fn run(
         self,
         mut settings: watch::Receiver<CaptureSettings>,
         video_bus: video_bus::Sender,
         device_state_tx: watch::Sender<DeviceState>,
         force_keyframe: Arc<AtomicBool>,
+        mut client_count: watch::Receiver<u32>,
     ) {
         let device_path = self.device_path;
         let mut known_present = false;
-        let mut previous_video_mode: Option<VideoMode> = None;
         let mut uevents = match uevent::UeventListener::open() {
             Ok(listener) => Some(listener),
             Err(err) => {
@@ -128,13 +130,6 @@ impl CaptureManager {
             }
 
             let current = *settings.borrow();
-            if let Some(prev) = previous_video_mode {
-                if prev != current.video_mode {
-                    tracing::info!(mode = ?prev, "video encoding stopped");
-                    tracing::info!(mode = ?current.video_mode, "video encoding started");
-                }
-            }
-            previous_video_mode = Some(current.video_mode);
             let new_state = device_state_for(&formats, &current);
             device_state_tx.send_if_modified(|s| {
                 if *s == new_state {
@@ -145,37 +140,97 @@ impl CaptureManager {
                 }
             });
 
+            if *client_count.borrow() == 0 {
+                if wait_for_client_or_shutdown(&mut client_count, &mut settings).await.is_err() {
+                    break;
+                }
+                continue;
+            }
+
             let device_path_task = device_path.clone();
             let stop = Arc::new(AtomicBool::new(false));
             let stop_task = Arc::clone(&stop);
             let video_bus_task = video_bus.clone();
             let force_keyframe_task = force_keyframe.clone();
 
+            tracing::info!(mode = ?current.video_mode, "video encoding started");
             let mut handle = tokio::task::spawn_blocking(move || {
                 run_one_pass(&device_path_task, &formats, &current, stop_task, video_bus_task, force_keyframe_task)
             });
 
-            tokio::select! {
-                changed = settings.changed() => {
-                    stop.store(true, Ordering::Relaxed);
-                    let _ = handle.await;
-                    if changed.is_err() {
+            let mut shutdown = false;
+            let mut pass_ended_on_its_own = false;
+            loop {
+                tokio::select! {
+                    changed = settings.changed() => {
+                        stop.store(true, Ordering::Relaxed);
+                        let _ = handle.await;
+                        shutdown = changed.is_err();
+                        break;
+                    }
+                    changed = client_count.changed() => {
+                        if changed.is_err() {
+                            stop.store(true, Ordering::Relaxed);
+                            let _ = handle.await;
+                            shutdown = true;
+                            break;
+                        }
+                        if *client_count.borrow() == 0 {
+                            stop.store(true, Ordering::Relaxed);
+                            let _ = handle.await;
+                            break;
+                        }
+                        // Count changed but is still nonzero (e.g. a second
+                        // client joined, or one of several left) - the
+                        // running pass isn't disrupted, keep waiting.
+                    }
+                    // The pass ended on its own - most likely the card was
+                    // unplugged mid-capture and the next loop iteration's
+                    // presence check will notice. Could also be some other
+                    // capture error; either way, looping back (rather than
+                    // exiting the task) is what makes it retryable. The sleep
+                    // keeps a persistent non-unplug error (e.g. a permissions
+                    // problem) from busy-looping instead of just polling.
+                    _ = &mut handle => {
+                        pass_ended_on_its_own = true;
                         break;
                     }
                 }
-                // The pass ended on its own - most likely the card was
-                // unplugged mid-capture and the next loop iteration's
-                // presence check will notice. Could also be some other
-                // capture error; either way, looping back (rather than
-                // exiting the task) is what makes it retryable. The sleep
-                // keeps a persistent non-unplug error (e.g. a permissions
-                // problem) from busy-looping instead of just polling.
-                _ = &mut handle => {
-                    tokio::time::sleep(DEVICE_POLL_INTERVAL).await;
-                }
+            }
+            tracing::info!(mode = ?current.video_mode, "video encoding stopped");
+
+            if shutdown {
+                break;
+            }
+            if pass_ended_on_its_own {
+                tokio::time::sleep(DEVICE_POLL_INTERVAL).await;
             }
         }
     }
+}
+
+/// Waits until `client_count` becomes nonzero, or returns `Err` once the
+/// settings channel closes (server shutting down, nothing left to wait
+/// for). Also returns `Ok` on a settings change even while the count is
+/// still zero, so the caller re-evaluates from the top of the loop (e.g. to
+/// keep `device_state_tx` current) before waiting again.
+async fn wait_for_client_or_shutdown(client_count: &mut watch::Receiver<u32>, settings: &mut watch::Receiver<CaptureSettings>) -> Result<(), ()> {
+    while *client_count.borrow() == 0 {
+        tokio::select! {
+            changed = client_count.changed() => {
+                if changed.is_err() {
+                    return Err(());
+                }
+            }
+            changed = settings.changed() => {
+                if changed.is_err() {
+                    return Err(());
+                }
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Waits until `device_path` exists, or returns `Err` once the settings
@@ -314,11 +369,40 @@ fn device_state_for(formats: &[SupportedFormat], settings: &CaptureSettings) -> 
     if formats.is_empty() {
         return DeviceState::default();
     }
-    let format = pixel_format_for(formats, settings.video_mode).and_then(|pf| formats.iter().find(|f| f.pixel_format == pf));
-    let resolutions = format.map(|f| f.resolutions.clone()).unwrap_or_default();
-    // Falls back to just the currently-applied fps if the card didn't
-    // report a discrete list for this resolution — the dropdown should
-    // never be empty, and the applied value is always a valid option.
-    let frame_rates = format.and_then(|f| f.frame_rates.get(&settings.resolution)).cloned().unwrap_or_else(|| vec![settings.fps]);
-    DeviceState { available: true, resolutions, frame_rates, default_resolution: Some(settings.resolution) }
+    DeviceState {
+        available: true,
+        mjpeg: video_mode_state_for(formats, VideoMode::Mjpeg, settings),
+        h264: video_mode_state_for(formats, VideoMode::H264, settings),
+    }
+}
+
+/// What the card supports for `video_mode` specifically — every resolution
+/// it offers in that mode's pixel format, and the discrete frame rates at
+/// each. `settings.resolution` is only used as the preferred default when
+/// it's actually the currently-applied mode; the other (not-currently-
+/// applied) mode instead defaults to its own largest resolution (`formats`
+/// entries are already sorted largest-first, see `v4l2::enumerate`), since
+/// the applied resolution may not even exist in that mode's pixel format.
+fn video_mode_state_for(formats: &[SupportedFormat], video_mode: VideoMode, settings: &CaptureSettings) -> VideoModeState {
+    let Some(format) = pixel_format_for(formats, video_mode).and_then(|pf| formats.iter().find(|f| f.pixel_format == pf)) else {
+        return VideoModeState::default();
+    };
+    let default_resolution = if settings.video_mode == video_mode && format.resolutions.contains(&settings.resolution) {
+        Some(settings.resolution)
+    } else {
+        format.resolutions.first().copied()
+    };
+    let frame_rates = format
+        .resolutions
+        .iter()
+        .map(|&resolution| {
+            // Falls back to just the currently-applied fps if the card
+            // didn't report a discrete list for this resolution — the
+            // dropdown should never be empty, and the applied value is
+            // always a valid option.
+            let rates = format.frame_rates.get(&resolution).cloned().unwrap_or_else(|| vec![settings.fps]);
+            ResolutionFrameRates { resolution, rates }
+        })
+        .collect();
+    VideoModeState { resolutions: format.resolutions.clone(), default_resolution, frame_rates }
 }

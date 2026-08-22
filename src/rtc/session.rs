@@ -24,7 +24,7 @@ use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
 use webrtc::media_stream::track_local::{TrackLocal, TrackLocalEvent};
 use webrtc::media_stream::Track;
-use webrtc::peer_connection::PeerConnection;
+use webrtc::peer_connection::{PeerConnection, RTCPeerConnectionState};
 use webrtc::rtp_transceiver::RtpSender;
 
 use crate::capture::v4l2::Resolution;
@@ -47,6 +47,12 @@ pub struct SessionContext {
     pub hid_connected_rx: watch::Receiver<bool>,
     pub settings_path: PathBuf,
     pub force_keyframe: Arc<AtomicBool>,
+    /// Mirrors the `RTCPeerConnection`'s own connection state (see
+    /// `rtc::Handler::on_connection_state_change`) - watched by `handle`'s
+    /// main loop so the session shuts down as soon as the connection
+    /// disconnects/fails/closes, rather than only when the `control` data
+    /// channel happens to notice on its own.
+    pub pc_state_rx: watch::Receiver<RTCPeerConnectionState>,
 }
 
 /// The three data channels the browser creates before sending its offer
@@ -110,6 +116,7 @@ pub async fn handle(
     let mut capture_settings_rx = ctx.capture_settings_rx.clone();
     let mut mouse_mode_rx = ctx.mouse_mode_rx.clone();
     let mut hid_connected_rx = ctx.hid_connected_rx.clone();
+    let mut pc_state_rx = ctx.pc_state_rx.clone();
     let mut keyboard = KeyboardState::default();
 
     let mut mjpeg_open = false;
@@ -232,6 +239,16 @@ pub async fn handle(
                     if send_server_message(&control, &msg).await.is_err() {
                         control_open = false;
                     }
+                }
+            }
+            changed = pc_state_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let state = *pc_state_rx.borrow_and_update();
+                if matches!(state, RTCPeerConnectionState::Disconnected | RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed) {
+                    tracing::debug!(?state, "peer connection state ended, closing session");
+                    break;
                 }
             }
         }
@@ -444,6 +461,7 @@ mod tests {
         let (mouse_mode_tx, mouse_mode_rx) = watch::channel(MouseMode::Absolute);
         let (_device_state_tx, device_state_rx) = watch::channel(DeviceState::default());
         let (_hid_connected_tx, hid_connected_rx) = watch::channel(false);
+        let (_pc_state_tx, pc_state_rx) = watch::channel(RTCPeerConnectionState::New);
         SessionContext {
             video_bus: video_rx,
             serial_tx,
@@ -455,6 +473,7 @@ mod tests {
             hid_connected_rx,
             settings_path,
             force_keyframe: Arc::new(AtomicBool::new(false)),
+            pc_state_rx,
         }
     }
 

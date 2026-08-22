@@ -23,19 +23,41 @@ pub struct CaptureSettings {
 }
 
 /// Live state of the capture card itself — whether it's plugged in right
-/// now, and what it supports. Published by `CaptureManager::run`'s hot-plug
-/// loop over a `watch` channel, and pushed to the web page over the
-/// `control` data channel (see `rtc::session::handle`) so an already-open
-/// tab reflects a hot-plug/unplug instead of being frozen at
-/// server-startup values.
+/// now, and what it supports in each video mode. Published by
+/// `CaptureManager::run`'s hot-plug loop over a `watch` channel, and pushed
+/// to the web page over the `control` data channel (see
+/// `rtc::session::handle`) so an already-open tab reflects a hot-plug/unplug
+/// instead of being frozen at server-startup values.
+///
+/// Carries both modes' data (not just whichever is currently applied) so
+/// the page can repopulate its resolution/fps dropdowns the moment the
+/// video-mode dropdown is changed, before Save is clicked — fps and
+/// resolution support genuinely differ between MJPEG and H.264 on real
+/// hardware (see `capture::device_state_for`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct DeviceState {
     pub available: bool,
+    pub mjpeg: VideoModeState,
+    pub h264: VideoModeState,
+}
+
+/// What the card supports for one video mode: every resolution it offers,
+/// which one to default to, and the discrete frame rates available at each
+/// of those resolutions.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct VideoModeState {
     pub resolutions: Vec<Resolution>,
     pub default_resolution: Option<Resolution>,
-    /// Frame rates (fps) the card reports for the currently-applied
-    /// resolution — populated by `capture::device_state_for`.
-    pub frame_rates: Vec<u32>,
+    pub frame_rates: Vec<ResolutionFrameRates>,
+}
+
+/// One resolution's discrete frame-rate list — `Vec` rather than a
+/// `Resolution`-keyed map, since JSON object keys must be strings and
+/// `Resolution` isn't one.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ResolutionFrameRates {
+    pub resolution: Resolution,
+    pub rates: Vec<u32>,
 }
 
 /// Mouse mode doesn't affect the capture pipeline — it's purely which

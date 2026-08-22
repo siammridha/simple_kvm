@@ -57,6 +57,7 @@ async fn main() -> Result<()> {
     let (video_bus_tx, video_bus_rx) = video_bus::channel();
     let (hid_connected_tx, hid_connected_rx) = watch::channel(false);
     let force_keyframe = Arc::new(AtomicBool::new(false));
+    let (client_count_tx, client_count_rx) = watch::channel(0u32);
 
     // --- Serial: same soft-unavailable treatment as capture. Commands sent
     // to `serial_tx` before the port is open just queue up in the channel,
@@ -73,6 +74,7 @@ async fn main() -> Result<()> {
         hid_connected_rx,
         settings_path,
         force_keyframe: force_keyframe.clone(),
+        client_count_tx,
     };
     let http_addr = std::net::SocketAddr::from(([0, 0, 0, 0], http_port));
     tracing::info!(port = http_port, "page and WebRTC signaling server listening");
@@ -89,7 +91,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    let capture_handle = tokio::spawn(capture_manager.run(capture_settings_rx, video_bus_tx, device_state_tx, force_keyframe));
+    let capture_handle = tokio::spawn(capture_manager.run(capture_settings_rx, video_bus_tx, device_state_tx, force_keyframe, client_count_rx));
 
     let _ = tokio::join!(http_handle, capture_handle);
     Ok(())

@@ -51,6 +51,14 @@ let savePending = false;
 // comes up - see openTopbar()/closeTopbar() and the connectionstatechange
 // handler in connect().
 let rtcConnected = false;
+// What the card supports in each video mode (resolutions, and frame rates
+// per resolution) - from the last `device_state` push. Keyed by the same
+// strings as the video-mode dropdown's option values. Needed so switching
+// the video-mode/resolution dropdowns *before* Save repopulates the other
+// dropdowns from the right list instead of leaving MJPEG's list showing
+// while H.264 is selected (or vice versa) - fps/resolution support
+// genuinely differs between the two on real hardware.
+let deviceModes = { mjpeg: emptyModeState(), h264: emptyModeState() };
 // Whether the settings modal is open - suppresses the topbar's
 // outside-click auto-hide (see wireTopbar()) while it's up.
 let settingsOpen = false;
@@ -63,32 +71,94 @@ function setStatus(text, isError) {
   statusEl.classList.toggle('error', Boolean(isError));
 }
 
+let autoHideTimer = null;
+
+// (Re)starts the 5s auto-hide countdown, but only when the bar is actually
+// open, connected, and neither the settings modal nor the paste flyout is
+// up - same gating as the outside-click auto-hide in wireTopbar().
+function armAutoHide() {
+  clearAutoHide();
+  if (!topbar.classList.contains('open') || !rtcConnected || settingsOpen || pasteOpen) return;
+  autoHideTimer = setTimeout(closeTopbar, 5000);
+}
+
+function clearAutoHide() {
+  if (autoHideTimer !== null) {
+    clearTimeout(autoHideTimer);
+    autoHideTimer = null;
+  }
+}
+
 function openTopbar() {
   topbar.classList.add('open');
+  armAutoHide();
 }
 
 function closeTopbar() {
   topbar.classList.remove('open');
+  clearAutoHide();
 }
 
 function openSettingsModal() {
   settingsModal.classList.add('open');
   settingsOpen = true;
+  clearAutoHide();
 }
 
 function closeSettingsModal() {
   settingsModal.classList.remove('open');
   settingsOpen = false;
+  armAutoHide();
 }
 
 function openPastePanel() {
   pastePanel.classList.add('open');
   pasteOpen = true;
+  clearAutoHide();
 }
 
 function closePastePanel() {
   pastePanel.classList.remove('open');
   pasteOpen = false;
+  armAutoHide();
+}
+
+function emptyModeState() {
+  return { resolutions: [], default_resolution: null, frame_rates: [] };
+}
+
+function sameResolution(a, b) {
+  return a && b && a.width === b.width && a.height === b.height;
+}
+
+function currentResolutionSelection() {
+  const [width, height] = resolutionSelect.value.split('x').map(Number);
+  return Number.isNaN(width) || Number.isNaN(height) ? null : { width, height };
+}
+
+// Repopulates the resolution dropdown from `mode`'s list (preferring
+// `preferredResolution` if it's still valid, else that mode's default),
+// then repopulates the frame-rate dropdown to match whichever resolution
+// ends up selected. Called whenever the video-mode dropdown changes (live,
+// before Save) and when the server confirms a `device_state`/`settings`
+// push, so the two dropdowns never show a stale list from the other mode.
+function refreshOptionsForMode(mode, preferredResolution, preferredFps) {
+  const state = deviceModes[mode] || emptyModeState();
+  const resolution = state.resolutions.some((r) => sameResolution(r, preferredResolution)) ? preferredResolution : state.default_resolution;
+  populateResolutions(state.resolutions, resolution);
+  refreshFrameRatesForSelection(preferredFps);
+}
+
+// Repopulates the frame-rate dropdown from the currently-selected video
+// mode + resolution. Called whenever the resolution dropdown changes
+// (live, before Save) as well as from refreshOptionsForMode above.
+function refreshFrameRatesForSelection(preferredFps) {
+  const state = deviceModes[videoModeSelect.value] || emptyModeState();
+  const resolution = currentResolutionSelection();
+  const entry = state.frame_rates.find((fr) => sameResolution(fr.resolution, resolution));
+  const rates = entry ? entry.rates : [];
+  const fps = preferredFps !== undefined && rates.includes(preferredFps) ? preferredFps : undefined;
+  populateFrameRates(rates, fps);
 }
 
 function populateResolutions(resolutions, defaultResolution) {
@@ -206,6 +276,16 @@ function wireSettingsModal() {
     }
   });
 
+  // Registered before the generic updateSaveButtonState loop below, so the
+  // resolution/fps lists are already repopulated for the newly-selected
+  // mode/resolution by the time the dirty-check reads them.
+  videoModeSelect.addEventListener('change', () => {
+    refreshOptionsForMode(videoModeSelect.value, currentResolutionSelection(), Number(frameRateSelect.value));
+  });
+  resolutionSelect.addEventListener('change', () => {
+    refreshFrameRatesForSelection(Number(frameRateSelect.value));
+  });
+
   for (const el of [videoModeSelect, frameRateSelect, resolutionSelect, mouseModeSelect]) {
     el.addEventListener('change', updateSaveButtonState);
   }
@@ -243,6 +323,7 @@ async function connect() {
       // Auto-hide is only allowed once we're actually connected - see
       // wireTopbar()'s outside-click listener.
       rtcConnected = true;
+      armAutoHide();
     } else if (pc.connectionState === 'failed' || pc.connectionState === 'closed' || pc.connectionState === 'disconnected') {
       // Force the bar back open any time we're not actively connected, same
       // as the pre-connect state below - so status/version stay visible.
@@ -319,8 +400,11 @@ function waitForIceGatheringComplete(pc) {
 function handleServerMessage(msg) {
   if (msg.type === 'device_state') {
     captureAvailable = msg.available;
-    populateResolutions(msg.resolutions, msg.default_resolution);
-    populateFrameRates(msg.frame_rates, undefined);
+    deviceModes = { mjpeg: msg.mjpeg, h264: msg.h264 };
+    // Preserve the currently-selected resolution/fps if the new data still
+    // supports them (e.g. a hot-plug refresh) - refreshOptionsForMode falls
+    // back to the mode's default on its own if not.
+    refreshOptionsForMode(videoModeSelect.value, currentResolutionSelection(), Number(frameRateSelect.value));
     updateSettingsAvailability();
     updateSaveButtonState();
     if (!msg.available) {
@@ -341,8 +425,7 @@ function handleServerMessage(msg) {
       mouse_mode: msg.mouse_mode,
     };
     videoModeSelect.value = msg.capture.video_mode;
-    frameRateSelect.value = msg.capture.fps;
-    resolutionSelect.value = `${msg.capture.resolution.width}x${msg.capture.resolution.height}`;
+    refreshOptionsForMode(msg.capture.video_mode, msg.capture.resolution, msg.capture.fps);
     mouseModeSelect.value = msg.mouse_mode;
     updateVideoElementVisibility();
     if (savePending) {

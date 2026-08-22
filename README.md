@@ -48,15 +48,21 @@ ip>:3000` with:
     the very first frame of a capture session would ever be a keyframe,
     and joining any later would leave the video stuck.
 - **Resolution dropdown**, populated from whatever the capture card
-  actually reports supporting (queried at startup) - not a hardcoded
-  list.
+  actually reports supporting (queried at startup) for whichever video
+  mode is currently selected - not a hardcoded list. Switching the video
+  mode dropdown (even before clicking Save) repopulates this list, since
+  MJPEG and H.264 can genuinely support different resolutions on the same
+  card.
 - **Frame rate dropdown**, populated from whatever the capture card
-  actually reports supporting for the current video mode and resolution
-  (queried at startup, like the resolution dropdown) - not a hardcoded
-  list, since real hardware supports different rates for MJPEG vs. YUYV
-  and for different resolutions. Sent to the capture card via V4L2's
-  frame-interval negotiation; the card is still free to negotiate a
-  different rate than requested (a mismatch is logged, not shown on the
+  actually reports supporting for the currently-selected video mode and
+  resolution (queried at startup, like the resolution dropdown) - not a
+  hardcoded list, since real hardware supports different rates for MJPEG
+  vs. YUYV and for different resolutions. Switching either the video mode
+  or resolution dropdown (even before clicking Save) repopulates this
+  list to match, so it's never possible to pick a rate the card can't
+  actually do at that mode/resolution. Sent to the capture card via
+  V4L2's frame-interval negotiation; the card is still free to negotiate
+  a different rate than requested (a mismatch is logged, not shown on the
   page), but picking through the page only ever offers rates the card
   itself reported.
 - **Mouse clicks and scroll wheel**, absolute or relative mode, also
@@ -71,8 +77,20 @@ ip>:3000` with:
 - **A paste box** - text typed or pasted into it is sent to the target as
   simulated keystrokes (US QWERTY only; there's no OS-level clipboard
   access over a HID-only link).
+- **An auto-hiding controls bar** - the bar with video mode/resolution/mouse
+  mode/paste controls and status tucks itself away 5 seconds after it's
+  opened while a browser is connected and nothing else is going on, and
+  reopens on tap/click, or on its own if the connection drops.
 - **No login.** Anyone who can reach port 3000 has full control. This is
   meant for a trusted LAN, not the open internet.
+
+Video capture and encoding only run while at least one browser is
+connected - with nobody watching, no CPU/power is spent on capture at all.
+The moment a browser connects, capture starts in whatever mode/resolution
+the settings say; the moment the last browser disconnects, it stops. A
+second browser connecting while one is already active doesn't restart
+anything. Every actual start/stop of a capture pass is logged as `video
+encoding started`/`video encoding stopped` (naming the mode).
 
 The server runs fine with no capture card or CH9329 attached - the page
 still loads, video mode/frame rate/resolution dropdowns are disabled and

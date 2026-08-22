@@ -11,6 +11,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use rtc::ice::mdns::MulticastDnsMode;
 use rtc::peer_connection::configuration::media_engine::MIME_TYPE_H264;
 use rtc::peer_connection::configuration::setting_engine::{SctpMaxMessageSize, SettingEngine};
 use rtc::rtp_transceiver::rtp_sender::{RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind};
@@ -46,6 +47,11 @@ pub struct SharedChannels {
     /// `session::handle`'s `video_track.poll()` branch and
     /// `capture::run_one_pass`.
     pub force_keyframe: Arc<AtomicBool>,
+    /// Count of currently-connected WebRTC sessions — incremented in
+    /// `negotiate` before a session is spawned, decremented by
+    /// `ClientCountGuard::drop` however the session ends (clean exit,
+    /// abnormal disconnect, or panic).
+    pub client_count_tx: watch::Sender<u32>,
 }
 
 #[derive(Deserialize)]
@@ -93,9 +99,29 @@ impl OnceSignal {
     }
 }
 
+/// Held for the lifetime of one spawned session task; its `Drop` is what
+/// guarantees the count comes back down no matter which of the session's
+/// several exit paths (clean shutdown, peer-connection failure/close,
+/// panic) actually ends it.
+struct ClientCountGuard(watch::Sender<u32>);
+
+impl ClientCountGuard {
+    fn new(tx: watch::Sender<u32>) -> Self {
+        tx.send_modify(|n| *n += 1);
+        Self(tx)
+    }
+}
+
+impl Drop for ClientCountGuard {
+    fn drop(&mut self) {
+        self.0.send_modify(|n| *n = n.saturating_sub(1));
+    }
+}
+
 struct Handler {
     gather_complete: Arc<OnceSignal>,
     dc_tx: mpsc::UnboundedSender<Arc<dyn DataChannel>>,
+    state_tx: watch::Sender<RTCPeerConnectionState>,
 }
 
 #[async_trait::async_trait]
@@ -108,6 +134,11 @@ impl PeerConnectionEventHandler for Handler {
 
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
         tracing::debug!(?state, "WebRTC connection state changed");
+        // `session::handle`'s main loop watches this to shut the session
+        // down promptly on disconnect/failure/close — see the `pc_state_rx`
+        // arm there — instead of only reacting once (if ever) the control
+        // data channel happens to notice on its own.
+        let _ = self.state_tx.send(state);
     }
 
     async fn on_data_channel(&self, data_channel: Arc<dyn DataChannel>) {
@@ -143,10 +174,18 @@ async fn negotiate(offer_sdp: String, channels: SharedChannels) -> Result<String
     // value has no downside: the browser's own (lower) cap still applies.
     let mut setting_engine = SettingEngine::default();
     setting_engine.set_sctp_max_message_size(SctpMaxMessageSize::Bounded(4 * 1024 * 1024));
+    // This device is only ever used on a local network, never over STUN/TURN
+    // (none is configured). Some browsers hide their real LAN IP behind a
+    // random "<uuid>.local" mDNS name instead of sending it directly, and
+    // with no STUN/TURN server there's no other candidate to fall back on.
+    // Disabling mDNS here means we don't try (and fail) to resolve that name
+    // - we just drop it, same as if it were never sent.
+    setting_engine.set_multicast_dns_mode(MulticastDnsMode::Disabled);
 
     let (gather_complete, gather_complete_rx) = OnceSignal::new();
     let (dc_tx, dc_rx) = mpsc::unbounded_channel();
-    let handler = Arc::new(Handler { gather_complete, dc_tx });
+    let (state_tx, pc_state_rx) = watch::channel(RTCPeerConnectionState::New);
+    let handler = Arc::new(Handler { gather_complete, dc_tx, state_tx });
 
     let peer_connection: Arc<dyn PeerConnection> = Arc::new(
         PeerConnectionBuilder::new()
@@ -196,9 +235,12 @@ async fn negotiate(offer_sdp: String, channels: SharedChannels) -> Result<String
         hid_connected_rx: channels.hid_connected_rx,
         settings_path: channels.settings_path,
         force_keyframe: channels.force_keyframe,
+        pc_state_rx,
     };
     let pc_for_session = peer_connection.clone();
+    let client_count_guard = ClientCountGuard::new(channels.client_count_tx.clone());
     tokio::spawn(async move {
+        let _client_count_guard = client_count_guard;
         if let Err(err) = session::handle(pc_for_session, video_track, video_sender, dc_rx, ctx).await {
             tracing::debug!(%err, "WebRTC session ended");
         }
