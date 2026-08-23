@@ -1,9 +1,7 @@
 #!/bin/bash
-# Status line, two rows:
+# Status line:
 #   [Opus 4.8] ▓▓▓▓░░░░░░ 43%              [2h13m] ▓▓▓▓░░░░░░ 18%
-#   main
-# Row 1: context window usage on the left, 5-hour rate limit on the right.
-# Row 2: current git branch.
+# Context window usage on the left, 5-hour rate limit on the right.
 
 COLOR='\033[38;2;236;236;236m'
 RESET='\033[0m'
@@ -76,15 +74,7 @@ if [ -n "$right" ]; then
   fi
 fi
 
-# --- Row 2: git branch ---
-dir=$(echo "$input" | jq -r '.workspace.current_dir // .cwd // empty')
-branch=""
-[ -n "$dir" ] && branch=$(git -C "$dir" branch --show-current 2>/dev/null)
-
 printf "%b%s%b" "$COLOR" "$row1" "$RESET"
-if [ -n "$branch" ]; then
-  printf "\n%b%s%b" "$COLOR" "$branch" "$RESET"
-fi
 
 # Must exit 0: any non-zero status makes Claude Code blank the status line.
 exit 0
