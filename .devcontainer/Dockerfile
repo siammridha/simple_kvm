@@ -46,21 +46,24 @@ RUN curl -fsSL https://claude.ai/install.sh | bash
 
 # The rust-analyzer-lsp plugin is user-scope (CLAUDE_CONFIG_DIR), so it's
 # installed here as the same vscode user that owns the Claude Code binary.
-RUN claude plugin marketplace add anthropics/claude-plugins-official && \
-    claude plugin install rust-analyzer-lsp@claude-plugins-official || \
-    echo "Warning: plugin install failed, continuing build"
-
-# ponytail plugin, from its own marketplace (not the official one above).
+# ponytail comes from its own marketplace (not the official one above).
 RUN claude plugin marketplace add DietrichGebert/ponytail && \
-    claude plugin install ponytail@ponytail || \
-    echo "Warning: plugin install failed, continuing build"
-
+    claude plugin marketplace add anthropics/claude-plugins-official && \
+    (claude plugin install ponytail@ponytail || echo "Warning: plugin install failed, continuing build") && \
+    (claude plugin install rust-analyzer-lsp@claude-plugins-official || echo "Warning: plugin install failed, continuing build")
 # Stop Claude Code from auto-installing its VS Code extension when `claude`
 # runs in the integrated terminal. This is a /config toggle, not a
 # settings.json field, so it lives in .claude.json instead. Baked into the
 # image (not just set live) so it also lands in the fresh claude-config
 # volume that gets created for any new clone/rebuild of this devcontainer.
-RUN jq '.autoInstallIdeExtension = false' "$CLAUDE_CONFIG_DIR/.claude.json" \
-        > /tmp/claude.json.tmp \
+RUN jq '.autoInstallIdeExtension = false' "$CLAUDE_CONFIG_DIR/.claude.json" > /tmp/claude.json.tmp \
     && mv /tmp/claude.json.tmp "$CLAUDE_CONFIG_DIR/.claude.json"
+
+# Statusline badge (context window + rate limit bars), baked in the same way
+# for the same reason: settings.json lives on the claude-config volume, so
+# this only needs to happen once per fresh volume, not on every rebuild.
+RUN jq '.statusLine = {"type": "command", "command": "bash .devcontainer/statusline-command.sh"}' \
+      "$CLAUDE_CONFIG_DIR/settings.json" > /tmp/settings.json.tmp \
+    && mv /tmp/settings.json.tmp "$CLAUDE_CONFIG_DIR/settings.json"
+
 USER root

@@ -30,11 +30,6 @@
 			"target": "/home/vscode/.claude",
 			"type": "volume"
 		},
-		{
-			"source": "devcontainer-claude-auth-shared",
-			"target": "/home/vscode/.claude-auth",
-			"type": "volume"
-		},
 		// Bind the host git config so name/email survive rebuilds. SSH keys are
 		// not mounted: VS Code forwards the host SSH agent into the container
 		// automatically, so the key never leaves the host.
@@ -44,10 +39,6 @@
 			"type": "bind"
 		}
 	],
-
-	// Runs on every container start (not just create) so the credentials
-	// symlink is re-established even if claude-config was deleted and rebuilt.
-	"postStartCommand": "bash .devcontainer/setup-claude-auth.sh",
 
 	"customizations": {
 		"vscode": {
