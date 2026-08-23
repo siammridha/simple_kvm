@@ -12,9 +12,13 @@
 	// Volumes survive rebuilds: cargo cache, and Claude state. The Dockerfile
 	// sets CLAUDE_CONFIG_DIR so everything, including what would otherwise be
 	// ~/.claude.json, lives in /home/vscode/.claude (the "claude-config"
-	// volume) -- EXCEPT the login token, which setup-claude-auth.sh symlinks
-	// in from the separate "claude-auth" volume. This lets claude-config
-	// (sessions, history, cache) be deleted and rebuilt without re-logging in.
+	// volume, named per-project below) -- EXCEPT the login token, which
+	// setup-claude-auth.sh symlinks in from the separate "claude-auth" volume.
+	// claude-auth has a fixed name (not scoped to this project) so it's the
+	// same volume across every devcontainer on this machine: log in once,
+	// and any project's devcontainer -- including a rebuilt claude-config --
+	// picks it up. For another project to share it, its devcontainer.json
+	// needs this same mount with source "devcontainer-claude-auth-shared".
 	"mounts": [
 		{
 			"source": "${localWorkspaceFolderBasename}-devcontainer-cargo-cache",
@@ -27,7 +31,7 @@
 			"type": "volume"
 		},
 		{
-			"source": "${localWorkspaceFolderBasename}-devcontainer-claude-auth",
+			"source": "devcontainer-claude-auth-shared",
 			"target": "/home/vscode/.claude-auth",
 			"type": "volume"
 		},
