@@ -9,15 +9,8 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FrameKind {
-    Mjpeg,
-    H264,
-}
-
 #[derive(Debug, Clone)]
 pub struct FrameEnvelope {
-    pub kind: FrameKind,
     pub data: Arc<[u8]>,
     /// When the capture driver says this frame actually came off the
     /// card (`v4l::buffer::Metadata::timestamp`, converted to a

@@ -27,44 +27,30 @@ to install.
 Run the binary on the Wyse 3040 and it serves a page at `http://<device
 ip>:3000` with:
 
-- **Live video**, streamed over WebRTC. Two modes, picked from a dropdown
-  and applied when you click **Save settings** (see below), each using a
-  different WebRTC transport under the hood:
-  - **MJPEG** (default) - sent as raw JPEG frames over a WebRTC data
-    channel, decoded and drawn to a canvas in the page. If the capture
-    card has hardware MJPEG (most UVC capture cards do), frames are
-    forwarded as-is, essentially free on the CPU. If not, frames are
-    JPEG-compressed in software from the raw feed - still much cheaper
-    than video encoding, just not free.
-  - **H.264**, software-encoded and sent as a real WebRTC video track,
-    decoded natively by the browser into a `<video>` element. Included
-    because it was asked for, but the Wyse 3040's Atom CPU is genuinely
-    weak for real-time software video encoding - expect this mode to be
-    choppy. MJPEG is the practical default. The encoder inserts a
-    keyframe every 60 frames so a browser that (re)connects mid-stream
-    has something to start decoding from, and also produces one
-    immediately whenever a connected browser's own decoder asks for one
-    (standard WebRTC keyframe-request feedback) - without either, only
-    the very first frame of a capture session would ever be a keyframe,
-    and joining any later would leave the video stuck.
+- **Live video**, streamed over WebRTC as a real H.264 video track,
+  software-encoded and decoded natively by the browser into a `<video>`
+  element. The Wyse 3040's Atom CPU is genuinely weak for real-time
+  software video encoding - expect this to be choppy at higher
+  resolutions/frame rates. The encoder inserts a keyframe every 60 frames
+  so a browser that (re)connects mid-stream has something to start
+  decoding from, and also produces one immediately whenever a connected
+  browser's own decoder asks for one (standard WebRTC keyframe-request
+  feedback) - without either, only the very first frame of a capture
+  session would ever be a keyframe, and joining any later would leave the
+  video stuck.
 - **Resolution dropdown**, populated from whatever the capture card
-  actually reports supporting (queried at startup) for whichever video
-  mode is currently selected - not a hardcoded list. Switching the video
-  mode dropdown (even before clicking Save) repopulates this list, since
-  MJPEG and H.264 can genuinely support different resolutions on the same
-  card.
+  actually reports supporting (queried at startup) - not a hardcoded list.
 - **Frame rate dropdown**, populated from whatever the capture card
-  actually reports supporting for the currently-selected video mode and
-  resolution (queried at startup, like the resolution dropdown) - not a
-  hardcoded list, since real hardware supports different rates for MJPEG
-  vs. YUYV and for different resolutions. Switching either the video mode
-  or resolution dropdown (even before clicking Save) repopulates this
-  list to match, so it's never possible to pick a rate the card can't
-  actually do at that mode/resolution. Sent to the capture card via
-  V4L2's frame-interval negotiation; the card is still free to negotiate
-  a different rate than requested (a mismatch is logged, not shown on the
-  page), but picking through the page only ever offers rates the card
-  itself reported.
+  actually reports supporting for the currently-selected resolution
+  (queried at startup, like the resolution dropdown) - not a hardcoded
+  list, since real hardware supports different rates at different
+  resolutions. Switching the resolution dropdown (even before clicking
+  Save) repopulates this list to match, so it's never possible to pick a
+  rate the card can't actually do at that resolution. Sent to the capture
+  card via V4L2's frame-interval negotiation; the card is still free to
+  negotiate a different rate than requested (a mismatch is logged, not
+  shown on the page), but picking through the page only ever offers rates
+  the card itself reported.
 - **Mouse movement, clicks, and scroll wheel**, absolute or relative mode,
   switched via **Save settings**. Absolute mode positions the cursor
   exactly where you point in the video; on the CH9329 hardware this repo
@@ -85,7 +71,7 @@ ip>:3000` with:
 - **A paste box** - pasting into it sends the text to the target right away
   as simulated keystrokes, then clears the box (US QWERTY only; there's no
   OS-level clipboard access over a HID-only link).
-- **An auto-hiding controls bar** - the bar with video mode/resolution/mouse
+- **An auto-hiding controls bar** - the bar with resolution/frame rate/mouse
   mode/paste controls and status tucks itself away 5 seconds after it's
   opened while a browser is connected and nothing else is going on, and
   reopens on tap/click, or on its own if the connection drops. Hovering
@@ -96,14 +82,14 @@ ip>:3000` with:
 
 Video capture and encoding only run while at least one browser is
 connected - with nobody watching, no CPU/power is spent on capture at all.
-The moment a browser connects, capture starts in whatever mode/resolution
+The moment a browser connects, capture starts at whatever resolution/fps
 the settings say; the moment the last browser disconnects, it stops. A
 second browser connecting while one is already active doesn't restart
 anything. Every actual start/stop of a capture pass is logged as `video
-encoding started`/`video encoding stopped` (naming the mode).
+encoding started`/`video encoding stopped`.
 
 The server runs fine with no capture card or CH9329 attached - the page
-still loads, video mode/frame rate/resolution dropdowns are disabled and
+still loads, the frame rate/resolution dropdowns are disabled and
 reflect "no video device," the mouse mode dropdown is disabled too, and
 keyboard/mouse input is silently dropped instead of the service failing
 to start. Useful
@@ -131,8 +117,8 @@ fallback, so if its listener fails to open, its reconnects are only
 noticed on the next real keystroke or click instead of immediately.
 
 **Dropdown changes only take effect when you click Save settings.**
-Changing video mode, frame rate, resolution, or mouse mode does nothing on
-its own - picking a new value just moves the dropdown. Clicking **Save
+Changing frame rate, resolution, or mouse mode does nothing on its own -
+picking a new value just moves the dropdown. Clicking **Save
 settings** sends one message over the WebRTC control channel that both
 applies the new settings live and writes them to the settings file on
 disk, together, in one step. If you reload the page (or open a second
@@ -143,7 +129,7 @@ up with whatever was last saved, or the capture card's own defaults if
 nothing ever was.
 
 Save only includes the settings for hardware that's actually connected:
-video mode/resolution/frame rate are sent only if the capture card is
+resolution/frame rate are sent only if the capture card is
 plugged in, and mouse mode only if the CH9329 is - there's nothing
 meaningful to save for a device that isn't there. If only one is
 connected, Save updates just that half and leaves the other as it was.
@@ -266,7 +252,7 @@ if you need to change one):
 | `SERIAL_OPEN_DELAY_SECS` | `30` | How long to wait before opening the CH9329 serial port, for the same reason as the capture card's boot delay below — set to `0` to disable. |
 | `VIDEO_PATH` | `/dev/video0` | Capture card device |
 | `HTTP_PORT` | `3000` | Port for the page and WebRTC signaling (`POST /rtc/offer`) |
-| `SETTINGS_PATH` | `/etc/simple_kvm-settings.json` | Where video mode/frame rate/resolution/mouse mode are written when you click **Save settings** on the page, and read back on the next startup. |
+| `SETTINGS_PATH` | `/etc/simple_kvm-settings.json` | Where frame rate/resolution/mouse mode are written when you click **Save settings** on the page, and read back on the next startup. |
 | `RUST_LOG` | `info,simple_kvm::rtc::session=debug,simple_kvm::ch9329::writer=debug` | Standard `tracing` log filter. By default, every keystroke/click is already logged at `debug` - no configuration needed first - since each log line includes how long that event took to queue/write, which is useful for tracking down input lag. A command that takes more than 50ms logs at `warn` regardless. Setting `RUST_LOG` yourself (e.g. `RUST_LOG=debug` for everything, or `RUST_LOG=warn` to quiet the per-keystroke lines) fully overrides the default above. |
 
 Each browser tab's video/input connection (WebRTC) picks its own UDP port

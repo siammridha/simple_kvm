@@ -16,7 +16,6 @@ body {
   cursor: crosshair;
 }
 
-#video,
 #video-el {
   width: 100%;
   height: 100%;
@@ -155,32 +154,26 @@ body {
   display: inline;
 }
 
-#settings-modal {
+#settings-panel {
   position: fixed;
-  inset: 0;
-  z-index: 30;
+  top: 3rem;
+  right: 1rem;
+  z-index: 15;
   display: none;
-  align-items: center;
-  justify-content: center;
-  background: rgba(0, 0, 0, 0.5);
-}
-
-#settings-modal.open {
-  display: flex;
-}
-
-#settings-modal .modal-box {
-  display: flex;
   flex-direction: column;
   gap: 0.75rem;
-  padding: 1.25rem;
+  padding: 0.75rem;
   background: #1a1a1a;
   border: 1px solid #333;
   border-radius: 4px;
-  min-width: 16rem;
+  min-width: 14rem;
 }
 
-#settings-modal label {
+#settings-panel.open {
+  display: flex;
+}
+
+#settings-panel label {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -188,7 +181,7 @@ body {
   font-size: 0.9rem;
 }
 
-.modal-actions {
+.panel-actions {
   display: flex;
   align-items: center;
   gap: 0.75rem;

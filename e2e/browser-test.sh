@@ -60,8 +60,8 @@ agent-browser wait --load load
 
 DROPDOWN_COUNT=$(agent-browser get count select)
 echo "dropdowns found: $DROPDOWN_COUNT"
-if [ "$DROPDOWN_COUNT" -ne 4 ]; then
-	echo "FAIL: expected 4 dropdowns (video mode, frame rate, resolution, mouse mode), got $DROPDOWN_COUNT" >&2
+if [ "$DROPDOWN_COUNT" -ne 3 ]; then
+	echo "FAIL: expected 3 dropdowns (frame rate, resolution, mouse mode), got $DROPDOWN_COUNT" >&2
 	exit 1
 fi
 
@@ -95,12 +95,12 @@ sleep 0.5
 
 # The top bar slides off-screen once connected (clicking the video surface
 # above just closed it, since we're connected by this point) - the handle
-# re-opens it. The dropdowns/Save button now live in the settings modal,
+# re-opens it. The dropdowns/Save button now live in the settings panel,
 # opened via the gear icon in the bar.
 echo "Opening the top bar..."
 agent-browser click "#topbar-handle"
 
-echo "Opening the settings modal..."
+echo "Opening the settings panel..."
 agent-browser click "#settings-button"
 
 echo "Changing mouse mode and clicking Save settings..."

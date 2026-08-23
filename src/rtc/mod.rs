@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use rtc::ice::mdns::MulticastDnsMode;
 use rtc::peer_connection::configuration::media_engine::MIME_TYPE_H264;
-use rtc::peer_connection::configuration::setting_engine::{SctpMaxMessageSize, SettingEngine};
+use rtc::peer_connection::configuration::setting_engine::SettingEngine;
 use rtc::rtp_transceiver::rtp_sender::{RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind};
 use webrtc::data_channel::DataChannel;
 use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
@@ -166,14 +166,7 @@ async fn negotiate(offer_sdp: String, channels: SharedChannels) -> Result<String
     media_engine.register_codec(h264_codec.clone(), RtpCodecKind::Video).context("registering H.264 codec")?;
     let registry = register_default_interceptors(Registry::new(), &mut media_engine).context("registering RTP interceptors")?;
 
-    // Neither side configures this otherwise, so both fall back to the RFC
-    // 8841 default of 64KB — and since the crate takes the min of our
-    // configured value and the browser's, our default is what ends up
-    // binding. A JPEG frame from the capture card routinely exceeds 64KB,
-    // so every MJPEG send fails outright without this. A generous local
-    // value has no downside: the browser's own (lower) cap still applies.
     let mut setting_engine = SettingEngine::default();
-    setting_engine.set_sctp_max_message_size(SctpMaxMessageSize::Bounded(4 * 1024 * 1024));
     // This device is only ever used on a local network, never over STUN/TURN
     // (none is configured). Some browsers hide their real LAN IP behind a
     // random "<uuid>.local" mDNS name instead of sending it directly, and

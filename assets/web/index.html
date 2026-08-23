@@ -8,7 +8,6 @@
 </head>
 <body>
 <div id="video-surface" tabindex="0">
-  <canvas id="video"></canvas>
   <video id="video-el" autoplay playsinline muted></video>
 </div>
 
@@ -34,34 +33,25 @@
   <span id="version"></span>
 </div>
 
-<div id="settings-modal">
-  <div class="modal-box">
-    <label>Video
-      <select id="video-mode">
-        <option value="mjpeg">MJPEG</option>
-        <option value="h264">H.264</option>
-      </select>
-    </label>
+<div id="settings-panel">
+  <label>Frame rate
+    <select id="frame-rate"></select>
+  </label>
 
-    <label>Frame rate
-      <select id="frame-rate"></select>
-    </label>
+  <label>Resolution
+    <select id="resolution"></select>
+  </label>
 
-    <label>Resolution
-      <select id="resolution"></select>
-    </label>
+  <label>Mouse
+    <select id="mouse-mode">
+      <option value="absolute">Absolute</option>
+      <option value="relative">Relative</option>
+    </select>
+  </label>
 
-    <label>Mouse
-      <select id="mouse-mode">
-        <option value="absolute">Absolute</option>
-        <option value="relative">Relative</option>
-      </select>
-    </label>
-
-    <div class="modal-actions">
-      <button id="save-settings" disabled>Save settings</button>
-      <span id="save-settings-status"></span>
-    </div>
+  <div class="panel-actions">
+    <button id="save-settings" disabled>Save settings</button>
+    <span id="save-settings-status"></span>
   </div>
 </div>
 

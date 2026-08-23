@@ -55,7 +55,6 @@ impl InputEvent {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CaptureSettingsWire {
-    pub video_mode: VideoModeWire,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -91,13 +90,6 @@ pub enum ServerMessage {
     /// `DeviceState` (which only covers the capture card).
     HidState { available: bool },
     Settings { capture: crate::config::CaptureSettings, mouse_mode: crate::config::MouseMode },
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VideoModeWire {
-    Mjpeg,
-    H264,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -147,13 +139,10 @@ mod tests {
 
     #[test]
     fn control_message_deserializes_from_json() {
-        let msg: ControlMessage = serde_json::from_str(
-            r#"{"type":"update_settings","capture":{"video_mode":"h264","width":1920,"height":1080,"fps":10},"mouse_mode":"relative"}"#,
-        )
-        .unwrap();
+        let msg: ControlMessage =
+            serde_json::from_str(r#"{"type":"update_settings","capture":{"width":1920,"height":1080,"fps":10},"mouse_mode":"relative"}"#).unwrap();
         let ControlMessage::UpdateSettings { capture, mouse_mode } = msg else { panic!("expected UpdateSettings") };
         let capture = capture.unwrap();
-        assert!(matches!(capture.video_mode, VideoModeWire::H264));
         assert_eq!((capture.width, capture.height, capture.fps), (1920, 1080, 10));
         assert!(matches!(mouse_mode, Some(MouseModeWire::Relative)));
 
@@ -166,8 +155,7 @@ mod tests {
         let msg: ControlMessage = serde_json::from_str(r#"{"type":"update_settings","mouse_mode":"absolute"}"#).unwrap();
         assert!(matches!(msg, ControlMessage::UpdateSettings { capture: None, mouse_mode: Some(MouseModeWire::Absolute) }));
 
-        let msg: ControlMessage =
-            serde_json::from_str(r#"{"type":"update_settings","capture":{"video_mode":"mjpeg","width":1280,"height":720,"fps":5}}"#).unwrap();
+        let msg: ControlMessage = serde_json::from_str(r#"{"type":"update_settings","capture":{"width":1280,"height":720,"fps":5}}"#).unwrap();
         assert!(matches!(msg, ControlMessage::UpdateSettings { capture: Some(_), mouse_mode: None }));
 
         let msg: ControlMessage = serde_json::from_str(r#"{"type":"update_settings"}"#).unwrap();

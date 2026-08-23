@@ -30,11 +30,11 @@ use webrtc::rtp_transceiver::RtpSender;
 use crate::capture::v4l2::Resolution;
 use crate::ch9329::keymap::{self, KeyCode};
 use crate::ch9329::writer::SerialCommand;
-use crate::config::{CaptureSettings, DeviceState, MouseMode, PersistedSettings, VideoMode};
+use crate::config::{CaptureSettings, DeviceState, MouseMode, PersistedSettings};
 use crate::settings_store;
-use crate::video_bus::{self, FrameKind};
+use crate::video_bus;
 
-use super::protocol::{ControlMessage, InputEvent, MouseModeWire, ServerMessage, VideoModeWire};
+use super::protocol::{ControlMessage, InputEvent, MouseModeWire, ServerMessage};
 
 pub struct SessionContext {
     pub video_bus: video_bus::Receiver,
@@ -55,30 +55,28 @@ pub struct SessionContext {
     pub pc_state_rx: watch::Receiver<RTCPeerConnectionState>,
 }
 
-/// The three data channels the browser creates before sending its offer
+/// The two data channels the browser creates before sending its offer
 /// (see `assets/web/app.js`) — matched by label as they arrive through
 /// `on_data_channel` (see `Handler` in `super::mod`).
 pub struct DataChannels {
-    pub mjpeg: Arc<dyn DataChannel>,
     pub input: Arc<dyn DataChannel>,
     pub control: Arc<dyn DataChannel>,
 }
 
-/// Waits for all three expected data channels to arrive. The browser
-/// creates them in a fixed set before the offer is even sent, so this
-/// only has to tolerate arrival order, not a missing channel.
+/// Waits for both expected data channels to arrive. The browser creates
+/// them in a fixed set before the offer is even sent, so this only has to
+/// tolerate arrival order, not a missing channel.
 pub async fn collect_data_channels(mut dc_rx: mpsc::UnboundedReceiver<Arc<dyn DataChannel>>) -> Result<DataChannels> {
-    let (mut mjpeg, mut input, mut control) = (None, None, None);
-    while mjpeg.is_none() || input.is_none() || control.is_none() {
+    let (mut input, mut control) = (None, None);
+    while input.is_none() || control.is_none() {
         let dc = dc_rx.recv().await.ok_or_else(|| anyhow::anyhow!("peer connection closed before all data channels opened"))?;
         match dc.label().await?.as_str() {
-            "mjpeg" => mjpeg = Some(dc),
             "input" => input = Some(dc),
             "control" => control = Some(dc),
             other => tracing::debug!(label = other, "ignoring unexpected data channel"),
         }
     }
-    Ok(DataChannels { mjpeg: mjpeg.unwrap(), input: input.unwrap(), control: control.unwrap() })
+    Ok(DataChannels { input: input.unwrap(), control: control.unwrap() })
 }
 
 /// Resolves the SSRC and negotiated payload type for the local H.264
@@ -105,10 +103,10 @@ pub async fn handle(
     dc_rx: mpsc::UnboundedReceiver<Arc<dyn DataChannel>>,
     ctx: SessionContext,
 ) -> Result<()> {
-    let DataChannels { mjpeg, input, control } = collect_data_channels(dc_rx).await?;
+    let DataChannels { input, control } = collect_data_channels(dc_rx).await?;
     let video_target = video_target(&video_track, &video_sender).await;
     if let Err(err) = &video_target {
-        tracing::warn!(%err, "H.264 track not usable for this session; MJPEG and input/control are unaffected");
+        tracing::warn!(%err, "H.264 track not usable for this session; video will not work, input/control are unaffected");
     }
 
     let mut video_rx = ctx.video_bus.clone();
@@ -119,16 +117,13 @@ pub async fn handle(
     let mut pc_state_rx = ctx.pc_state_rx.clone();
     let mut keyboard = KeyboardState::default();
 
-    let mut mjpeg_open = false;
-    let mut mjpeg_active = true;
     let mut input_active = true;
     let mut control_open = false;
-    // The real capture-time delta between consecutive H.264 frames, used
-    // as each RTP sample's duration so the browser's jitter buffer gets
-    // correct pacing info — see `send_frame`. `None` only for the very
-    // first H.264 frame of a session, which has no prior frame to diff
-    // against.
-    let mut last_h264_captured_at: Option<Duration> = None;
+    // The real capture-time delta between consecutive frames, used as each
+    // RTP sample's duration so the browser's jitter buffer gets correct
+    // pacing info — see `send_frame`. `None` only for the very first frame
+    // of a session, which has no prior frame to diff against.
+    let mut last_captured_at: Option<Duration> = None;
     // Set once the video_bus sender is gone for good (only happens if the
     // capture task itself is torn down, e.g. process shutdown - it no
     // longer exits just because the card is absent or unplugged, see
@@ -144,15 +139,9 @@ pub async fn handle(
                     Ok(()) => {
                         let frame = video_rx.borrow_and_update().clone();
                         if let Some(frame) = frame {
-                            let duration = if frame.kind == FrameKind::H264 {
-                                last_h264_captured_at.map(|t| frame.captured_at.saturating_sub(t)).unwrap_or(Duration::ZERO)
-                            } else {
-                                Duration::ZERO
-                            };
-                            if frame.kind == FrameKind::H264 {
-                                last_h264_captured_at = Some(frame.captured_at);
-                            }
-                            send_frame(frame.kind, &frame.data, duration, mjpeg_open, &mjpeg, &video_track, video_target.as_ref().ok().copied()).await;
+                            let duration = last_captured_at.map(|t| frame.captured_at.saturating_sub(t)).unwrap_or(Duration::ZERO);
+                            last_captured_at = Some(frame.captured_at);
+                            send_frame(&frame.data, duration, &video_track, video_target.as_ref().ok().copied()).await;
                         }
                     }
                     Err(_) => video_closed = true,
@@ -163,13 +152,6 @@ pub async fn handle(
                     if packets.iter().any(is_keyframe_request) {
                         ctx.force_keyframe.store(true, Ordering::Relaxed);
                     }
-                }
-            }
-            event = mjpeg.poll(), if mjpeg_active => {
-                match event {
-                    Some(DataChannelEvent::OnOpen) => mjpeg_open = true,
-                    Some(DataChannelEvent::OnClose) | None => { mjpeg_open = false; mjpeg_active = false; }
-                    _ => {}
                 }
             }
             event = input.poll(), if input_active => {
@@ -318,35 +300,15 @@ async fn send_server_message(control: &Arc<dyn DataChannel>, msg: &ServerMessage
     Ok(())
 }
 
-/// Sends one frame on whichever transport matches its codec: MJPEG frames
-/// go out as raw JPEG bytes on the `mjpeg` data channel (no framing needed
-/// — SCTP messages already arrive whole), H.264 frames go out as RTP via
-/// the local video track. Errors on either path are dropped, not
-/// propagated — a slow or not-yet-open channel just means this frame is
-/// skipped, the same tolerance the video_bus watch channel already gives
-/// every subscriber.
-async fn send_frame(
-    kind: FrameKind,
-    data: &Arc<[u8]>,
-    duration: Duration,
-    mjpeg_open: bool,
-    mjpeg: &Arc<dyn DataChannel>,
-    video_track: &TrackLocalStaticSample,
-    video_target: Option<(u32, PayloadType)>,
-) {
-    match kind {
-        FrameKind::Mjpeg => {
-            if mjpeg_open && let Err(err) = mjpeg.send(BytesMut::from(&data[..])).await {
-                tracing::debug!(%err, "failed to send MJPEG frame, dropping it");
-            }
-        }
-        FrameKind::H264 => {
-            let Some((ssrc, payload_type)) = video_target else { return };
-            let sample = Sample { data: Bytes::copy_from_slice(data), duration, ..Default::default() };
-            if let Err(err) = video_track.sample_writer(ssrc, payload_type).write_sample(&sample).await {
-                tracing::debug!(%err, "failed to send H.264 frame, dropping it");
-            }
-        }
+/// Sends one H.264 frame as RTP via the local video track. Errors are
+/// dropped, not propagated — a not-yet-negotiated track just means this
+/// frame is skipped, the same tolerance the video_bus watch channel
+/// already gives every subscriber.
+async fn send_frame(data: &Arc<[u8]>, duration: Duration, video_track: &TrackLocalStaticSample, video_target: Option<(u32, PayloadType)>) {
+    let Some((ssrc, payload_type)) = video_target else { return };
+    let sample = Sample { data: Bytes::copy_from_slice(data), duration, ..Default::default() };
+    if let Err(err) = video_track.sample_writer(ssrc, payload_type).write_sample(&sample).await {
+        tracing::debug!(%err, "failed to send H.264 frame, dropping it");
     }
 }
 
@@ -399,10 +361,6 @@ fn handle_control_message(msg: ControlMessage, ctx: &SessionContext) {
             let had_update = capture.is_some() || mouse_mode.is_some();
             if let Some(capture) = capture {
                 ctx.capture_settings_tx.send_modify(|s| {
-                    s.video_mode = match capture.video_mode {
-                        VideoModeWire::Mjpeg => VideoMode::Mjpeg,
-                        VideoModeWire::H264 => VideoMode::H264,
-                    };
                     s.resolution = Resolution { width: capture.width, height: capture.height };
                     s.fps = capture.fps;
                 });
@@ -422,7 +380,6 @@ fn handle_control_message(msg: ControlMessage, ctx: &SessionContext) {
             if had_update {
                 let settings = PersistedSettings { capture: *ctx.capture_settings_rx.borrow(), mouse_mode: *ctx.mouse_mode_rx.borrow() };
                 tracing::info!(
-                    ?settings.capture.video_mode,
                     width = settings.capture.resolution.width,
                     height = settings.capture.resolution.height,
                     fps = settings.capture.fps,
@@ -450,14 +407,12 @@ fn handle_control_message(msg: ControlMessage, ctx: &SessionContext) {
 mod tests {
     use super::*;
     use crate::capture::v4l2::Resolution;
-    use crate::config::VideoMode;
     use crate::rtc::protocol::CaptureSettingsWire;
 
     fn test_ctx(settings_path: PathBuf) -> SessionContext {
         let (_video_tx, video_rx) = video_bus::channel();
         let (serial_tx, _serial_rx) = mpsc::channel(1);
-        let (capture_settings_tx, capture_settings_rx) =
-            watch::channel(CaptureSettings { video_mode: VideoMode::Mjpeg, resolution: Resolution { width: 1280, height: 720 }, fps: 5 });
+        let (capture_settings_tx, capture_settings_rx) = watch::channel(CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5 });
         let (mouse_mode_tx, mouse_mode_rx) = watch::channel(MouseMode::Absolute);
         let (_device_state_tx, device_state_rx) = watch::channel(DeviceState::default());
         let (_hid_connected_tx, hid_connected_rx) = watch::channel(false);
@@ -489,14 +444,11 @@ mod tests {
         let ctx = test_ctx(path.clone());
 
         handle_control_message(
-            ControlMessage::UpdateSettings {
-                capture: Some(CaptureSettingsWire { video_mode: VideoModeWire::H264, width: 1920, height: 1080, fps: 25 }),
-                mouse_mode: None,
-            },
+            ControlMessage::UpdateSettings { capture: Some(CaptureSettingsWire { width: 1920, height: 1080, fps: 25 }), mouse_mode: None },
             &ctx,
         );
 
-        assert_eq!(*ctx.capture_settings_rx.borrow(), CaptureSettings { video_mode: VideoMode::H264, resolution: Resolution { width: 1920, height: 1080 }, fps: 25 });
+        assert_eq!(*ctx.capture_settings_rx.borrow(), CaptureSettings { resolution: Resolution { width: 1920, height: 1080 }, fps: 25 });
         assert_eq!(*ctx.mouse_mode_rx.borrow(), MouseMode::Absolute);
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -514,7 +466,7 @@ mod tests {
 
         handle_control_message(ControlMessage::UpdateSettings { capture: None, mouse_mode: Some(MouseModeWire::Relative) }, &ctx);
 
-        assert_eq!(*ctx.capture_settings_rx.borrow(), CaptureSettings { video_mode: VideoMode::Mjpeg, resolution: Resolution { width: 1280, height: 720 }, fps: 5 });
+        assert_eq!(*ctx.capture_settings_rx.borrow(), CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5 });
         assert_eq!(*ctx.mouse_mode_rx.borrow(), MouseMode::Relative);
 
         tokio::time::sleep(Duration::from_millis(50)).await;

@@ -6,6 +6,9 @@
 //! and the two are only ever used together inside a single blocking loop
 //! anyway (per the concurrency design — a settings change stops the loop
 //! and starts a fresh one), so there's no need to fight the lifetime.
+//!
+//! Only the raw YUYV (4:2:2) format is ever requested — that's what the
+//! H.264 encoder needs to encode from (see `capture::h264`).
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -23,89 +26,47 @@ use v4l::{Device, Format};
 
 pub use v4l::timestamp::Timestamp;
 
+const YUYV_FOURCC: FourCC = FourCC { repr: *b"YUYV" };
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Resolution {
     pub width: u32,
     pub height: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PixelFormat {
-    Mjpeg,
-    Yuyv,
-}
-
-impl PixelFormat {
-    fn fourcc(self) -> FourCC {
-        match self {
-            PixelFormat::Mjpeg => FourCC::new(b"MJPG"),
-            PixelFormat::Yuyv => FourCC::new(b"YUYV"),
-        }
-    }
-
-    fn from_fourcc(fourcc: FourCC) -> Option<Self> {
-        match fourcc.str().ok() {
-            Some("MJPG") => Some(PixelFormat::Mjpeg),
-            Some("YUYV") => Some(PixelFormat::Yuyv),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct SupportedFormat {
-    pub pixel_format: PixelFormat,
     pub resolutions: Vec<Resolution>,
     /// Frame rates (fps) the card actually reports for each resolution
-    /// (`VIDIOC_ENUM_FRAMEINTERVALS`) — support genuinely varies by both
-    /// pixel format and resolution on real hardware (confirmed via
-    /// `v4l2-ctl --list-formats-ext` on the real device: e.g. YUYV offers
-    /// only 5/10fps at 1080p but 10/25fps at 720p). A resolution missing
-    /// from this map (continuous/"stepwise" rates, or the query failing)
-    /// just means no discrete list is available for it.
+    /// (`VIDIOC_ENUM_FRAMEINTERVALS`) — support genuinely varies by
+    /// resolution on real hardware. A resolution missing from this map
+    /// (continuous/"stepwise" rates, or the query failing) just means no
+    /// discrete list is available for it.
     pub frame_rates: HashMap<Resolution, Vec<u32>>,
 }
 
-/// Queries the card at `path` for every capture format/resolution/frame
-/// rate it actually supports (formats we don't know how to use are
-/// skipped).
-pub fn enumerate(path: &str) -> Result<Vec<SupportedFormat>> {
+/// Queries the card at `path` for the YUYV resolutions/frame rates it
+/// supports. Returns `None` if the card doesn't offer YUYV at all.
+pub fn enumerate(path: &str) -> Result<Option<SupportedFormat>> {
     let dev = Device::with_path(path).with_context(|| format!("opening {path}"))?;
-    let mut out = Vec::new();
-    for desc in dev.enum_formats().with_context(|| format!("enumerating formats on {path}"))? {
-        let Some(pixel_format) = PixelFormat::from_fourcc(desc.fourcc) else {
-            continue;
-        };
-        let frame_sizes = match dev.enum_framesizes(desc.fourcc) {
-            Ok(sizes) => sizes,
-            Err(err) => {
-                // Some real UVC devices advertise a format via enum_formats
-                // but fail enum_framesizes for it specifically. Skip just
-                // that format rather than losing every format the device
-                // offers.
-                tracing::warn!(%err, ?pixel_format, path, "failed to enumerate frame sizes for this format, skipping it");
-                continue;
-            }
-        };
-        let mut resolutions: Vec<Resolution> = frame_sizes
-            .into_iter()
-            .flat_map(|frame_size| frame_size.size.to_discrete())
-            .map(|d| Resolution { width: d.width, height: d.height })
-            .collect();
-        resolutions.sort_by_key(|r| std::cmp::Reverse(r.width * r.height));
-        resolutions.dedup();
+    let Some(desc) = dev.enum_formats().with_context(|| format!("enumerating formats on {path}"))?.into_iter().find(|d| d.fourcc == YUYV_FOURCC) else {
+        return Ok(None);
+    };
 
-        let mut frame_rates = HashMap::new();
-        for resolution in &resolutions {
-            let rates = frame_rates_for(&dev, desc.fourcc, *resolution);
-            if !rates.is_empty() {
-                frame_rates.insert(*resolution, rates);
-            }
+    let frame_sizes = dev.enum_framesizes(desc.fourcc).with_context(|| format!("enumerating frame sizes on {path}"))?;
+    let mut resolutions: Vec<Resolution> = frame_sizes.into_iter().flat_map(|frame_size| frame_size.size.to_discrete()).map(|d| Resolution { width: d.width, height: d.height }).collect();
+    resolutions.sort_by_key(|r| std::cmp::Reverse(r.width * r.height));
+    resolutions.dedup();
+
+    let mut frame_rates = HashMap::new();
+    for resolution in &resolutions {
+        let rates = frame_rates_for(&dev, desc.fourcc, *resolution);
+        if !rates.is_empty() {
+            frame_rates.insert(*resolution, rates);
         }
-
-        out.push(SupportedFormat { pixel_format, resolutions, frame_rates });
     }
-    Ok(out)
+
+    Ok(Some(SupportedFormat { resolutions, frame_rates }))
 }
 
 /// Discrete frame rates (fps) the card reports for `fourcc` at
@@ -134,27 +95,16 @@ fn frame_rates_for(dev: &Device, fourcc: FourCC, resolution: Resolution) -> Vec<
     rates
 }
 
-/// Picks a sensible default (format, resolution) from an enumeration:
-/// prefer MJPEG (cheapest on this hardware) over raw YUYV, then the
-/// largest resolution offered, capped at 1080p. Kept separate from the
-/// ioctl calls above so it's unit-testable on plain data.
-pub fn pick_default(formats: &[SupportedFormat]) -> Option<(PixelFormat, Resolution)> {
+/// Picks the largest resolution offered, capped at 1080p. Kept separate
+/// from the ioctl calls above so it's unit-testable on plain data.
+pub fn pick_default(format: Option<&SupportedFormat>) -> Option<Resolution> {
     const MAX_PIXELS: u32 = 1920 * 1080;
-
-    let best_of = |pixel_format: PixelFormat| {
-        formats
-            .iter()
-            .find(|f| f.pixel_format == pixel_format)
-            .and_then(|f| f.resolutions.iter().filter(|r| r.width * r.height <= MAX_PIXELS).max_by_key(|r| r.width * r.height))
-            .map(|r| (pixel_format, *r))
-    };
-
-    best_of(PixelFormat::Mjpeg).or_else(|| best_of(PixelFormat::Yuyv))
+    format?.resolutions.iter().filter(|r| r.width * r.height <= MAX_PIXELS).max_by_key(|r| r.width * r.height).copied()
 }
 
-/// Runs a blocking capture loop against `path` at the given format and
-/// requested resolution, until `should_stop` returns true. Meant to run
-/// inside `tokio::task::spawn_blocking`.
+/// Runs a blocking YUYV capture loop against `path` at the requested
+/// resolution, until `should_stop` returns true. Meant to run inside
+/// `tokio::task::spawn_blocking`.
 ///
 /// V4L2 drivers are free to negotiate a different resolution than what's
 /// requested (`set_format` returns the format actually in effect) — so
@@ -162,21 +112,14 @@ pub fn pick_default(formats: &[SupportedFormat]) -> Option<(PixelFormat, Resolut
 /// resolution, and must build the per-frame handler from that. Sizing a
 /// frame handler from the merely-requested resolution instead is a real
 /// bug: a mismatch between it and the driver's actual frame size means
-/// buffer-indexing code (JPEG/I420 conversion) reads past the end of a
-/// frame it assumed was a different size.
-pub fn run_capture_loop<H>(
-    path: &str,
-    pixel_format: PixelFormat,
-    resolution: Resolution,
-    fps: u32,
-    mut should_stop: impl FnMut() -> bool,
-    make_handler: impl FnOnce(Resolution) -> H,
-) -> Result<()>
+/// buffer-indexing code (I420 conversion) reads past the end of a frame it
+/// assumed was a different size.
+pub fn run_capture_loop<H>(path: &str, resolution: Resolution, fps: u32, mut should_stop: impl FnMut() -> bool, make_handler: impl FnOnce(Resolution) -> H) -> Result<()>
 where
     H: FnMut(&[u8], Timestamp),
 {
     let dev = Device::with_path(path).with_context(|| format!("opening {path}"))?;
-    let requested = Format::new(resolution.width, resolution.height, pixel_format.fourcc());
+    let requested = Format::new(resolution.width, resolution.height, YUYV_FOURCC);
     let actual = dev.set_format(&requested).context("negotiating capture format")?;
     let actual_resolution = Resolution { width: actual.width, height: actual.height };
 
@@ -198,9 +141,8 @@ where
         match stream.next() {
             Ok((buf, meta)) => {
                 // `buf` is the full fixed-size mmap buffer slot, not the
-                // real frame: for compressed formats like MJPEG the actual
-                // encoded frame only fills the first `bytesused` bytes, the
-                // rest is leftover data from a previous capture.
+                // real frame - the driver reports the actual filled length
+                // separately (`bytesused`).
                 let len = (meta.bytesused as usize).min(buf.len());
                 on_frame(&buf[..len], meta.timestamp);
             }
@@ -235,41 +177,19 @@ fn fps_mismatch(requested: u32, interval: v4l::fraction::Fraction) -> Option<u32
 mod tests {
     use super::*;
 
-    fn formats(entries: &[(PixelFormat, &[(u32, u32)])]) -> Vec<SupportedFormat> {
-        entries
-            .iter()
-            .map(|(pixel_format, resolutions)| SupportedFormat {
-                pixel_format: *pixel_format,
-                resolutions: resolutions.iter().map(|&(width, height)| Resolution { width, height }).collect(),
-                frame_rates: HashMap::new(),
-            })
-            .collect()
-    }
-
-    #[test]
-    fn prefers_mjpeg_over_yuyv_when_both_available() {
-        let formats = formats(&[
-            (PixelFormat::Yuyv, &[(1920, 1080)]),
-            (PixelFormat::Mjpeg, &[(1280, 720)]),
-        ]);
-        assert_eq!(pick_default(&formats), Some((PixelFormat::Mjpeg, Resolution { width: 1280, height: 720 })));
+    fn format(resolutions: &[(u32, u32)]) -> SupportedFormat {
+        SupportedFormat { resolutions: resolutions.iter().map(|&(width, height)| Resolution { width, height }).collect(), frame_rates: HashMap::new() }
     }
 
     #[test]
     fn picks_largest_resolution_within_1080p_cap() {
-        let formats = formats(&[(PixelFormat::Mjpeg, &[(640, 480), (1920, 1080), (3840, 2160)])]);
-        assert_eq!(pick_default(&formats), Some((PixelFormat::Mjpeg, Resolution { width: 1920, height: 1080 })));
+        let format = format(&[(640, 480), (1920, 1080), (3840, 2160)]);
+        assert_eq!(pick_default(Some(&format)), Some(Resolution { width: 1920, height: 1080 }));
     }
 
     #[test]
-    fn falls_back_to_yuyv_when_no_mjpeg() {
-        let formats = formats(&[(PixelFormat::Yuyv, &[(800, 600)])]);
-        assert_eq!(pick_default(&formats), Some((PixelFormat::Yuyv, Resolution { width: 800, height: 600 })));
-    }
-
-    #[test]
-    fn no_supported_formats_returns_none() {
-        assert_eq!(pick_default(&[]), None);
+    fn no_supported_format_returns_none() {
+        assert_eq!(pick_default(None), None);
     }
 
     #[test]

@@ -32,7 +32,7 @@ The modern, low-lag open source KVMs (PiKVM, JetKVM, NanoKVM) use WebRTC with H.
 
 ## This project
 
-simple_kvm used WebTransport (built on QUIC) at first, then moved to WebRTC - joining PiKVM, JetKVM, and NanoKVM's approach. Video is a hybrid for comparison: MJPEG over a WebRTC data channel, H.264 over a real WebRTC video track.
+simple_kvm used WebTransport (built on QUIC) at first, then moved to WebRTC - joining PiKVM, JetKVM, and NanoKVM's approach, with H.264 sent as a real WebRTC video track. It originally also offered an MJPEG mode over a WebRTC data channel, dropped later once H.264 alone proved sufficient.
 
 The reason for the move was TLS, not performance. This device has no public hostname and no certificate from a public CA - just a private, self-signed one. WebTransport's normal certificate checking requires the certificate to be logged in **Certificate Transparency**, a set of public logs that only publicly trusted CAs can submit to; a private CA can never satisfy that, full stop, no matter how well the root is trusted on the device doing the connecting. The only workarounds were getting a certificate from a public CA for a domain this device doesn't have, or pinning the connection to the certificate's exact hash (`serverCertificateHashes`) and rotating it every 14 days.
 

@@ -1,8 +1,7 @@
 // simple_kvm client: opens an RTCPeerConnection over plain HTTP signaling
 // (POST /rtc/offer, no trickle ICE — see connect()), receives H.264 video
-// as a native WebRTC track rendered into a <video> element, and receives
-// MJPEG frames as blobs on a data channel drawn onto a <canvas>. Keyboard
-// and mouse input goes out as small binary messages on an
+// as a native WebRTC track rendered into a <video> element. Keyboard and
+// mouse input goes out as small binary messages on an
 // unreliable/unordered data channel, and settings updates/paste text go
 // out as JSON on a reliable data channel, which also carries
 // device-state/settings pushes back from the server.
@@ -13,18 +12,15 @@ const TAG_MOUSE_RELATIVE_MOVE = 3;
 const TAG_MOUSE_BUTTONS = 4;
 
 const statusEl = document.getElementById('status');
-const canvas = document.getElementById('video');
-const ctx2d = canvas.getContext('2d');
 const videoEl = document.getElementById('video-el');
 const inputSurface = document.getElementById('video-surface');
 const topbarHandle = document.getElementById('topbar-handle');
 const topbar = document.getElementById('topbar');
 const settingsButton = document.getElementById('settings-button');
 const mouseToggleButton = document.getElementById('mouse-toggle-button');
-const settingsModal = document.getElementById('settings-modal');
+const settingsPanel = document.getElementById('settings-panel');
 const pasteButton = document.getElementById('paste-button');
 const pastePanel = document.getElementById('paste-panel');
-const videoModeSelect = document.getElementById('video-mode');
 const frameRateSelect = document.getElementById('frame-rate');
 const resolutionSelect = document.getElementById('resolution');
 const mouseModeSelect = document.getElementById('mouse-mode');
@@ -45,22 +41,19 @@ let hidAvailable = false;
 // connect and after a Save is applied) - never written optimistically on a
 // dropdown change or Save click, so live reads of this always reflect what
 // the server is actually doing.
-let appliedSettings = { video_mode: 'mjpeg', width: undefined, height: undefined, fps: undefined, mouse_mode: 'absolute' };
+let appliedSettings = { width: undefined, height: undefined, fps: undefined, mouse_mode: 'absolute' };
 let savePending = false;
 // Whether the RTCPeerConnection has actually reached 'connected'. Starts
 // false so the bar stays forced open from page load until the connection
 // comes up - see openTopbar()/closeTopbar() and the connectionstatechange
 // handler in connect().
 let rtcConnected = false;
-// What the card supports in each video mode (resolutions, and frame rates
-// per resolution) - from the last `device_state` push. Keyed by the same
-// strings as the video-mode dropdown's option values. Needed so switching
-// the video-mode/resolution dropdowns *before* Save repopulates the other
-// dropdowns from the right list instead of leaving MJPEG's list showing
-// while H.264 is selected (or vice versa) - fps/resolution support
-// genuinely differs between the two on real hardware.
-let deviceModes = { mjpeg: emptyModeState(), h264: emptyModeState() };
-// Whether the settings modal is open - suppresses the topbar's
+// What the capture card supports (resolutions, and frame rates per
+// resolution) - from the last `device_state` push. Needed so switching the
+// resolution dropdown *before* Save repopulates the frame-rate dropdown
+// from the right list.
+let deviceState = emptyDeviceState();
+// Whether the settings panel is open - suppresses the topbar's
 // outside-click auto-hide (see wireTopbar()) while it's up.
 let settingsOpen = false;
 // Latest mouse position/movement since the last flush, sent out at most
@@ -89,7 +82,7 @@ function setStatus(text, isError) {
 let autoHideTimer = null;
 
 // (Re)starts the 5s auto-hide countdown, but only when the bar is actually
-// open, connected, and neither the settings modal nor the paste flyout is
+// open, connected, and neither the settings panel nor the paste flyout is
 // up - same gating as the outside-click auto-hide in wireTopbar().
 function armAutoHide() {
   clearAutoHide();
@@ -114,19 +107,21 @@ function closeTopbar() {
   clearAutoHide();
 }
 
-function openSettingsModal() {
-  settingsModal.classList.add('open');
+function openSettingsPanel() {
+  closePastePanel();
+  settingsPanel.classList.add('open');
   settingsOpen = true;
   clearAutoHide();
 }
 
-function closeSettingsModal() {
-  settingsModal.classList.remove('open');
+function closeSettingsPanel() {
+  settingsPanel.classList.remove('open');
   settingsOpen = false;
   armAutoHide();
 }
 
 function openPastePanel() {
+  closeSettingsPanel();
   pastePanel.classList.add('open');
   pasteOpen = true;
   clearAutoHide();
@@ -139,7 +134,7 @@ function closePastePanel() {
   armAutoHide();
 }
 
-function emptyModeState() {
+function emptyDeviceState() {
   return { resolutions: [], default_resolution: null, frame_rates: [] };
 }
 
@@ -152,26 +147,23 @@ function currentResolutionSelection() {
   return Number.isNaN(width) || Number.isNaN(height) ? null : { width, height };
 }
 
-// Repopulates the resolution dropdown from `mode`'s list (preferring
-// `preferredResolution` if it's still valid, else that mode's default),
-// then repopulates the frame-rate dropdown to match whichever resolution
-// ends up selected. Called whenever the video-mode dropdown changes (live,
-// before Save) and when the server confirms a `device_state`/`settings`
-// push, so the two dropdowns never show a stale list from the other mode.
-function refreshOptionsForMode(mode, preferredResolution, preferredFps) {
-  const state = deviceModes[mode] || emptyModeState();
-  const resolution = state.resolutions.some((r) => sameResolution(r, preferredResolution)) ? preferredResolution : state.default_resolution;
-  populateResolutions(state.resolutions, resolution);
+// Repopulates the resolution dropdown from the capture card's list
+// (preferring `preferredResolution` if it's still valid, else the card's
+// default), then repopulates the frame-rate dropdown to match whichever
+// resolution ends up selected. Called when the server confirms a
+// `device_state`/`settings` push.
+function refreshCaptureOptions(preferredResolution, preferredFps) {
+  const resolution = deviceState.resolutions.some((r) => sameResolution(r, preferredResolution)) ? preferredResolution : deviceState.default_resolution;
+  populateResolutions(deviceState.resolutions, resolution);
   refreshFrameRatesForSelection(preferredFps);
 }
 
-// Repopulates the frame-rate dropdown from the currently-selected video
-// mode + resolution. Called whenever the resolution dropdown changes
-// (live, before Save) as well as from refreshOptionsForMode above.
+// Repopulates the frame-rate dropdown from the currently-selected
+// resolution. Called whenever the resolution dropdown changes (live,
+// before Save) as well as from refreshCaptureOptions above.
 function refreshFrameRatesForSelection(preferredFps) {
-  const state = deviceModes[videoModeSelect.value] || emptyModeState();
   const resolution = currentResolutionSelection();
-  const entry = state.frame_rates.find((fr) => sameResolution(fr.resolution, resolution));
+  const entry = deviceState.frame_rates.find((fr) => sameResolution(fr.resolution, resolution));
   const rates = entry ? entry.rates : [];
   const fps = preferredFps !== undefined && rates.includes(preferredFps) ? preferredFps : undefined;
   populateFrameRates(rates, fps);
@@ -199,12 +191,6 @@ function populateResolutions(resolutions, defaultResolution) {
   }
 }
 
-function updateVideoElementVisibility() {
-  const showVideoEl = appliedSettings.video_mode === 'h264';
-  videoEl.style.display = showVideoEl ? '' : 'none';
-  canvas.style.display = showVideoEl ? 'none' : '';
-}
-
 function populateFrameRates(frameRates, currentFps) {
   frameRateSelect.innerHTML = '';
   if (frameRates.length === 0) {
@@ -229,7 +215,6 @@ function populateFrameRates(frameRates, currentFps) {
 // themselves - Save already silently drops whichever half isn't
 // available (see the click handler below), this just makes that visible.
 function updateSettingsAvailability() {
-  videoModeSelect.disabled = !captureAvailable;
   frameRateSelect.disabled = !captureAvailable;
   resolutionSelect.disabled = !captureAvailable || resolutionSelect.options.length === 0;
   mouseModeSelect.disabled = !hidAvailable;
@@ -241,7 +226,6 @@ function updateSettingsAvailability() {
 // so its dropdowns (which may hold placeholder values) don't count.
 function settingsAreDirty() {
   if (captureAvailable) {
-    if (videoModeSelect.value !== appliedSettings.video_mode) return true;
     if (Number(frameRateSelect.value) !== appliedSettings.fps) return true;
     const [width, height] = resolutionSelect.value.split('x').map(Number);
     if (width !== appliedSettings.width || height !== appliedSettings.height) return true;
@@ -270,7 +254,7 @@ function wireTopbar() {
   document.addEventListener('click', (e) => {
     if (!rtcConnected) return;
     if (settingsOpen || pasteOpen) return;
-    if (topbar.contains(e.target) || topbarHandle.contains(e.target) || settingsModal.contains(e.target) || pastePanel.contains(e.target)) return;
+    if (topbar.contains(e.target) || topbarHandle.contains(e.target) || settingsPanel.contains(e.target) || pastePanel.contains(e.target)) return;
     closeTopbar();
   });
 
@@ -285,34 +269,32 @@ function wireTopbar() {
   });
 }
 
-// Settings modal wiring - gear icon toggles it, backdrop click closes it,
+// Settings panel wiring - gear icon toggles it, a document-level click
+// outside the panel/button closes it (same pattern as the paste flyout),
 // and each dropdown's change recomputes whether Save should be enabled.
-function wireSettingsModal() {
+function wireSettingsPanel() {
   settingsButton.addEventListener('click', () => {
     if (settingsOpen) {
-      closeSettingsModal();
+      closeSettingsPanel();
     } else {
-      openSettingsModal();
+      openSettingsPanel();
     }
   });
 
-  settingsModal.addEventListener('click', (e) => {
-    if (e.target === settingsModal) {
-      closeSettingsModal();
-    }
+  document.addEventListener('click', (e) => {
+    if (!settingsOpen) return;
+    if (settingsPanel.contains(e.target) || settingsButton.contains(e.target)) return;
+    closeSettingsPanel();
   });
 
   // Registered before the generic updateSaveButtonState loop below, so the
-  // resolution/fps lists are already repopulated for the newly-selected
-  // mode/resolution by the time the dirty-check reads them.
-  videoModeSelect.addEventListener('change', () => {
-    refreshOptionsForMode(videoModeSelect.value, currentResolutionSelection(), Number(frameRateSelect.value));
-  });
+  // fps list is already repopulated for the newly-selected resolution by
+  // the time the dirty-check reads it.
   resolutionSelect.addEventListener('change', () => {
     refreshFrameRatesForSelection(Number(frameRateSelect.value));
   });
 
-  for (const el of [videoModeSelect, frameRateSelect, resolutionSelect, mouseModeSelect]) {
+  for (const el of [frameRateSelect, resolutionSelect, mouseModeSelect]) {
     el.addEventListener('change', updateSaveButtonState);
   }
 }
@@ -355,9 +337,8 @@ function wireMouseToggle() {
   });
 }
 
-// Paste flyout wiring - paste icon toggles it, and (since it's a small
-// fixed panel rather than a full-screen backdrop like the settings modal)
-// a document-level click outside the panel/button closes it.
+// Paste flyout wiring - paste icon toggles it, and a document-level click
+// outside the panel/button closes it (same pattern as the settings panel).
 function wirePastePanel() {
   pasteButton.addEventListener('click', () => {
     if (pasteOpen) {
@@ -406,12 +387,6 @@ async function connect() {
     videoEl.srcObject = event.streams[0] ?? new MediaStream([event.track]);
   });
 
-  const mjpegChannel = pc.createDataChannel('mjpeg', { ordered: false, maxRetransmits: 0 });
-  mjpegChannel.binaryType = 'arraybuffer';
-  mjpegChannel.addEventListener('message', (event) => {
-    renderJpeg(event.data).catch((err) => console.error('failed to render MJPEG frame', err));
-  });
-
   inputChannel = pc.createDataChannel('input', { ordered: false, maxRetransmits: 0 });
 
   controlChannel = pc.createDataChannel('control');
@@ -445,7 +420,6 @@ async function connect() {
   await pc.setRemoteDescription({ type: 'answer', sdp });
 
   setStatus('connected');
-  updateVideoElementVisibility();
   wireInput();
 }
 
@@ -464,11 +438,11 @@ function waitForIceGatheringComplete(pc) {
 function handleServerMessage(msg) {
   if (msg.type === 'device_state') {
     captureAvailable = msg.available;
-    deviceModes = { mjpeg: msg.mjpeg, h264: msg.h264 };
+    deviceState = { resolutions: msg.resolutions, default_resolution: msg.default_resolution, frame_rates: msg.frame_rates };
     // Preserve the currently-selected resolution/fps if the new data still
-    // supports them (e.g. a hot-plug refresh) - refreshOptionsForMode falls
-    // back to the mode's default on its own if not.
-    refreshOptionsForMode(videoModeSelect.value, currentResolutionSelection(), Number(frameRateSelect.value));
+    // supports them (e.g. a hot-plug refresh) - refreshCaptureOptions falls
+    // back to the card's default on its own if not.
+    refreshCaptureOptions(currentResolutionSelection(), Number(frameRateSelect.value));
     updateSettingsAvailability();
     updateSaveButtonState();
     if (!msg.available) {
@@ -482,16 +456,13 @@ function handleServerMessage(msg) {
     updateSaveButtonState();
   } else if (msg.type === 'settings') {
     appliedSettings = {
-      video_mode: msg.capture.video_mode,
       width: msg.capture.resolution.width,
       height: msg.capture.resolution.height,
       fps: msg.capture.fps,
       mouse_mode: msg.mouse_mode,
     };
-    videoModeSelect.value = msg.capture.video_mode;
-    refreshOptionsForMode(msg.capture.video_mode, msg.capture.resolution, msg.capture.fps);
+    refreshCaptureOptions(msg.capture.resolution, msg.capture.fps);
     mouseModeSelect.value = msg.mouse_mode;
-    updateVideoElementVisibility();
     // Drop anything queued under the old mode so a mode switch can't flush a
     // stale absolute position or relative delta under the new one.
     pendingAbsoluteMove = null;
@@ -507,16 +478,6 @@ function handleServerMessage(msg) {
     // re-disables itself rather than staying force-enabled.
     updateSaveButtonState();
   }
-}
-
-async function renderJpeg(payload) {
-  const bitmap = await createImageBitmap(new Blob([payload], { type: 'image/jpeg' }));
-  if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
-    canvas.width = bitmap.width;
-    canvas.height = bitmap.height;
-  }
-  ctx2d.drawImage(bitmap, 0, 0);
-  bitmap.close();
 }
 
 function sendInput(bytes) {
@@ -573,7 +534,7 @@ function wireInput() {
     const message = { type: 'update_settings' };
     if (captureAvailable) {
       const [width, height] = resolutionSelect.value.split('x').map(Number);
-      message.capture = { video_mode: videoModeSelect.value, width, height, fps: Number(frameRateSelect.value) };
+      message.capture = { width, height, fps: Number(frameRateSelect.value) };
     }
     if (hidAvailable) {
       message.mouse_mode = mouseModeSelect.value;
@@ -678,7 +639,7 @@ function sendControl(message) {
 }
 
 wireTopbar();
-wireSettingsModal();
+wireSettingsPanel();
 wireMouseToggle();
 wirePastePanel();
 // Forced open pre-connect, same as the disconnected state handled in
