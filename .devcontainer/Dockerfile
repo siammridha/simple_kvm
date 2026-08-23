@@ -26,7 +26,8 @@ RUN cargo install --locked cargo-nextest bacon agent-browser \
 # Chromium for the agent-browser browser test. Chrome for Testing has no arm64
 # build, so the test drives this system Chromium at /usr/bin/chromium.
 # github-cli (gh) is here too, for publishing/PR work from inside the container.
-RUN apk add --no-cache chromium github-cli
+# jq is used below to edit the Claude Code user prefs file (.claude.json).
+RUN apk add --no-cache chromium github-cli jq
 
 # Keep ALL Claude state (including what would otherwise be ~/.claude.json) in
 # one directory, so a single volume mount persists login + sessions.
@@ -48,4 +49,18 @@ RUN curl -fsSL https://claude.ai/install.sh | bash
 RUN claude plugin marketplace add anthropics/claude-plugins-official && \
     claude plugin install rust-analyzer-lsp@claude-plugins-official || \
     echo "Warning: plugin install failed, continuing build"
+
+# ponytail plugin, from its own marketplace (not the official one above).
+RUN claude plugin marketplace add DietrichGebert/ponytail && \
+    claude plugin install ponytail@ponytail || \
+    echo "Warning: plugin install failed, continuing build"
+
+# Stop Claude Code from auto-installing its VS Code extension when `claude`
+# runs in the integrated terminal. This is a /config toggle, not a
+# settings.json field, so it lives in .claude.json instead. Baked into the
+# image (not just set live) so it also lands in the fresh claude-config
+# volume that gets created for any new clone/rebuild of this devcontainer.
+RUN jq '.autoInstallIdeExtension = false' "$CLAUDE_CONFIG_DIR/.claude.json" \
+        > /tmp/claude.json.tmp \
+    && mv /tmp/claude.json.tmp "$CLAUDE_CONFIG_DIR/.claude.json"
 USER root
