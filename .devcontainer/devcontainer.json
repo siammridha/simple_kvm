@@ -9,10 +9,12 @@
 	},
 	"workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
 	"remoteUser": "vscode",
-	// Volumes survive rebuilds: cargo cache, and all Claude state (login,
-	// sessions, history, plugins — the Dockerfile sets CLAUDE_CONFIG_DIR so
-	// everything, including what would otherwise be ~/.claude.json, lives in
-	// /home/vscode/.claude).
+	// Volumes survive rebuilds: cargo cache, and Claude state. The Dockerfile
+	// sets CLAUDE_CONFIG_DIR so everything, including what would otherwise be
+	// ~/.claude.json, lives in /home/vscode/.claude (the "claude-config"
+	// volume) -- EXCEPT the login token, which setup-claude-auth.sh symlinks
+	// in from the separate "claude-auth" volume. This lets claude-config
+	// (sessions, history, cache) be deleted and rebuilt without re-logging in.
 	"mounts": [
 		{
 			"source": "${localWorkspaceFolderBasename}-devcontainer-cargo-cache",
@@ -24,6 +26,11 @@
 			"target": "/home/vscode/.claude",
 			"type": "volume"
 		},
+		{
+			"source": "${localWorkspaceFolderBasename}-devcontainer-claude-auth",
+			"target": "/home/vscode/.claude-auth",
+			"type": "volume"
+		},
 		// Bind the host git config so name/email survive rebuilds. SSH keys are
 		// not mounted: VS Code forwards the host SSH agent into the container
 		// automatically, so the key never leaves the host.
@@ -33,6 +40,10 @@
 			"type": "bind"
 		}
 	],
+
+	// Runs on every container start (not just create) so the credentials
+	// symlink is re-established even if claude-config was deleted and rebuilt.
+	"postStartCommand": "bash .devcontainer/setup-claude-auth.sh",
 
 	"customizations": {
 		"vscode": {
