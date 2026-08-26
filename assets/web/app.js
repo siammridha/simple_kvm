@@ -23,7 +23,6 @@ const pasteButton = document.getElementById('paste-button');
 const pastePanel = document.getElementById('paste-panel');
 const frameRateSelect = document.getElementById('frame-rate');
 const resolutionSelect = document.getElementById('resolution');
-const bitrateInput = document.getElementById('bitrate');
 const mouseModeSelect = document.getElementById('mouse-mode');
 const pasteText = document.getElementById('paste-text');
 const saveSettings = document.getElementById('save-settings');
@@ -42,7 +41,7 @@ let hidAvailable = false;
 // connect and after a Save is applied) - never written optimistically on a
 // dropdown change or Save click, so live reads of this always reflect what
 // the server is actually doing.
-let appliedSettings = { width: undefined, height: undefined, fps: undefined, bitrate: undefined, mouse_mode: 'absolute' };
+let appliedSettings = { width: undefined, height: undefined, fps: undefined, mouse_mode: 'absolute' };
 let savePending = false;
 // Whether the RTCPeerConnection has actually reached 'connected'. Starts
 // false so the bar stays forced open from page load until the connection
@@ -218,7 +217,6 @@ function populateFrameRates(frameRates, currentFps) {
 function updateSettingsAvailability() {
   frameRateSelect.disabled = !captureAvailable;
   resolutionSelect.disabled = !captureAvailable || resolutionSelect.options.length === 0;
-  bitrateInput.disabled = !captureAvailable;
   mouseModeSelect.disabled = !hidAvailable;
 }
 
@@ -231,7 +229,6 @@ function settingsAreDirty() {
     if (Number(frameRateSelect.value) !== appliedSettings.fps) return true;
     const [width, height] = resolutionSelect.value.split('x').map(Number);
     if (width !== appliedSettings.width || height !== appliedSettings.height) return true;
-    if (Math.round(Number(bitrateInput.value) * 1_000_000) !== appliedSettings.bitrate) return true;
   }
   if (hidAvailable) {
     if (mouseModeSelect.value !== appliedSettings.mouse_mode) return true;
@@ -297,7 +294,7 @@ function wireSettingsPanel() {
     refreshFrameRatesForSelection(Number(frameRateSelect.value));
   });
 
-  for (const el of [frameRateSelect, resolutionSelect, bitrateInput, mouseModeSelect]) {
+  for (const el of [frameRateSelect, resolutionSelect, mouseModeSelect]) {
     el.addEventListener('change', updateSaveButtonState);
   }
 }
@@ -462,11 +459,9 @@ function handleServerMessage(msg) {
       width: msg.capture.resolution.width,
       height: msg.capture.resolution.height,
       fps: msg.capture.fps,
-      bitrate: msg.capture.bitrate,
       mouse_mode: msg.mouse_mode,
     };
     refreshCaptureOptions(msg.capture.resolution, msg.capture.fps);
-    bitrateInput.value = msg.capture.bitrate / 1_000_000;
     mouseModeSelect.value = msg.mouse_mode;
     // Drop anything queued under the old mode so a mode switch can't flush a
     // stale absolute position or relative delta under the new one.
@@ -539,7 +534,7 @@ function wireInput() {
     const message = { type: 'update_settings' };
     if (captureAvailable) {
       const [width, height] = resolutionSelect.value.split('x').map(Number);
-      message.capture = { width, height, fps: Number(frameRateSelect.value), bitrate: Math.round(Number(bitrateInput.value) * 1_000_000) };
+      message.capture = { width, height, fps: Number(frameRateSelect.value) };
     }
     if (hidAvailable) {
       message.mouse_mode = mouseModeSelect.value;

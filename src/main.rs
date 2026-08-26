@@ -18,7 +18,6 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tracing_subscriber::EnvFilter;
 
-use capture::h264;
 use capture::v4l2::Resolution;
 use capture::CaptureManager;
 use ch9329::writer::{self, SerialCommand};
@@ -50,7 +49,6 @@ async fn main() -> Result<()> {
         persisted_capture.or_else(|| capture_manager.default_settings()).unwrap_or(CaptureSettings {
             resolution: Resolution { width: 1280, height: 720 },
             fps: 5,
-            bitrate: h264::DEFAULT_BITRATE_BPS,
         });
     let default_mouse_mode = persisted.map(|p| p.mouse_mode).unwrap_or(MouseMode::Absolute);
 

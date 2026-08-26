@@ -29,14 +29,14 @@ use anyhow::Context as _;
 use anyhow::Result;
 use libva_rs::{
     BorrowedBufferType, BufferType, Context, Display, EncMiscParameter,
-    EncMiscParameterFrameRate, EncMiscParameterRateControl, EncPackedHeaderParameter,
-    EncPackedHeaderType, EncPictureParameterBufferH264, EncSequenceParameterBufferH264,
-    EncSliceParameterBufferH264, H264EncPicFields, H264EncSeqFields, Image, MappedCodedBuffer,
-    Picture, PictureH264, ProcPipelineParameterBuffer, RcFlags, Surface, UsageHint,
-    VAConfigAttrib, VAConfigAttribType, VAEntrypoint, VAProfile, VARectangle,
-    VA_ATTRIB_NOT_SUPPORTED, VA_ENC_PACKED_HEADER_PICTURE, VA_ENC_PACKED_HEADER_SEQUENCE,
-    VA_ENC_PACKED_HEADER_SLICE, VA_FOURCC_YUY2, VA_INVALID_ID,
-    VA_PICTURE_H264_SHORT_TERM_REFERENCE, VA_RC_VBR, VA_RT_FORMAT_YUV420, VA_RT_FORMAT_YUV422,
+    EncMiscParameterFrameRate, EncPackedHeaderParameter, EncPackedHeaderType,
+    EncPictureParameterBufferH264, EncSequenceParameterBufferH264, EncSliceParameterBufferH264,
+    H264EncPicFields, H264EncSeqFields, Image, MappedCodedBuffer, Picture, PictureH264,
+    ProcPipelineParameterBuffer, Surface, UsageHint, VAConfigAttrib, VAConfigAttribType,
+    VAEntrypoint, VAProfile, VARectangle, VA_ATTRIB_NOT_SUPPORTED,
+    VA_ENC_PACKED_HEADER_PICTURE, VA_ENC_PACKED_HEADER_SEQUENCE, VA_ENC_PACKED_HEADER_SLICE,
+    VA_FOURCC_YUY2, VA_INVALID_ID, VA_PICTURE_H264_SHORT_TERM_REFERENCE, VA_RC_CQP,
+    VA_RT_FORMAT_YUV420, VA_RT_FORMAT_YUV422,
 };
 
 /// H.264 Constrained Baseline profile - matches the browser's negotiated
@@ -56,16 +56,6 @@ const PROFILE_COMPATIBILITY: u8 = 0xE0;
 /// frame of a capture pass would only ever receive delta frames and could
 /// never start decoding.
 const INTRA_FRAME_PERIOD: u64 = 60;
-
-/// Default/fallback bitrate, used when no persisted setting exists yet (see
-/// `main.rs`) and by `CaptureManager::default_settings`. Matches the web
-/// UI's own default (see `assets/web/index.html`'s bitrate input).
-pub const DEFAULT_BITRATE_BPS: u32 = 5_000_000;
-
-/// Under VBR, the encoder aims for this percentage of the configured
-/// bitrate on average, using the rest as headroom for complex frames rather
-/// than padding simple ones out to a fixed size (which is what CBR did).
-const VBR_TARGET_PERCENTAGE: u32 = 70;
 
 /// `log2_max_frame_num_minus4` / `log2_max_pic_order_cnt_lsb_minus4` are
 /// both set to 4, giving an 8-bit range (0-255) for `frame_num` and
@@ -141,7 +131,6 @@ pub struct H264Encoder {
     height: u32,
     coded_width: u32,
     coded_height: u32,
-    bitrate: u32,
     frame_count: u64,
     /// Index into `ref_surfaces` that the *next* call to
     /// `encode_yuyv_frame` will render/encode into.
@@ -159,7 +148,7 @@ pub struct H264Encoder {
 }
 
 impl H264Encoder {
-    pub fn new(width: u32, height: u32, bitrate: u32) -> Result<Self> {
+    pub fn new(width: u32, height: u32) -> Result<Self> {
         let display =
             Display::open().context("Display::open() found no usable DRM/VAAPI device")?;
 
@@ -201,15 +190,14 @@ impl H264Encoder {
             enc_attrs[1].value
         );
         // Without explicitly negotiating a rate-control mode here, the driver
-        // defaults to constant-QP and silently ignores
-        // `EncMiscParameterRateControl`'s bitrate target entirely - confirmed
-        // on-device: encoded output measured ~12.6 Mbps (vs. the 2 Mbps
-        // target) before this was added. VBR support was confirmed on-device
-        // (bitmask 0x16 = CBR|VBR|CQP) before switching to it from CBR.
+        // silently defaults to constant-QP behavior on its own (confirmed in
+        // the investigation doc) - this makes that mode explicit and
+        // intentional instead of implicit. CQP support was confirmed
+        // on-device (bitmask 0x16 = CBR|VBR|CQP).
         anyhow::ensure!(
-            enc_attrs[2].value & VA_RC_VBR != 0,
-            "driver does not support VBR rate control (reports {:#x}) - required for the \
-             configured bitrate to actually be honored, see docs/gpu-encoding-investigation.md",
+            enc_attrs[2].value & VA_RC_CQP != 0,
+            "driver does not support CQP rate control (reports {:#x}), see \
+             docs/gpu-encoding-investigation.md",
             enc_attrs[2].value
         );
 
@@ -221,7 +209,7 @@ impl H264Encoder {
                         type_: VAConfigAttribType::VAConfigAttribEncPackedHeaders,
                         value: required_packed_headers,
                     },
-                    VAConfigAttrib { type_: VAConfigAttribType::VAConfigAttribRateControl, value: VA_RC_VBR },
+                    VAConfigAttrib { type_: VAConfigAttribType::VAConfigAttribRateControl, value: VA_RC_CQP },
                 ],
                 h264_profile,
                 VAEntrypoint::VAEntrypointEncSlice,
@@ -299,7 +287,6 @@ impl H264Encoder {
             height,
             coded_width,
             coded_height,
-            bitrate,
             frame_count: 0,
             next_target: 0,
             frame_num: 0,
@@ -451,8 +438,23 @@ impl H264Encoder {
 
         let slice_type: u8 = if is_idr { 2 } else { 0 };
         let num_macroblocks = (self.coded_width / 16) * (self.coded_height / 16);
-        let ref_pic_list_0: [PictureH264; 32] = std::array::from_fn(|_| PictureH264::invalid());
+        let mut ref_pic_list_0: [PictureH264; 32] = std::array::from_fn(|_| PictureH264::invalid());
         let ref_pic_list_1: [PictureH264; 32] = std::array::from_fn(|_| PictureH264::invalid());
+        if !is_idr {
+            // Must match `reference_frames[0]` above exactly - this is the
+            // actual reference the hardware searches against for motion
+            // estimation on P slices. Leaving this as `invalid()` (as before)
+            // contradicted `num_ref_idx_l0_active_minus1 = 0` below (which
+            // says "1 active reference exists") and made P-frames far more
+            // expensive than they should be - see docs/gpu-encoding-investigation.md.
+            ref_pic_list_0[0] = PictureH264::new(
+                self.ref_surfaces[prev].id(),
+                self.frame_num as u32,
+                VA_PICTURE_H264_SHORT_TERM_REFERENCE,
+                self.pic_order_cnt as i32,
+                self.pic_order_cnt as i32,
+            );
+        }
         let slice_param = EncSliceParameterBufferH264::new(
             0, // macroblock_address
             num_macroblocks,
@@ -527,14 +529,10 @@ impl H264Encoder {
             );
         }
 
-        // Under VBR, `bits_per_second` is the peak/ceiling rather than a
-        // fixed target - `target_percentage` is how much of that ceiling the
-        // encoder aims for on average, leaving headroom above it for complex
-        // frames instead of forcing every frame to the same size like CBR did.
-        let rc_flags = RcFlags::new(0, 0, 0, 0, 0, 0, 0, 0, 0);
-        let rc_param = EncMiscParameterRateControl::new(self.bitrate, VBR_TARGET_PERCENTAGE, 1000, PIC_INIT_QP as u32, 1, 0, rc_flags, 0, 51, 0, 0);
-        picture.add_buffer(self.enc_context.create_buffer(BufferType::EncMiscParameter(EncMiscParameter::RateControl(rc_param))).context("create_buffer(EncMiscParameter::RateControl)")?);
-
+        // CQP takes no bitrate/target-percentage - the fixed QP comes from
+        // `PIC_INIT_QP`, already wired into `pic_param` below and into the
+        // hand-packed PPS's `pic_init_qp_minus26` (see `pack_pps`), so no
+        // `EncMiscParameterRateControl` buffer is needed.
         let fr_param = EncMiscParameterFrameRate::new(ENCODE_FRAMERATE_HINT, 0);
         picture.add_buffer(self.enc_context.create_buffer(BufferType::EncMiscParameter(EncMiscParameter::FrameRate(fr_param))).context("create_buffer(EncMiscParameter::FrameRate)")?);
 
@@ -577,8 +575,9 @@ impl H264Encoder {
             LEVEL_IDC,
             INTRA_FRAME_PERIOD as u32, // intra_period
             INTRA_FRAME_PERIOD as u32, // intra_idr_period
-            1,                         // ip_period
-            self.bitrate,
+            1, // ip_period
+            0, // bit_rate - unused under CQP; the driver's own HRD bookkeeping
+               // this feeds isn't signaled in the hand-packed SPS anyway
             1, // max_num_ref_frames
             (self.coded_width / 16) as u16,
             (self.coded_height / 16) as u16,

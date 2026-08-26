@@ -364,7 +364,6 @@ fn handle_control_message(msg: ControlMessage, ctx: &SessionContext) {
                 ctx.capture_settings_tx.send_modify(|s| {
                     s.resolution = Resolution { width: capture.width, height: capture.height };
                     s.fps = capture.fps;
-                    s.bitrate = capture.bitrate;
                 });
             }
             // The server doesn't need mouse mode to translate input events —
@@ -385,7 +384,6 @@ fn handle_control_message(msg: ControlMessage, ctx: &SessionContext) {
                     width = settings.capture.resolution.width,
                     height = settings.capture.resolution.height,
                     fps = settings.capture.fps,
-                    bitrate = settings.capture.bitrate,
                     ?settings.mouse_mode,
                     "settings updated"
                 );
@@ -416,7 +414,7 @@ mod tests {
         let (_video_tx, video_rx) = video_bus::channel();
         let (serial_tx, _serial_rx) = mpsc::channel(1);
         let (capture_settings_tx, capture_settings_rx) =
-            watch::channel(CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5, bitrate: crate::capture::h264::DEFAULT_BITRATE_BPS });
+            watch::channel(CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5 });
         let (mouse_mode_tx, mouse_mode_rx) = watch::channel(MouseMode::Absolute);
         let (_device_state_tx, device_state_rx) = watch::channel(DeviceState::default());
         let (_hid_connected_tx, hid_connected_rx) = watch::channel(false);
@@ -448,17 +446,16 @@ mod tests {
         let ctx = test_ctx(path.clone());
 
         handle_control_message(
-            ControlMessage::UpdateSettings { capture: Some(CaptureSettingsWire { width: 1920, height: 1080, fps: 25, bitrate: 1_500_000 }), mouse_mode: None },
+            ControlMessage::UpdateSettings { capture: Some(CaptureSettingsWire { width: 1920, height: 1080, fps: 25 }), mouse_mode: None },
             &ctx,
         );
 
-        assert_eq!(*ctx.capture_settings_rx.borrow(), CaptureSettings { resolution: Resolution { width: 1920, height: 1080 }, fps: 25, bitrate: 1_500_000 });
+        assert_eq!(*ctx.capture_settings_rx.borrow(), CaptureSettings { resolution: Resolution { width: 1920, height: 1080 }, fps: 25 });
         assert_eq!(*ctx.mouse_mode_rx.borrow(), MouseMode::Absolute);
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         let saved = settings_store::load(&path).expect("save spawned by handle_control_message should have run");
         assert_eq!(saved.capture.fps, 25);
-        assert_eq!(saved.capture.bitrate, 1_500_000);
         assert_eq!(saved.mouse_mode, MouseMode::Absolute);
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
@@ -473,7 +470,7 @@ mod tests {
 
         assert_eq!(
             *ctx.capture_settings_rx.borrow(),
-            CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5, bitrate: crate::capture::h264::DEFAULT_BITRATE_BPS }
+            CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5 }
         );
         assert_eq!(*ctx.mouse_mode_rx.borrow(), MouseMode::Relative);
 

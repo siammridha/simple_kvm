@@ -65,13 +65,6 @@ if [ "$DROPDOWN_COUNT" -ne 3 ]; then
 	exit 1
 fi
 
-BITRATE_COUNT=$(agent-browser get count "#bitrate")
-echo "bitrate input found: $BITRATE_COUNT"
-if [ "$BITRATE_COUNT" -ne 1 ]; then
-	echo "FAIL: expected the bitrate number input to be present, got count $BITRATE_COUNT" >&2
-	exit 1
-fi
-
 echo "Waiting for the WebRTC connection..."
 # "no video device found" is the correct status here, not a failure - this
 # test has no capture card, and the device-state push (sent as soon as the

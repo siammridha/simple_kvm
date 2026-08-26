@@ -58,7 +58,6 @@ pub struct CaptureSettingsWire {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
-    pub bitrate: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -141,10 +140,10 @@ mod tests {
     #[test]
     fn control_message_deserializes_from_json() {
         let msg: ControlMessage =
-            serde_json::from_str(r#"{"type":"update_settings","capture":{"width":1920,"height":1080,"fps":10,"bitrate":2000000},"mouse_mode":"relative"}"#).unwrap();
+            serde_json::from_str(r#"{"type":"update_settings","capture":{"width":1920,"height":1080,"fps":10},"mouse_mode":"relative"}"#).unwrap();
         let ControlMessage::UpdateSettings { capture, mouse_mode } = msg else { panic!("expected UpdateSettings") };
         let capture = capture.unwrap();
-        assert_eq!((capture.width, capture.height, capture.fps, capture.bitrate), (1920, 1080, 10, 2_000_000));
+        assert_eq!((capture.width, capture.height, capture.fps), (1920, 1080, 10));
         assert!(matches!(mouse_mode, Some(MouseModeWire::Relative)));
 
         let msg: ControlMessage = serde_json::from_str(r#"{"type":"paste","text":"hi"}"#).unwrap();
@@ -156,7 +155,7 @@ mod tests {
         let msg: ControlMessage = serde_json::from_str(r#"{"type":"update_settings","mouse_mode":"absolute"}"#).unwrap();
         assert!(matches!(msg, ControlMessage::UpdateSettings { capture: None, mouse_mode: Some(MouseModeWire::Absolute) }));
 
-        let msg: ControlMessage = serde_json::from_str(r#"{"type":"update_settings","capture":{"width":1280,"height":720,"fps":5,"bitrate":2000000}}"#).unwrap();
+        let msg: ControlMessage = serde_json::from_str(r#"{"type":"update_settings","capture":{"width":1280,"height":720,"fps":5}}"#).unwrap();
         assert!(matches!(msg, ControlMessage::UpdateSettings { capture: Some(_), mouse_mode: None }));
 
         let msg: ControlMessage = serde_json::from_str(r#"{"type":"update_settings"}"#).unwrap();
