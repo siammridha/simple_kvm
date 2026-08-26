@@ -27,17 +27,20 @@ to install.
 Run the binary on the Wyse 3040 and it serves a page at `http://<device
 ip>:3000` with:
 
-- **Live video**, streamed over WebRTC as a real H.264 video track,
-  software-encoded and decoded natively by the browser into a `<video>`
-  element. The Wyse 3040's Atom CPU is genuinely weak for real-time
-  software video encoding - expect this to be choppy at higher
-  resolutions/frame rates. The encoder inserts a keyframe every 60 frames
-  so a browser that (re)connects mid-stream has something to start
-  decoding from, and also produces one immediately whenever a connected
-  browser's own decoder asks for one (standard WebRTC keyframe-request
-  feedback) - without either, only the very first frame of a capture
-  session would ever be a keyframe, and joining any later would leave the
-  video stuck.
+- **Live video**, streamed over WebRTC as a real H.264 video track, encoded
+  on the Wyse 3040's GPU (an `ffmpeg` subprocess driving its `h264_vaapi`
+  hardware encoder) and decoded natively by the browser into a `<video>`
+  element. This offloads encoding from the Wyse 3040's genuinely weak Atom
+  CPU onto its GPU, which does the work far more cheaply. The encoder
+  inserts a keyframe every 60 frames so a browser that (re)connects
+  mid-stream has something to start decoding from, and also produces one
+  promptly whenever a connected browser's own decoder asks for one
+  (standard WebRTC keyframe-request feedback, handled by restarting the
+  `ffmpeg` subprocess with a fresh keyframe) - without either, only the
+  very first frame of a capture session would ever be a keyframe, and
+  joining any later would leave the video stuck. Runs in a fixed-quality
+  mode with no bitrate target or limit (matching how the encoder this
+  replaced always worked), so there's nothing to tune from the page.
 - **Resolution dropdown**, populated from whatever the capture card
   actually reports supporting (queried at startup) - not a hardcoded list.
 - **Frame rate dropdown**, populated from whatever the capture card
@@ -152,14 +155,18 @@ for why this replaced an earlier WebTransport-based design.
   Wyse 3040 exactly, so it's a normal build, not a cross-compile) and
   publishes it as a GitHub Release.
 - `deploy/install.sh` - run on the device; downloads the latest release
-  binary from GitHub and sets it up as an OpenRC service that starts on
-  boot.
+  binary from GitHub, installs `ffmpeg` and the Intel VAAPI driver
+  (`libva-intel-driver`) alongside it since the video encoding path shells
+  out to `ffmpeg` at runtime, and sets the binary up as an OpenRC service
+  that starts on boot.
 
-Building needs a few extra Alpine packages beyond a bare Rust toolchain:
-`clang-dev` and `linux-headers` (the `v4l` crate generates V4L2 bindings
-with `bindgen` at build time) and `nasm` (speeds up the `openh264`
-encoder, which matters on this CPU). Both the devcontainer and the release
-workflow already install these.
+Building needs a couple of extra Alpine packages beyond a bare Rust
+toolchain: `clang-dev` and `linux-headers` (the `v4l` crate generates V4L2
+bindings with `bindgen` at build time). Both the devcontainer and the
+release workflow already install these. No build-time dependency is needed
+for video encoding itself - it's a runtime `ffmpeg` subprocess (see
+`src/capture/h264.rs`), not a linked library, so `ffmpeg` only needs to be
+present on the device (as `deploy/install.sh` ensures), not at build time.
 
 **Fast local iteration, without a tag/release for every change:** the
 devcontainer can cross-compile a debug binary directly, for testing

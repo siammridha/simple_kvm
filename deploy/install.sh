@@ -15,7 +15,11 @@ if [ "$(id -u)" -ne 0 ]; then
 	exit 1
 fi
 
-apk add --no-cache jq
+# ffmpeg (with its h264_vaapi encoder) and the Intel VAAPI driver are what
+# actually do the video encoding at runtime - simple_kvm just shells out to
+# ffmpeg, it doesn't bundle an encoder itself. jq is only needed by this
+# install script, to parse the GitHub release API response below.
+apk add --no-cache jq ffmpeg libva-intel-driver
 
 echo "Looking up the latest release of $REPO..."
 DOWNLOAD_URL=$(wget -qO- "https://api.github.com/repos/$REPO/releases/latest" \
