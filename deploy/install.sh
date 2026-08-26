@@ -10,9 +10,17 @@ set -eu
 
 REPO="siammridha/simple_kvm"
 
-ok()   { echo "  [ok]   $1"; }
-warn() { echo "  [warn] $1"; }
-fail() { echo "  [FAIL] $1" >&2; }
+# Colors only when writing to an actual terminal - a plain `wget | sh` still
+# goes straight to one, but this keeps output clean if it's ever redirected.
+if [ -t 1 ]; then
+	GREEN='\033[32m'; YELLOW='\033[33m'; RED='\033[31m'; RESET='\033[0m'
+else
+	GREEN=''; YELLOW=''; RED=''; RESET=''
+fi
+
+ok()   { printf '  %b[ok]%b   %s\n' "$GREEN" "$RESET" "$1"; }
+warn() { printf '  %b[warn]%b %s\n' "$YELLOW" "$RESET" "$1"; }
+fail() { printf '  %b[FAIL]%b %s\n' "$RED" "$RESET" "$1" >&2; }
 
 echo "Checking the environment..."
 
