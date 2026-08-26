@@ -60,8 +60,15 @@ agent-browser wait --load load
 
 DROPDOWN_COUNT=$(agent-browser get count select)
 echo "dropdowns found: $DROPDOWN_COUNT"
-if [ "$DROPDOWN_COUNT" -ne 4 ]; then
-	echo "FAIL: expected 4 dropdowns (frame rate, resolution, bitrate, mouse mode), got $DROPDOWN_COUNT" >&2
+if [ "$DROPDOWN_COUNT" -ne 3 ]; then
+	echo "FAIL: expected 3 dropdowns (frame rate, resolution, mouse mode), got $DROPDOWN_COUNT" >&2
+	exit 1
+fi
+
+BITRATE_COUNT=$(agent-browser get count "#bitrate")
+echo "bitrate input found: $BITRATE_COUNT"
+if [ "$BITRATE_COUNT" -ne 1 ]; then
+	echo "FAIL: expected the bitrate number input to be present, got count $BITRATE_COUNT" >&2
 	exit 1
 fi
 

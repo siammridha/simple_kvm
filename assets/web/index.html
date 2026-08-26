@@ -42,19 +42,8 @@
     <select id="resolution"></select>
   </label>
 
-  <label>Bitrate
-    <select id="bitrate">
-      <option value="500000">500 Kbps</option>
-      <option value="1000000">1 Mbps</option>
-      <option value="1500000">1.5 Mbps</option>
-      <option value="2000000" selected>2 Mbps</option>
-      <option value="2500000">2.5 Mbps</option>
-      <option value="3000000">3 Mbps</option>
-      <option value="3500000">3.5 Mbps</option>
-      <option value="4000000">4 Mbps</option>
-      <option value="4500000">4.5 Mbps</option>
-      <option value="5000000">5 Mbps</option>
-    </select>
+  <label>Bitrate (Mbps)
+    <input type="number" id="bitrate" min="0.1" step="0.1" value="5">
   </label>
 
   <label>Mouse

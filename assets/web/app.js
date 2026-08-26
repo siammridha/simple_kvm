@@ -23,7 +23,7 @@ const pasteButton = document.getElementById('paste-button');
 const pastePanel = document.getElementById('paste-panel');
 const frameRateSelect = document.getElementById('frame-rate');
 const resolutionSelect = document.getElementById('resolution');
-const bitrateSelect = document.getElementById('bitrate');
+const bitrateInput = document.getElementById('bitrate');
 const mouseModeSelect = document.getElementById('mouse-mode');
 const pasteText = document.getElementById('paste-text');
 const saveSettings = document.getElementById('save-settings');
@@ -218,7 +218,7 @@ function populateFrameRates(frameRates, currentFps) {
 function updateSettingsAvailability() {
   frameRateSelect.disabled = !captureAvailable;
   resolutionSelect.disabled = !captureAvailable || resolutionSelect.options.length === 0;
-  bitrateSelect.disabled = !captureAvailable;
+  bitrateInput.disabled = !captureAvailable;
   mouseModeSelect.disabled = !hidAvailable;
 }
 
@@ -231,7 +231,7 @@ function settingsAreDirty() {
     if (Number(frameRateSelect.value) !== appliedSettings.fps) return true;
     const [width, height] = resolutionSelect.value.split('x').map(Number);
     if (width !== appliedSettings.width || height !== appliedSettings.height) return true;
-    if (Number(bitrateSelect.value) !== appliedSettings.bitrate) return true;
+    if (Math.round(Number(bitrateInput.value) * 1_000_000) !== appliedSettings.bitrate) return true;
   }
   if (hidAvailable) {
     if (mouseModeSelect.value !== appliedSettings.mouse_mode) return true;
@@ -297,7 +297,7 @@ function wireSettingsPanel() {
     refreshFrameRatesForSelection(Number(frameRateSelect.value));
   });
 
-  for (const el of [frameRateSelect, resolutionSelect, bitrateSelect, mouseModeSelect]) {
+  for (const el of [frameRateSelect, resolutionSelect, bitrateInput, mouseModeSelect]) {
     el.addEventListener('change', updateSaveButtonState);
   }
 }
@@ -466,7 +466,7 @@ function handleServerMessage(msg) {
       mouse_mode: msg.mouse_mode,
     };
     refreshCaptureOptions(msg.capture.resolution, msg.capture.fps);
-    bitrateSelect.value = msg.capture.bitrate;
+    bitrateInput.value = msg.capture.bitrate / 1_000_000;
     mouseModeSelect.value = msg.mouse_mode;
     // Drop anything queued under the old mode so a mode switch can't flush a
     // stale absolute position or relative delta under the new one.
@@ -539,7 +539,7 @@ function wireInput() {
     const message = { type: 'update_settings' };
     if (captureAvailable) {
       const [width, height] = resolutionSelect.value.split('x').map(Number);
-      message.capture = { width, height, fps: Number(frameRateSelect.value), bitrate: Number(bitrateSelect.value) };
+      message.capture = { width, height, fps: Number(frameRateSelect.value), bitrate: Math.round(Number(bitrateInput.value) * 1_000_000) };
     }
     if (hidAvailable) {
       message.mouse_mode = mouseModeSelect.value;

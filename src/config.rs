@@ -12,9 +12,9 @@ use crate::capture::v4l2::Resolution;
 pub struct CaptureSettings {
     pub resolution: Resolution,
     pub fps: u32,
-    /// Bits per second, passed straight to `h264::H264Encoder::new`. Clamped
-    /// server-side to `h264::MAX_SAFE_BITRATE_BPS` before it's ever applied
-    /// (see `rtc::session::handle_control_message`).
+    /// Bits per second, passed straight to `h264::H264Encoder::new`. No
+    /// server-side limit - whatever the web UI's Mbps input (or a
+    /// hand-crafted control message) sends is applied as-is.
     pub bitrate: u32,
 }
 

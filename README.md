@@ -51,14 +51,11 @@ ip>:3000` with:
   negotiate a different rate than requested (a mismatch is logged, not
   shown on the page), but picking through the page only ever offers rates
   the card itself reported.
-- **Bitrate dropdown**, a fixed set of steps from 500 Kbps up to 5 Mbps.
-  Unlike the resolution/frame rate dropdowns, this isn't queried from
-  hardware. The full range has been confirmed clean in manual testing -
-  5 Mbps at both 1080p@10fps and 720p@25fps - see
-  `docs/gpu-encoding-investigation.md`. The server enforces a hard 5 Mbps
-  ceiling itself (clamping anything higher) regardless of what the dropdown
-  offers, since the settings message could in principle be hand-crafted
-  with any value.
+- **Bitrate**, a free-entry number field in Mbps (defaults to 5). Unlike the
+  resolution/frame rate dropdowns, this isn't queried from hardware, and
+  there's no server-side ceiling - whatever value is entered is sent as-is.
+  5 Mbps has been confirmed clean in manual testing - 1080p@10fps and
+  720p@25fps - see `docs/gpu-encoding-investigation.md`.
 - **Mouse movement, clicks, and scroll wheel**, absolute or relative mode,
   switched via **Save settings**. Absolute mode positions the cursor
   exactly where you point in the video; on the CH9329 hardware this repo
