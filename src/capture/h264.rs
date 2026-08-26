@@ -22,6 +22,7 @@
 //! an error and the app fails to start rather than silently falling back to
 //! software encoding.
 
+use std::ops::Deref;
 use std::rc::Rc;
 
 use anyhow::Context as _;
@@ -87,9 +88,47 @@ const ENCODE_FRAMERATE_HINT: u32 = 10;
 
 const PIC_INIT_QP: u8 = 26;
 
+/// The GPU's video-processing (VPP) context that does YUYV -> NV12 color
+/// conversion. A distinct type (rather than a bare `Rc<Context>` field on
+/// `H264Encoder`) so its own teardown - separate from the H.264 encode
+/// context below - is logged at the point it actually happens.
+struct GpuColorConverter(Rc<Context>);
+
+impl Deref for GpuColorConverter {
+    type Target = Rc<Context>;
+
+    fn deref(&self) -> &Rc<Context> {
+        &self.0
+    }
+}
+
+impl Drop for GpuColorConverter {
+    fn drop(&mut self) {
+        tracing::info!("GPU color converter stopped");
+    }
+}
+
+/// The GPU's H.264 encode context. See `GpuColorConverter` above for why
+/// this is a distinct type rather than a bare `Rc<Context>` field.
+struct GpuH264EncodeContext(Rc<Context>);
+
+impl Deref for GpuH264EncodeContext {
+    type Target = Rc<Context>;
+
+    fn deref(&self) -> &Rc<Context> {
+        &self.0
+    }
+}
+
+impl Drop for GpuH264EncodeContext {
+    fn drop(&mut self) {
+        tracing::info!("GPU H.264 encoder stopped");
+    }
+}
+
 pub struct H264Encoder {
-    enc_context: Rc<Context>,
-    vpp_context: Rc<Context>,
+    enc_context: GpuH264EncodeContext,
+    vpp_context: GpuColorConverter,
     yuyv_surface: Surface,
     yuyv_image_format: simple_kvm_vaapi::VAImageFormat,
     /// A 2-surface NV12 reference pool: `num_ref_frames = 1` is enough with
@@ -250,8 +289,8 @@ impl H264Encoder {
         let packed_pps = pack_pps();
 
         Ok(Self {
-            enc_context,
-            vpp_context,
+            enc_context: GpuH264EncodeContext(enc_context),
+            vpp_context: GpuColorConverter(vpp_context),
             yuyv_surface,
             yuyv_image_format,
             ref_surfaces,

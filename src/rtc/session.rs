@@ -236,6 +236,7 @@ pub async fn handle(
         }
     }
 
+    tracing::info!("WebRTC video stopped");
     Ok(())
 }
 

@@ -114,7 +114,7 @@ pub fn pick_default(format: Option<&SupportedFormat>) -> Option<Resolution> {
 /// bug: a mismatch between it and the driver's actual frame size means
 /// buffer-indexing code (I420 conversion) reads past the end of a frame it
 /// assumed was a different size.
-pub fn run_capture_loop<H>(path: &str, resolution: Resolution, fps: u32, mut should_stop: impl FnMut() -> bool, make_handler: impl FnOnce(Resolution) -> H) -> Result<()>
+pub fn run_capture_loop<H>(path: &str, resolution: Resolution, fps: u32, mut should_stop: impl FnMut() -> bool, make_handler: impl FnOnce(Resolution) -> Result<H>) -> Result<()>
 where
     H: FnMut(&[u8], Timestamp),
 {
@@ -132,7 +132,10 @@ where
         Err(err) => tracing::warn!(%err, requested_fps = fps, "failed to set capture frame rate, continuing at device default"),
     }
 
-    let mut on_frame = make_handler(actual_resolution);
+    // If GPU setup fails here, we return before ever opening the mmap
+    // capture stream below - no frames are read for a pass that can't
+    // encode them anyway.
+    let mut on_frame = make_handler(actual_resolution)?;
 
     let mut stream = MmapStream::with_buffers(&dev, BufferType::VideoCapture, 4).context("starting mmap capture stream")?;
     stream.set_timeout(Duration::from_millis(500));

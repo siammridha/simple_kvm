@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context as _;
 use tokio::sync::watch;
 
 use crate::config::{CaptureSettings, DeviceState, ResolutionFrameRates};
@@ -13,11 +14,10 @@ use crate::uevent;
 use crate::video_bus::{self, FrameEnvelope};
 use v4l2::SupportedFormat;
 
-/// Safety-net interval for checking whether the capture card is plugged in
-/// while it's absent. `UeventListener` (see `capture::uevent`) normally
-/// notices a reconnect immediately, straight from the kernel - this timer
-/// only matters if that listener failed to open (e.g. no permission) or a
-/// notification was somehow missed, so it doesn't need to be tight.
+/// Backoff delay used when retrying after a capture-device enumeration
+/// error or an unexpected end to a capture pass, so a persistent error
+/// doesn't turn into a busy loop. Device reconnects are detected purely via
+/// kernel uevents (see `capture::uevent`), not by polling.
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Preferred fps for `CaptureManager::default_settings()` — picked from
@@ -93,7 +93,7 @@ impl CaptureManager {
         let mut uevents = match uevent::UeventListener::open() {
             Ok(listener) => Some(listener),
             Err(err) => {
-                tracing::warn!(%err, "failed to open kernel uevent listener, falling back to polling only for capture device reconnects");
+                tracing::warn!(%err, "failed to open kernel uevent listener, capture device reconnects won't be detected until the next settings change");
                 None
             }
         };
@@ -190,7 +190,9 @@ impl CaptureManager {
                     }
                 }
             }
-            tracing::info!("video encoding stopped");
+            // `H264Encoder`'s `Drop` impl logs its own GPU teardown steps
+            // (color converter, then H.264 encoder) as it goes, which is
+            // more useful than one generic line here.
 
             if shutdown {
                 break;
@@ -227,10 +229,10 @@ async fn wait_for_client_or_shutdown(client_count: &mut watch::Receiver<u32>, se
 }
 
 /// Waits until `device_path` exists, or returns `Err` once the settings
-/// channel closes (server shutting down, nothing left to wait for).
-/// Wakes up immediately on a matching kernel uevent when `uevents` is
-/// available; the timer is just the fallback for when it isn't (see
-/// `DEVICE_POLL_INTERVAL`).
+/// channel closes (server shutting down, nothing left to wait for). Relies
+/// entirely on kernel uevents to notice a reconnect - if `uevents` is
+/// `None` (the listener failed to open), this only wakes on a settings
+/// change.
 async fn wait_for_device_or_shutdown(
     device_path: &str,
     settings: &mut watch::Receiver<CaptureSettings>,
@@ -242,7 +244,6 @@ async fn wait_for_device_or_shutdown(
         }
         tokio::select! {
             _ = wait_for_uevent(uevents) => {}
-            _ = tokio::time::sleep(DEVICE_POLL_INTERVAL) => {}
             changed = settings.changed() => {
                 if changed.is_err() {
                     return Err(());
@@ -255,8 +256,8 @@ async fn wait_for_device_or_shutdown(
 /// `video4linux` is the kernel subsystem name for V4L2 capture devices
 /// like `/dev/video0` - unrelated uevents (USB, network, ...) are ignored.
 /// Never resolves when `uevents` is `None` (listener failed to open), so
-/// this branch simply never wins the `select!` above and the timer takes
-/// over instead.
+/// this branch simply never wins the `select!` above - the settings-change
+/// branch is the only other way to wake up in that case.
 async fn wait_for_uevent(uevents: &mut Option<uevent::UeventListener>) {
     match uevents {
         Some(listener) => listener.wait_for_subsystem("video4linux").await,
@@ -273,21 +274,15 @@ fn run_one_pass(device_path: &str, format: &Option<SupportedFormat>, settings: &
     // `make_handler` runs once `run_capture_loop` knows the *actual*
     // negotiated resolution (which the driver is free to pick differently
     // than what was requested) — sizing the H.264 conversion buffers from
-    // anything else risks reading past the end of a real frame.
-    let result = v4l2::run_capture_loop(device_path, settings.resolution, settings.fps, || stop.load(Ordering::Relaxed), move |actual_resolution| {
-        let mut h264_encoder = match h264::H264Encoder::new(actual_resolution.width, actual_resolution.height, h264::DEFAULT_BITRATE_BPS) {
-            Ok(encoder) => Some(encoder),
-            Err(err) => {
-                tracing::error!(%err, "failed to create H.264 encoder, dropping frames in this pass");
-                None
-            }
-        };
+    // anything else risks reading past the end of a real frame. It's
+    // fallible: if GPU setup fails, `run_capture_loop` returns before ever
+    // opening the capture stream, instead of reading and dropping frames
+    // for a pass that can't encode them anyway.
+    let result = v4l2::run_capture_loop(device_path, settings.resolution, settings.fps, || stop.load(Ordering::Relaxed), move |actual_resolution| -> anyhow::Result<_> {
+        let mut encoder = h264::H264Encoder::new(actual_resolution.width, actual_resolution.height, h264::DEFAULT_BITRATE_BPS).context("Failed to set up GPU")?;
 
-        move |frame: &[u8], captured_at: v4l2::Timestamp| {
+        Ok(move |frame: &[u8], captured_at: v4l2::Timestamp| {
             let captured_at = v4l2::timestamp_to_duration(captured_at);
-            let Some(encoder) = h264_encoder.as_mut() else {
-                return;
-            };
             // A session asked (via RTCP PLI/FIR) for a fresh keyframe
             // sooner than the encoder's own periodic schedule - see
             // `rtc::session::handle`'s `video_track.poll()` branch.
@@ -302,7 +297,7 @@ fn run_one_pass(device_path: &str, format: &Option<SupportedFormat>, settings: &
                 }
             };
             let _ = video_bus.send(Some(envelope));
-        }
+        })
     });
 
     if let Err(err) = result {

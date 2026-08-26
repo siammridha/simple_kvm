@@ -26,6 +26,7 @@ use config::{CaptureSettings, MouseMode};
 #[tokio::main]
 async fn main() -> Result<()> {
     init_logging();
+    log_startup_banner(env!("CARGO_PKG_VERSION"));
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "simple_kvm starting");
 
     let serial_path = env::var("SERIAL_PATH").unwrap_or_else(|_| "/dev/ttyUSB0".to_string());
@@ -130,4 +131,17 @@ const DEFAULT_LOG_FILTER: &str = "info,simple_kvm::rtc::session=debug,simple_kvm
 fn init_logging() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
     tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+/// A loud, hand-colored banner printed straight to stdout (not through
+/// `tracing`, so it isn't buried under a timestamp/level/target prefix like
+/// every other line) - meant to jump out visually when scrolling past
+/// hundreds of dense per-frame/per-packet debug lines to find where the
+/// service actually (re)started.
+fn log_startup_banner(version: &str) {
+    let line = format!("simple_kvm v{version} — service started");
+    let bar = "=".repeat(line.chars().count() + 4);
+    println!("\x1b[1;32m{bar}\x1b[0m");
+    println!("\x1b[1;32m  {line}\x1b[0m");
+    println!("\x1b[1;32m{bar}\x1b[0m");
 }
