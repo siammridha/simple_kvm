@@ -274,7 +274,7 @@ impl H264Encoder {
             .try_into()
             .map_err(|_| anyhow::anyhow!("expected exactly 2 reference surfaces"))?;
 
-        let packed_sps = pack_sps(coded_width / 16, coded_height / 16);
+        let packed_sps = pack_sps(coded_width, coded_height, width, height);
         let packed_pps = pack_pps();
 
         Ok(Self {
@@ -674,7 +674,7 @@ fn pack_slice_header(args: PackedSliceHeaderArgs) -> (Vec<u8>, usize) {
 /// `VAEncPackedHeaderSequence` buffer. Constant across the encoder's
 /// lifetime (built once in `H264Encoder::new`), since none of its fields
 /// change frame to frame.
-fn pack_sps(width_in_mbs: u32, height_in_mbs: u32) -> (Vec<u8>, usize) {
+fn pack_sps(coded_width: u32, coded_height: u32, width: u32, height: u32) -> (Vec<u8>, usize) {
     let mut w = BitWriter::new();
     w.write_bits(PROFILE_IDC as u32, 8);
     w.write_bits(PROFILE_COMPATIBILITY as u32, 8);
@@ -688,12 +688,30 @@ fn pack_sps(width_in_mbs: u32, height_in_mbs: u32) -> (Vec<u8>, usize) {
     w.write_ue(POC_LSB_BITS - 4); // log2_max_pic_order_cnt_lsb_minus4
     w.write_ue(1); // max_num_ref_frames
     w.write_bit(0); // gaps_in_frame_num_value_allowed_flag
-    w.write_ue(width_in_mbs - 1); // pic_width_in_mbs_minus1
+    w.write_ue(coded_width / 16 - 1); // pic_width_in_mbs_minus1
     // frame_mbs_only_flag == 1: pic_height_in_map_units == pic_height_in_mbs.
-    w.write_ue(height_in_mbs - 1); // pic_height_in_map_units_minus1
+    w.write_ue(coded_height / 16 - 1); // pic_height_in_map_units_minus1
     w.write_bit(1); // frame_mbs_only_flag
     w.write_bit(1); // direct_8x8_inference_flag
-    w.write_bit(0); // frame_cropping_flag (no crop - see module doc on 1088 vs 1080)
+    // coded_width/coded_height are rounded up to whole macroblocks (16px),
+    // so they can exceed the real width/height (e.g. 1088 vs 1080 at
+    // 1080p) - without cropping, that extra strip is undefined picture
+    // data at the bottom/right edge (rendered as a solid green bar by
+    // decoders, since it comes out as YUV (0,0,0)). chroma_format_idc=1
+    // (4:2:0) gives crop units of 2 horizontally and 2 vertically (spec
+    // 7.4.2.1.1), which the pixel deltas below always divide evenly since
+    // capture resolutions are even in both dimensions.
+    let crop_right = (coded_width - width) / 2;
+    let crop_bottom = (coded_height - height) / 2;
+    if crop_right > 0 || crop_bottom > 0 {
+        w.write_bit(1); // frame_cropping_flag
+        w.write_ue(0); // frame_crop_left_offset
+        w.write_ue(crop_right);
+        w.write_ue(0); // frame_crop_top_offset
+        w.write_ue(crop_bottom);
+    } else {
+        w.write_bit(0); // frame_cropping_flag
+    }
     w.write_bit(0); // vui_parameters_present_flag
     w.write_bit(1); // rbsp_stop_one_bit (rbsp_trailing_bits - SPS is a complete NAL)
 
@@ -827,6 +845,39 @@ impl BitWriter {
 mod tests {
     use super::*;
 
+    /// Minimal MSB-first bit reader, test-only counterpart to `BitWriter` -
+    /// just enough to decode the exp-golomb SPS fields the crop tests below
+    /// need to check.
+    struct BitReader<'a> {
+        bytes: &'a [u8],
+        bit_pos: usize,
+    }
+
+    impl<'a> BitReader<'a> {
+        fn new(bytes: &'a [u8]) -> Self {
+            Self { bytes, bit_pos: 0 }
+        }
+
+        fn read_bit(&mut self) -> u32 {
+            let byte = self.bytes[self.bit_pos / 8];
+            let bit = (byte >> (7 - self.bit_pos % 8)) & 1;
+            self.bit_pos += 1;
+            bit as u32
+        }
+
+        fn read_bits(&mut self, n: u32) -> u32 {
+            (0..n).fold(0, |acc, _| (acc << 1) | self.read_bit())
+        }
+
+        fn read_ue(&mut self) -> u32 {
+            let mut leading_zeros = 0;
+            while self.read_bit() == 0 {
+                leading_zeros += 1;
+            }
+            (1 << leading_zeros) - 1 + self.read_bits(leading_zeros)
+        }
+    }
+
     #[test]
     fn bitwriter_write_ue_matches_exp_golomb() {
         let mut w = BitWriter::new();
@@ -911,7 +962,7 @@ mod tests {
 
     #[test]
     fn pack_sps_starts_with_start_code_profile_and_level() {
-        let (packed, bit_len) = pack_sps(120, 68);
+        let (packed, bit_len) = pack_sps(1920, 1088, 1920, 1080);
         // 00 00 01 (start code) + 0x67 (nal_ref_idc=3, nal_unit_type=7) +
         // profile_idc (0x42) + constraint flags (0xE0) + level_idc (0x28 = 40).
         assert_eq!(&packed[..7], &[0x00, 0x00, 0x01, 0x67, 0x42, 0xE0, 0x28]);
@@ -919,6 +970,51 @@ mod tests {
         // number of bytes (ends with rbsp_trailing_bits).
         assert_eq!(bit_len % 8, 0);
         assert_eq!(bit_len, packed.len() * 8);
+    }
+
+    #[test]
+    fn pack_sps_crops_padding_when_coded_size_exceeds_real_size() {
+        // 1080p: coded_height rounds up to 1088 (16px macroblocks), 8px of
+        // padding must be cropped off the bottom or it renders as a green
+        // bar - see the frame_cropping_flag comment in pack_sps.
+        let (packed, _) = pack_sps(1920, 1088, 1920, 1080);
+        let mut r = BitReader::new(&packed[4..]); // skip start code + NAL header
+        r.read_bits(24); // profile_idc, constraint flags, level_idc
+        assert_eq!(r.read_ue(), 0); // seq_parameter_set_id
+        assert_eq!(r.read_ue(), FRAME_NUM_BITS - 4);
+        assert_eq!(r.read_ue(), 0); // pic_order_cnt_type
+        assert_eq!(r.read_ue(), POC_LSB_BITS - 4);
+        assert_eq!(r.read_ue(), 1); // max_num_ref_frames
+        assert_eq!(r.read_bit(), 0); // gaps_in_frame_num_value_allowed_flag
+        assert_eq!(r.read_ue(), 1920 / 16 - 1); // pic_width_in_mbs_minus1
+        assert_eq!(r.read_ue(), 1088 / 16 - 1); // pic_height_in_map_units_minus1
+        assert_eq!(r.read_bit(), 1); // frame_mbs_only_flag
+        assert_eq!(r.read_bit(), 1); // direct_8x8_inference_flag
+        assert_eq!(r.read_bit(), 1); // frame_cropping_flag
+        assert_eq!(r.read_ue(), 0); // frame_crop_left_offset
+        assert_eq!(r.read_ue(), 0); // frame_crop_right_offset (1920 already a multiple of 16)
+        assert_eq!(r.read_ue(), 0); // frame_crop_top_offset
+        assert_eq!(r.read_ue(), 4); // frame_crop_bottom_offset ((1088-1080)/2)
+    }
+
+    #[test]
+    fn pack_sps_skips_cropping_when_coded_size_matches_real_size() {
+        // 720p: 720 is already a multiple of 16, so there's no padding to
+        // crop and frame_cropping_flag should stay off.
+        let (packed, _) = pack_sps(1280, 720, 1280, 720);
+        let mut r = BitReader::new(&packed[4..]);
+        r.read_bits(24);
+        r.read_ue(); // seq_parameter_set_id
+        r.read_ue(); // log2_max_frame_num_minus4
+        r.read_ue(); // pic_order_cnt_type
+        r.read_ue(); // log2_max_pic_order_cnt_lsb_minus4
+        r.read_ue(); // max_num_ref_frames
+        r.read_bit(); // gaps_in_frame_num_value_allowed_flag
+        r.read_ue(); // pic_width_in_mbs_minus1
+        r.read_ue(); // pic_height_in_map_units_minus1
+        r.read_bit(); // frame_mbs_only_flag
+        r.read_bit(); // direct_8x8_inference_flag
+        assert_eq!(r.read_bit(), 0); // frame_cropping_flag
     }
 
     #[test]
