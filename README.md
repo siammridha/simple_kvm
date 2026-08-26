@@ -235,20 +235,23 @@ The page, `app.js`, and `style.css` are all served with `Cache-Control:
 no-store`, so a browser tab reloaded after an update always gets the new
 version instead of quietly running old page code against the new server.
 
-**Why the service waits 30 seconds after boot before starting:** on the
-actual Wyse 3040 this was built and tested against, opening the capture
-card right as it finishes USB enumeration at boot reliably hard-crashes
-the machine (confirmed by repeated testing - starting the service at boot
-crashed it every time; starting the exact same binary the exact same way
-once the system had been up a while never did). The installed service
-waits 30 seconds before starting to avoid that window. If you hit boot
-crashes on different hardware, try increasing the delay in
-`/etc/init.d/simple_kvm`'s `start_pre()`.
+**Known issue - no boot-crash protection for the capture card right now:**
+on the actual Wyse 3040 this was built and tested against, opening the
+capture card right as it finishes USB enumeration at boot reliably
+hard-crashes the machine (confirmed by repeated testing - starting the
+service at boot crashed it every time; starting the exact same binary the
+exact same way once the system had been up a while never did). The
+service used to work around this with a 30-second `start_pre()` sleep in
+`/etc/init.d/simple_kvm` before the binary even launched; that's been
+removed (it was stacking with the CH9329 delay below and needlessly
+delaying every restart, not just boot), and nothing has replaced it yet
+- so a fresh boot can currently still crash the machine. Tracked as
+follow-up work.
 
 The CH9329 has shown the same crash-on-connect behavior, so the binary
-itself also waits before opening the serial port (`SERIAL_OPEN_DELAY_SECS`,
-default 30 seconds) — separately from the capture card's boot delay above,
-so it applies any time the service starts, not just at boot.
+itself waits before opening the serial port (`SERIAL_OPEN_DELAY_SECS`,
+default 30 seconds) - this one still applies, since it lives in the
+binary itself rather than the removed OpenRC delay.
 
 ### Configuration
 

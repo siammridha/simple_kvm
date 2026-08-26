@@ -141,15 +141,6 @@ error_log="/var/log/simple_kvm.log"
 depend() {
 	need net
 }
-
-# Starting the capture card right as it finishes USB enumeration at boot
-# reliably hard-crashes this specific Wyse 3040 (confirmed by testing:
-# starting this service at boot crashes it every time, starting the exact
-# same way once the system's been up a while never does). Giving the USB
-# subsystem time to settle before opening the devices avoids it.
-start_pre() {
-	sleep 30
-}
 EOF
 chmod 755 /etc/init.d/simple_kvm
 
