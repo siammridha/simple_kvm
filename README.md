@@ -51,6 +51,16 @@ ip>:3000` with:
   negotiate a different rate than requested (a mismatch is logged, not
   shown on the page), but picking through the page only ever offers rates
   the card itself reported.
+- **Bitrate dropdown**, a fixed set of steps from 500 Kbps up to 5 Mbps.
+  Unlike the resolution/frame rate dropdowns, this isn't queried from
+  hardware. Only 2 Mbps is validated as clean - the GPU H.264 encoder on
+  this device is known to corrupt P-frame output above roughly 2.5-3 Mbps
+  (see `docs/gpu-encoding-investigation.md`), so anything past 2.5 Mbps is
+  offered for testing how far past that known-good range this hardware
+  actually holds up, not as a recommended setting. The server enforces a
+  hard 5 Mbps ceiling itself (clamping anything higher) regardless of what
+  the dropdown offers, since the settings message could in principle be
+  hand-crafted with any value.
 - **Mouse movement, clicks, and scroll wheel**, absolute or relative mode,
   switched via **Save settings**. Absolute mode positions the cursor
   exactly where you point in the video; on the CH9329 hardware this repo
@@ -117,7 +127,7 @@ fallback, so if its listener fails to open, its reconnects are only
 noticed on the next real keystroke or click instead of immediately.
 
 **Dropdown changes only take effect when you click Save settings.**
-Changing frame rate, resolution, or mouse mode does nothing on its own -
+Changing frame rate, resolution, bitrate, or mouse mode does nothing on its own -
 picking a new value just moves the dropdown. Clicking **Save
 settings** sends one message over the WebRTC control channel that both
 applies the new settings live and writes them to the settings file on
@@ -129,7 +139,7 @@ up with whatever was last saved, or the capture card's own defaults if
 nothing ever was.
 
 Save only includes the settings for hardware that's actually connected:
-resolution/frame rate are sent only if the capture card is
+resolution/frame rate/bitrate are sent only if the capture card is
 plugged in, and mouse mode only if the CH9329 is - there's nothing
 meaningful to save for a device that isn't there. If only one is
 connected, Save updates just that half and leaves the other as it was.
@@ -252,7 +262,7 @@ if you need to change one):
 | `SERIAL_OPEN_DELAY_SECS` | `30` | How long to wait before opening the CH9329 serial port, for the same reason as the capture card's boot delay below — set to `0` to disable. |
 | `VIDEO_PATH` | `/dev/video0` | Capture card device |
 | `HTTP_PORT` | `3000` | Port for the page and WebRTC signaling (`POST /rtc/offer`) |
-| `SETTINGS_PATH` | `/etc/simple_kvm-settings.json` | Where frame rate/resolution/mouse mode are written when you click **Save settings** on the page, and read back on the next startup. |
+| `SETTINGS_PATH` | `/etc/simple_kvm-settings.json` | Where frame rate/resolution/bitrate/mouse mode are written when you click **Save settings** on the page, and read back on the next startup. |
 | `RUST_LOG` | `info,simple_kvm::rtc::session=debug,simple_kvm::ch9329::writer=debug` | Standard `tracing` log filter. By default, every keystroke/click is already logged at `debug` - no configuration needed first - since each log line includes how long that event took to queue/write, which is useful for tracking down input lag. A command that takes more than 50ms logs at `warn` regardless. Setting `RUST_LOG` yourself (e.g. `RUST_LOG=debug` for everything, or `RUST_LOG=warn` to quiet the per-keystroke lines) fully overrides the default above. |
 
 Each browser tab's video/input connection (WebRTC) picks its own UDP port

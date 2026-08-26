@@ -55,7 +55,7 @@ impl CaptureManager {
             .and_then(|f| f.frame_rates.get(&resolution))
             .and_then(|rates| rates.iter().copied().filter(|&r| r <= DEFAULT_TARGET_FPS).max().or_else(|| rates.iter().copied().min()))
             .unwrap_or(DEFAULT_TARGET_FPS);
-        Some(CaptureSettings { resolution, fps })
+        Some(CaptureSettings { resolution, fps, bitrate: h264::DEFAULT_BITRATE_BPS })
     }
 
     /// The card's current availability and resolution list for the startup
@@ -279,7 +279,7 @@ fn run_one_pass(device_path: &str, format: &Option<SupportedFormat>, settings: &
     // opening the capture stream, instead of reading and dropping frames
     // for a pass that can't encode them anyway.
     let result = v4l2::run_capture_loop(device_path, settings.resolution, settings.fps, || stop.load(Ordering::Relaxed), move |actual_resolution| -> anyhow::Result<_> {
-        let mut encoder = h264::H264Encoder::new(actual_resolution.width, actual_resolution.height, h264::DEFAULT_BITRATE_BPS).context("Failed to set up GPU")?;
+        let mut encoder = h264::H264Encoder::new(actual_resolution.width, actual_resolution.height, settings.bitrate).context("Failed to set up GPU")?;
 
         Ok(move |frame: &[u8], captured_at: v4l2::Timestamp| {
             let captured_at = v4l2::timestamp_to_duration(captured_at);

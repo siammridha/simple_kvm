@@ -49,12 +49,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("settings.json");
 
-        let settings = PersistedSettings { capture: CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 25 }, mouse_mode: MouseMode::Relative };
+        let settings =
+            PersistedSettings { capture: CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 25, bitrate: 1_800_000 }, mouse_mode: MouseMode::Relative };
         save(&path, settings);
 
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.capture.resolution, Resolution { width: 1280, height: 720 });
         assert_eq!(loaded.capture.fps, 25);
+        assert_eq!(loaded.capture.bitrate, 1_800_000);
         assert_eq!(loaded.mouse_mode, MouseMode::Relative);
 
         std::fs::remove_dir_all(&dir).ok();

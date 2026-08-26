@@ -12,6 +12,11 @@ use crate::capture::v4l2::Resolution;
 pub struct CaptureSettings {
     pub resolution: Resolution,
     pub fps: u32,
+    /// Bits per second, passed straight to `h264::H264Encoder::new`. Clamped
+    /// server-side to `h264::MAX_SAFE_BITRATE_BPS` before it's ever applied
+    /// (see `rtc::session::handle_control_message`) — this device's GPU
+    /// encoder corrupts P-frame output above that ceiling.
+    pub bitrate: u32,
 }
 
 /// Live state of the capture card itself — whether it's plugged in right

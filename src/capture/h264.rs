@@ -57,14 +57,22 @@ const PROFILE_COMPATIBILITY: u8 = 0xE0;
 /// never start decoding.
 const INTRA_FRAME_PERIOD: u64 = 60;
 
-/// Hardware bitrate ceiling on this device: P-frame encoding corrupts above
-/// roughly 2.5-3 Mbps (see the investigation doc). 2 Mbps is the value
-/// validated throughout that investigation, including a live end-to-end
-/// capture test - stay safely under the ceiling.
-///
-/// This is a fixed default for now; a real user-facing bitrate setting is a
-/// separate, later piece of work.
+/// Default/fallback bitrate, used when no persisted setting exists yet (see
+/// `main.rs`) and by `CaptureManager::default_settings`. 2 Mbps is the value
+/// validated throughout the investigation doc, including a live end-to-end
+/// capture test - stay safely under `MAX_SAFE_BITRATE_BPS` below.
 pub const DEFAULT_BITRATE_BPS: u32 = 2_000_000;
+
+/// Hard ceiling for any user-supplied bitrate (the web UI's dropdown, or a
+/// hand-crafted control message) - clamped to this value server-side before
+/// it's ever applied, see `rtc::session::handle_control_message`.
+///
+/// Encoding corrupts above roughly 2.5-3 Mbps in prior testing (see
+/// docs/gpu-encoding-investigation.md) - only 2 Mbps was validated as
+/// clean. This ceiling is set higher, at 5 Mbps, so the dropdown's upper
+/// options can be used to test how far past that known-good range this
+/// hardware actually holds up.
+pub const MAX_SAFE_BITRATE_BPS: u32 = 5_000_000;
 
 /// `log2_max_frame_num_minus4` / `log2_max_pic_order_cnt_lsb_minus4` are
 /// both set to 4, giving an 8-bit range (0-255) for `frame_num` and
