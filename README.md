@@ -205,9 +205,18 @@ Run this on the Wyse 3040 itself, as root:
 wget -qO- https://raw.githubusercontent.com/siammridha/simple_kvm/main/deploy/install.sh | sh
 ```
 
-This downloads the latest release binary and sets it up as an OpenRC
-service (`simple_kvm`) that starts on boot and is already running once the
-script finishes.
+This first checks the device has what the binary needs to run - root, an
+x86_64 CPU, Alpine's `apk`, a GPU render device at `/dev/dri/renderD*`, and
+the VAAPI runtime + Intel `i965` driver (`libva`/`libva-intel-driver`,
+installing them from Alpine's `community` repo if missing) - since the
+H.264 encoder needs the GPU and has no CPU fallback: if VAAPI setup fails,
+the binary refuses to start rather than silently falling back to software
+encoding. It also reports (without blocking on) whether the capture card
+and CH9329 are currently plugged in, since both are hot-pluggable and the
+app runs fine without either attached yet. Once the checks pass, it
+downloads the latest release binary and sets it up as an OpenRC service
+(`simple_kvm`) that starts on boot and is already running once the script
+finishes.
 
 Check it's running:
 
