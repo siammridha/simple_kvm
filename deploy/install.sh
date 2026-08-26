@@ -10,13 +10,9 @@ set -eu
 
 REPO="siammridha/simple_kvm"
 
-# Colors only when writing to an actual terminal - a plain `wget | sh` still
-# goes straight to one, but this keeps output clean if it's ever redirected.
-if [ -t 1 ]; then
-	GREEN='\033[32m'; YELLOW='\033[33m'; RED='\033[31m'; RESET='\033[0m'
-else
-	GREEN=''; YELLOW=''; RED=''; RESET=''
-fi
+# Printed unconditionally (no terminal check) - same as the colored startup
+# banner src/main.rs prints (log_startup_banner), which also doesn't check.
+GREEN='\033[32m'; YELLOW='\033[33m'; RED='\033[31m'; RESET='\033[0m'
 
 ok()   { printf '  %b[ok]%b   %s\n' "$GREEN" "$RESET" "$1"; }
 warn() { printf '  %b[warn]%b %s\n' "$YELLOW" "$RESET" "$1"; }
