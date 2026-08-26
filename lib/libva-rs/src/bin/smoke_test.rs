@@ -7,7 +7,7 @@
 //! `Surface::display()` (the public accessor added as one of this crate's two deliberate
 //! deviations from cros-libva).
 
-use simple_kvm_vaapi::{
+use libva_rs::{
     self as va, Display, UsageHint, VAConfigAttrib, VAConfigAttribType, VAEntrypoint, VAProfile,
     VA_RT_FORMAT_YUV420,
 };
@@ -16,7 +16,7 @@ const WIDTH: u32 = 64;
 const HEIGHT: u32 = 64;
 
 fn main() {
-    println!("== simple-kvm-vaapi smoke test ==");
+    println!("== libva-rs smoke test ==");
 
     let display = Display::open().expect("Display::open() failed: no usable DRM/VAAPI device");
     println!("Display::open() succeeded");

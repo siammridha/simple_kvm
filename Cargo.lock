@@ -1264,6 +1264,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "libva-rs"
+version = "0.1.0"
+dependencies = [
+ "bindgen 0.70.1",
+ "bitflags 2.13.1",
+ "log",
+ "pkg-config",
+ "regex",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2411,18 +2423,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
-name = "simple-kvm-vaapi"
-version = "0.1.0"
-dependencies = [
- "bindgen 0.70.1",
- "bitflags 2.13.1",
- "log",
- "pkg-config",
- "regex",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "simple_kvm"
 version = "0.1.22"
 dependencies = [
@@ -2431,11 +2431,11 @@ dependencies = [
  "axum",
  "bytes",
  "libc",
+ "libva-rs",
  "rtc",
  "serde",
  "serde_json",
  "serialport",
- "simple-kvm-vaapi",
  "tokio",
  "tracing",
  "tracing-subscriber",

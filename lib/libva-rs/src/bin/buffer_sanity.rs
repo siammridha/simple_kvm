@@ -7,7 +7,7 @@
 //! extra effort) actually drives each one through `Context::create_buffer` against the real
 //! driver, for both an H.264 encode context and a VPP context.
 
-use simple_kvm_vaapi::{
+use libva_rs::{
     self as va, BufferType, Display, EncMiscParameter, EncMiscParameterFrameRate,
     EncMiscParameterRateControl, EncPictureParameterBufferH264, EncSequenceParameterBufferH264,
     EncSliceParameterBufferH264, H264EncPicFields, H264EncSeqFields, PictureH264,
@@ -19,7 +19,7 @@ const WIDTH: u32 = 64;
 const HEIGHT: u32 = 64;
 
 fn main() {
-    println!("== simple-kvm-vaapi buffer sanity check ==");
+    println!("== libva-rs buffer sanity check ==");
 
     // --- 1. Construct every new wrapper type in isolation, with placeholder values. ---
     // This part never touches the driver, so it runs even without a usable device.

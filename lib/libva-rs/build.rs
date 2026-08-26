@@ -1,6 +1,6 @@
 // Ported from cros-libva's lib/build.rs. Deviations from the original:
-//   - The `CROS_LIBVA_*` env vars are renamed to `SIMPLE_KVM_VAAPI_*` to
-//     match this crate's name.
+//   - The `CROS_LIBVA_*` env vars are renamed to `LIBVA_RS_*` to match this
+//     crate's name.
 //   - All protected-content header handling (env var + Cargo feature) is
 //     dropped; protected content is out of scope for this crate.
 
@@ -15,8 +15,8 @@ use bindgen_gen::vaapi_gen_builder;
 
 /// Environment variable that can be set to point to the directory containing the `va.h`,
 /// `va_drm.h` and `va_drmcommon.h` files to use to generate the bindings.
-const SIMPLE_KVM_VAAPI_H_PATH_ENV: &str = "SIMPLE_KVM_VAAPI_H_PATH";
-const SIMPLE_KVM_VAAPI_LIB_PATH_ENV: &str = "SIMPLE_KVM_VAAPI_LIB_PATH";
+const LIBVA_RS_H_PATH_ENV: &str = "LIBVA_RS_H_PATH";
+const LIBVA_RS_LIB_PATH_ENV: &str = "LIBVA_RS_LIB_PATH";
 
 /// Wrapper file to use as input of bindgen.
 const WRAPPER_PATH: &str = "libva-wrapper.h";
@@ -67,7 +67,7 @@ fn main() {
         return;
     }
 
-    let va_h_path = env::var(SIMPLE_KVM_VAAPI_H_PATH_ENV)
+    let va_h_path = env::var(LIBVA_RS_H_PATH_ENV)
         .or_else(|e| {
             if let VarError::NotPresent = e {
                 let libva_library = pkg_config::probe_library("libva");
@@ -85,7 +85,7 @@ fn main() {
         })
         .expect("libva header location is unknown");
 
-    let va_lib_path = env::var(SIMPLE_KVM_VAAPI_LIB_PATH_ENV).unwrap_or_default();
+    let va_lib_path = env::var(LIBVA_RS_LIB_PATH_ENV).unwrap_or_default();
     // Check the path exists.
     if !va_h_path.is_empty() {
         assert!(

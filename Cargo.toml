@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/simple-kvm-vaapi"]
+members = ["lib/libva-rs"]
 
 [package]
 name = "simple_kvm"
@@ -16,7 +16,7 @@ rtc = "0.20.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serialport = "4.9.0"
-simple-kvm-vaapi = { path = "crates/simple-kvm-vaapi" }
+libva-rs = { path = "lib/libva-rs" }
 tokio = { version = "1.53.1", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

@@ -27,7 +27,7 @@ use std::rc::Rc;
 
 use anyhow::Context as _;
 use anyhow::Result;
-use simple_kvm_vaapi::{
+use libva_rs::{
     BorrowedBufferType, BufferType, Context, Display, EncMiscParameter,
     EncMiscParameterFrameRate, EncMiscParameterRateControl, EncPackedHeaderParameter,
     EncPackedHeaderType, EncPictureParameterBufferH264, EncSequenceParameterBufferH264,
@@ -138,7 +138,7 @@ pub struct H264Encoder {
     enc_context: GpuH264EncodeContext,
     vpp_context: GpuColorConverter,
     yuyv_surface: Surface,
-    yuyv_image_format: simple_kvm_vaapi::VAImageFormat,
+    yuyv_image_format: libva_rs::VAImageFormat,
     /// A 2-surface NV12 reference pool: `num_ref_frames = 1` is enough with
     /// no B-frames, so ping-ponging between two surfaces guarantees the
     /// frame currently being encoded and the previous reconstructed

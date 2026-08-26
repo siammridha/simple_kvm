@@ -5,7 +5,7 @@ FROM mcr.microsoft.com/devcontainers/base:alpine
 # OpenSSL headers commonly needed by Rust crates. clang-dev + linux-headers
 # are for the `v4l` crate's bindgen-based sys crate; nasm speeds up the
 # `openh264` software encoder, which matters on the target's weak CPU.
-# libva-dev is for the `simple-kvm-vaapi` crate's bindgen-based build script
+# libva-dev is for the `libva-rs` crate's bindgen-based build script
 # and for linking against libva.
 RUN apk add --no-cache build-base pkgconf openssl-dev clang-dev linux-headers nasm libva-dev
 
