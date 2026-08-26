@@ -36,6 +36,7 @@ fn get_va_version(va_h_path: &str) -> (u32, u32) {
         r"#define VA_MAJOR_VERSION\s*[0-9]+",
         r"#define VA_MINOR_VERSION\s*[0-9]+",
     ];
+    let digit_re = Regex::new(r"[0-9]+").unwrap();
     let mut numbers: [u32; 2] = [0; 2];
     for i in 0..2 {
         let re = Regex::new(VERSION_REGEX_STRINGS[i]).unwrap();
@@ -50,11 +51,7 @@ fn get_va_version(va_h_path: &str) -> (u32, u32) {
             VERSION_REGEX_STRINGS[i],
             match_line
         );
-        let number_str = Regex::new(r"[0-9]+")
-            .unwrap()
-            .find(match_line[0])
-            .unwrap()
-            .as_str();
+        let number_str = digit_re.find(match_line[0]).unwrap().as_str();
         numbers[i] = number_str.parse::<u32>().unwrap();
     }
 
@@ -101,6 +98,11 @@ fn main() {
         major > desired_major || (major == desired_major && minor >= desired_minor)
     };
 
+    println!("cargo::rustc-check-cfg=cfg(libva_1_21_or_higher)");
+    println!("cargo::rustc-check-cfg=cfg(libva_1_20_or_higher)");
+    println!("cargo::rustc-check-cfg=cfg(libva_1_19_or_higher)");
+    println!("cargo::rustc-check-cfg=cfg(libva_1_16_or_higher)");
+
     if va_check_version(1, 21) {
         println!("cargo::rustc-cfg=libva_1_21_or_higher");
     }
@@ -120,6 +122,7 @@ fn main() {
             "{} doesn't exist",
             va_lib_path
         );
+        println!("cargo:rustc-link-search=native={}", va_lib_path);
         println!("cargo:rustc-link-arg=-Wl,-rpath={}", va_lib_path);
     }
 

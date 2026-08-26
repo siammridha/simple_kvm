@@ -53,14 +53,12 @@ ip>:3000` with:
   the card itself reported.
 - **Bitrate dropdown**, a fixed set of steps from 500 Kbps up to 5 Mbps.
   Unlike the resolution/frame rate dropdowns, this isn't queried from
-  hardware. Only 2 Mbps is validated as clean - the GPU H.264 encoder on
-  this device is known to corrupt P-frame output above roughly 2.5-3 Mbps
-  (see `docs/gpu-encoding-investigation.md`), so anything past 2.5 Mbps is
-  offered for testing how far past that known-good range this hardware
-  actually holds up, not as a recommended setting. The server enforces a
-  hard 5 Mbps ceiling itself (clamping anything higher) regardless of what
-  the dropdown offers, since the settings message could in principle be
-  hand-crafted with any value.
+  hardware. The full range has been confirmed clean in manual testing -
+  5 Mbps at both 1080p@10fps and 720p@25fps - see
+  `docs/gpu-encoding-investigation.md`. The server enforces a hard 5 Mbps
+  ceiling itself (clamping anything higher) regardless of what the dropdown
+  offers, since the settings message could in principle be hand-crafted
+  with any value.
 - **Mouse movement, clicks, and scroll wheel**, absolute or relative mode,
   switched via **Save settings**. Absolute mode positions the cursor
   exactly where you point in the video; on the CH9329 hardware this repo
@@ -167,9 +165,9 @@ for why this replaced an earlier WebTransport-based design.
 
 Building needs a few extra Alpine packages beyond a bare Rust toolchain:
 `clang-dev` and `linux-headers` (the `v4l` crate generates V4L2 bindings
-with `bindgen` at build time) and `nasm` (speeds up the `openh264`
-encoder, which matters on this CPU). Both the devcontainer and the release
-workflow already install these.
+with `bindgen` at build time) and `libva-dev` (the GPU H.264 encoder's
+`bindgen`-based build script, and linking against libva). Both the
+devcontainer and the release workflow already install these.
 
 **Fast local iteration, without a tag/release for every change:** the
 devcontainer can cross-compile a debug binary directly, for testing

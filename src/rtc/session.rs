@@ -148,10 +148,10 @@ pub async fn handle(
                 }
             }
             event = video_track.poll(), if video_target.is_ok() => {
-                if let Some(TrackLocalEvent::OnRtcpPacket(packets)) = event {
-                    if packets.iter().any(is_keyframe_request) {
-                        ctx.force_keyframe.store(true, Ordering::Relaxed);
-                    }
+                if let Some(TrackLocalEvent::OnRtcpPacket(packets)) = event
+                    && packets.iter().any(|p| is_keyframe_request(p.as_ref()))
+                {
+                    ctx.force_keyframe.store(true, Ordering::Relaxed);
                 }
             }
             event = input.poll(), if input_active => {
@@ -317,7 +317,7 @@ async fn send_frame(data: &Arc<[u8]>, duration: Duration, video_track: &TrackLoc
 /// (PLI or FIR) — the browser sends these automatically when its decoder
 /// can't make progress without a fresh keyframe (see `handle`'s
 /// `video_track.poll()` branch).
-fn is_keyframe_request(packet: &Box<dyn Packet>) -> bool {
+fn is_keyframe_request(packet: &dyn Packet) -> bool {
     packet.as_any().downcast_ref::<PictureLossIndication>().is_some() || packet.as_any().downcast_ref::<FullIntraRequest>().is_some()
 }
 
@@ -362,9 +362,9 @@ fn handle_control_message(msg: ControlMessage, ctx: &SessionContext) {
             let had_update = capture.is_some() || mouse_mode.is_some();
             if let Some(capture) = capture {
                 // Clamped here, not just in the UI dropdown - a hand-crafted
-                // control message could ask for any value, and this
-                // device's GPU encoder corrupts P-frame output above
-                // `MAX_SAFE_BITRATE_BPS` (see `capture::h264`).
+                // control message could ask for any value, and
+                // `MAX_SAFE_BITRATE_BPS` (see `capture::h264`) is the
+                // confirmed-clean ceiling.
                 let bitrate = capture.bitrate.min(crate::capture::h264::MAX_SAFE_BITRATE_BPS);
                 ctx.capture_settings_tx.send_modify(|s| {
                     s.resolution = Resolution { width: capture.width, height: capture.height };

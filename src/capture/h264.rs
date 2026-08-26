@@ -58,20 +58,17 @@ const PROFILE_COMPATIBILITY: u8 = 0xE0;
 const INTRA_FRAME_PERIOD: u64 = 60;
 
 /// Default/fallback bitrate, used when no persisted setting exists yet (see
-/// `main.rs`) and by `CaptureManager::default_settings`. 2 Mbps is the value
-/// validated throughout the investigation doc, including a live end-to-end
-/// capture test - stay safely under `MAX_SAFE_BITRATE_BPS` below.
+/// `main.rs`) and by `CaptureManager::default_settings`. 2 Mbps has been
+/// validated with a live end-to-end capture test; see `MAX_SAFE_BITRATE_BPS`
+/// below for the confirmed upper bound.
 pub const DEFAULT_BITRATE_BPS: u32 = 2_000_000;
 
 /// Hard ceiling for any user-supplied bitrate (the web UI's dropdown, or a
 /// hand-crafted control message) - clamped to this value server-side before
 /// it's ever applied, see `rtc::session::handle_control_message`.
 ///
-/// Encoding corrupts above roughly 2.5-3 Mbps in prior testing (see
-/// docs/gpu-encoding-investigation.md) - only 2 Mbps was validated as
-/// clean. This ceiling is set higher, at 5 Mbps, so the dropdown's upper
-/// options can be used to test how far past that known-good range this
-/// hardware actually holds up.
+/// Confirmed clean in manual testing at 5 Mbps (1080p@10fps and
+/// 720p@25fps) - see docs/gpu-encoding-investigation.md.
 pub const MAX_SAFE_BITRATE_BPS: u32 = 5_000_000;
 
 /// `log2_max_frame_num_minus4` / `log2_max_pic_order_cnt_lsb_minus4` are
@@ -210,13 +207,11 @@ impl H264Encoder {
         // Without explicitly negotiating CBR here, the driver defaults to
         // constant-QP and silently ignores `EncMiscParameterRateControl`'s
         // bitrate target entirely - confirmed on-device: encoded output
-        // measured ~12.6 Mbps (vs. the 2 Mbps target) before this was added,
-        // well past the ~2.5-3 Mbps hardware corruption ceiling documented
-        // in docs/gpu-encoding-investigation.md.
+        // measured ~12.6 Mbps (vs. the 2 Mbps target) before this was added.
         anyhow::ensure!(
             enc_attrs[2].value & VA_RC_CBR != 0,
-            "driver does not support CBR rate control (reports {:#x}) - required to stay under \
-             this hardware's P-frame bitrate ceiling, see docs/gpu-encoding-investigation.md",
+            "driver does not support CBR rate control (reports {:#x}) - required for the \
+             configured bitrate to actually be honored, see docs/gpu-encoding-investigation.md",
             enc_attrs[2].value
         );
 

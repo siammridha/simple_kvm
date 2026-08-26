@@ -19,12 +19,6 @@ pub mod modifier {
     pub const RIGHT_GUI: u8 = 1 << 7;
 }
 
-pub mod button {
-    pub const LEFT: u8 = 1 << 0;
-    pub const RIGHT: u8 = 1 << 1;
-    pub const MIDDLE: u8 = 1 << 2;
-}
-
 /// Frames a command: `0x57 0xAB | addr | cmd | len | data | checksum`.
 /// Checksum is the sum of every preceding byte, mod 256.
 fn assemble(cmd: u8, data: &[u8]) -> Vec<u8> {
@@ -119,11 +113,11 @@ mod tests {
 
     #[test]
     fn mouse_absolute_scales_and_frames_correctly() {
-        let packet = mouse_absolute(button::LEFT, 0.5, 1.0, -1);
+        let packet = mouse_absolute(0x01, 0.5, 1.0, -1);
         assert_eq!(packet.len(), 13);
         assert_eq!(&packet[0..5], &[0x57, 0xAB, 0x00, 0x04, 0x07]);
         // x = 0.5 * 4096 = 2048 = 0x0800 (LE: 00 08); y = 1.0 * 4096 = 4096 = 0x1000 (LE: 00 10)
-        assert_eq!(&packet[5..12], &[0x02, button::LEFT, 0x00, 0x08, 0x00, 0x10, 0xFF]);
+        assert_eq!(&packet[5..12], &[0x02, 0x01, 0x00, 0x08, 0x00, 0x10, 0xFF]);
         assert_eq!(*packet.last().unwrap(), naive_checksum(&packet[..packet.len() - 1]));
     }
 
@@ -137,10 +131,10 @@ mod tests {
 
     #[test]
     fn mouse_relative_frames_signed_deltas() {
-        let packet = mouse_relative(button::RIGHT, -5, 10, 3);
+        let packet = mouse_relative(0x02, -5, 10, 3);
         assert_eq!(packet.len(), 11);
         assert_eq!(&packet[0..5], &[0x57, 0xAB, 0x00, 0x05, 0x05]);
-        assert_eq!(&packet[5..10], &[0x01, button::RIGHT, 0xFB, 10, 3]);
+        assert_eq!(&packet[5..10], &[0x01, 0x02, 0xFB, 10, 3]);
         assert_eq!(*packet.last().unwrap(), naive_checksum(&packet[..packet.len() - 1]));
     }
 }

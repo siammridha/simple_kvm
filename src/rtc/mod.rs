@@ -243,8 +243,6 @@ async fn negotiate(offer_sdp: String, channels: SharedChannels) -> Result<String
 }
 
 fn rand_u32() -> u32 {
-    use std::hash::{BuildHasher, Hash, Hasher};
-    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-    std::time::Instant::now().hash(&mut hasher);
-    hasher.finish() as u32
+    use std::hash::BuildHasher;
+    std::collections::hash_map::RandomState::new().hash_one(std::time::Instant::now()) as u32
 }
