@@ -275,7 +275,7 @@ fn run_one_pass(device_path: &str, format: &Option<SupportedFormat>, settings: &
     // than what was requested) — sizing the H.264 conversion buffers from
     // anything else risks reading past the end of a real frame.
     let result = v4l2::run_capture_loop(device_path, settings.resolution, settings.fps, || stop.load(Ordering::Relaxed), move |actual_resolution| {
-        let mut h264_encoder = match h264::H264Encoder::new(actual_resolution.width, actual_resolution.height) {
+        let mut h264_encoder = match h264::H264Encoder::new(actual_resolution.width, actual_resolution.height, h264::DEFAULT_BITRATE_BPS) {
             Ok(encoder) => Some(encoder),
             Err(err) => {
                 tracing::error!(%err, "failed to create H.264 encoder, dropping frames in this pass");

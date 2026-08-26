@@ -1,0 +1,16 @@
+[package]
+name = "simple-kvm-vaapi"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+description = "Minimal safe bindings over libva (core plumbing only, ported from cros-libva)"
+
+[dependencies]
+thiserror = "1"
+bitflags = "2.5"
+log = { version = "0", features = ["release_max_level_debug"] }
+
+[build-dependencies]
+bindgen = "0.70.1"
+pkg-config = "0.3.31"
+regex = "1.11.1"

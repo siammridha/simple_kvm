@@ -1,3 +1,6 @@
+[workspace]
+members = ["crates/simple-kvm-vaapi"]
+
 [package]
 name = "simple_kvm"
 version = "0.1.22"
@@ -9,11 +12,11 @@ async-trait = "0.1.89"
 axum = "0.8.9"
 bytes = "1.12.0"
 libc = "0.2.169"
-openh264 = "0.9.8"
 rtc = "0.20.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serialport = "4.9.0"
+simple-kvm-vaapi = { path = "crates/simple-kvm-vaapi" }
 tokio = { version = "1.53.1", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
