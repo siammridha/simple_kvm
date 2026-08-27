@@ -1,3 +1,5 @@
+pub mod driver;
+pub mod engine;
 pub mod h264;
 pub mod v4l2;
 
@@ -281,7 +283,10 @@ async fn wait_for_uevent(uevents: &mut Option<uevent::UeventListener>) {
     }
 }
 
-fn run_one_pass(device_path: &str, format: &Option<SupportedFormat>, settings: &CaptureSettings, stop: Arc<AtomicBool>, video_bus: video_bus::Sender, force_keyframe: Arc<AtomicBool>) {
+/// `pub(crate)` (rather than private) so `capture::engine`'s `CaptureEngine`
+/// can reuse this exact function for its own encode pass - see issue #004,
+/// which is required to reuse this machinery rather than reinvent it.
+pub(crate) fn run_one_pass(device_path: &str, format: &Option<SupportedFormat>, settings: &CaptureSettings, stop: Arc<AtomicBool>, video_bus: video_bus::Sender, force_keyframe: Arc<AtomicBool>) {
     if format.is_none() {
         tracing::error!("capture device doesn't support YUYV capture, no video this pass");
         return;
