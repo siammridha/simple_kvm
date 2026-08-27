@@ -1,8 +1,7 @@
 //! Shared, live-mutable settings — changed by a dropdown on the page,
 //! read by the capture task and the WebRTC session layer via
 //! `tokio::sync::watch`, so a change never has to touch the connection
-//! itself. Also the on-disk shape used by `settings_store` to persist the
-//! current choices across a service restart.
+//! itself. In-memory only: nothing here is ever persisted to disk.
 
 use serde::{Deserialize, Serialize};
 
@@ -46,12 +45,4 @@ pub struct ResolutionFrameRates {
 pub enum MouseMode {
     Absolute,
     Relative,
-}
-
-/// The full set of user-adjustable settings, as written to and read from
-/// the settings file.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct PersistedSettings {
-    pub capture: CaptureSettings,
-    pub mouse_mode: MouseMode,
 }

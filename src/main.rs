@@ -2,13 +2,11 @@ mod capture;
 mod ch9329;
 mod config;
 mod rtc;
-mod settings_store;
 mod uevent;
 mod video_bus;
 mod web;
 
 use std::env;
-use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,7 +30,6 @@ async fn main() -> Result<()> {
     let serial_path = env::var("SERIAL_PATH").unwrap_or_else(|_| "/dev/ttyUSB0".to_string());
     let video_path = env::var("VIDEO_PATH").unwrap_or_else(|_| "/dev/video0".to_string());
     let http_port: u16 = env_parsed("HTTP_PORT").unwrap_or(3000);
-    let settings_path = PathBuf::from(env::var("SETTINGS_PATH").unwrap_or_else(|_| "/etc/simple_kvm-settings.json".to_string()));
     let serial_open_delay_secs: u64 = env_parsed("SERIAL_OPEN_DELAY_SECS").unwrap_or(30);
 
     // --- Capture: probing never fails — an absent card just means video
@@ -40,17 +37,14 @@ async fn main() -> Result<()> {
     // server still starts and the page still loads. ---
     let capture_manager = CaptureManager::probe(&video_path);
 
-    // A settings file from a previous run wins over the capture card's own
-    // default, but only if the card on hand can actually still run it —
-    // it may have changed since the setting was saved.
-    let persisted = settings_store::load(&settings_path);
-    let persisted_capture = persisted.filter(|p| capture_manager.supports(p.capture.resolution)).map(|p| p.capture);
-    let default_capture_settings =
-        persisted_capture.or_else(|| capture_manager.default_settings()).unwrap_or(CaptureSettings {
-            resolution: Resolution { width: 1280, height: 720 },
-            fps: 5,
-        });
-    let default_mouse_mode = persisted.map(|p| p.mouse_mode).unwrap_or(MouseMode::Absolute);
+    // Settings are in-memory only - every start uses the capture card's own
+    // probed default, falling back to a fixed value if there's no card to
+    // probe. Nothing here is ever read from or written to disk.
+    let default_capture_settings = capture_manager.default_settings().unwrap_or(CaptureSettings {
+        resolution: Resolution { width: 1280, height: 720 },
+        fps: 5,
+    });
+    let default_mouse_mode = MouseMode::Absolute;
 
     let (device_state_tx, device_state_rx) = watch::channel(capture_manager.device_state(&default_capture_settings));
     let (capture_settings_tx, capture_settings_rx) = watch::channel(default_capture_settings);
@@ -73,7 +67,6 @@ async fn main() -> Result<()> {
         mouse_mode_tx,
         device_state_rx,
         hid_connected_rx,
-        settings_path,
         force_keyframe: force_keyframe.clone(),
         client_count_tx,
     };

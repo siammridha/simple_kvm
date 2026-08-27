@@ -116,17 +116,17 @@ net in case that listener can't be opened; the CH9329 side has no such
 fallback, so if its listener fails to open, its reconnects are only
 noticed on the next real keystroke or click instead of immediately.
 
-**Dropdown changes only take effect when you click Save settings.**
-Changing frame rate, resolution, or mouse mode does nothing on its own -
-picking a new value just moves the dropdown. Clicking **Save
-settings** sends one message over the WebRTC control channel that both
-applies the new settings live and writes them to the settings file on
-disk, together, in one step. If you reload the page (or open a second
-tab) without saving, the dropdowns show whatever the server is actually
-using right now, not your unsaved picks - and if the service restarts
-(e.g. after a reboot) without a save having happened first, it comes back
-up with whatever was last saved, or the capture card's own defaults if
-nothing ever was.
+**Dropdown changes only take effect when you click Save settings, and
+nothing is ever saved to disk.** Changing frame rate, resolution, or
+mouse mode does nothing on its own - picking a new value just moves the
+dropdown. Clicking **Save settings** sends one message over the WebRTC
+control channel that applies the new settings live, in memory, for the
+life of the running service - there is no settings file. If you reload
+the page (or open a second tab) without saving, the dropdowns show
+whatever the server is actually using right now, not your unsaved picks -
+and every service restart (e.g. after a reboot) always comes back up with
+the capture card's own defaults, regardless of anything saved before the
+restart.
 
 Save only includes the settings for hardware that's actually connected:
 resolution/frame rate are sent only if the capture card is
@@ -264,7 +264,6 @@ if you need to change one):
 | `SERIAL_OPEN_DELAY_SECS` | `30` | How long to wait before opening the CH9329 serial port, for the same reason as the capture card's boot delay below — set to `0` to disable. |
 | `VIDEO_PATH` | `/dev/video0` | Capture card device |
 | `HTTP_PORT` | `3000` | Port for the page and WebRTC signaling (`POST /rtc/offer`) |
-| `SETTINGS_PATH` | `/etc/simple_kvm-settings.json` | Where frame rate/resolution/mouse mode are written when you click **Save settings** on the page, and read back on the next startup. |
 | `RUST_LOG` | `info,simple_kvm::rtc::session=debug,simple_kvm::ch9329::writer=debug` | Standard `tracing` log filter. By default, every keystroke/click is already logged at `debug` - no configuration needed first - since each log line includes how long that event took to queue/write, which is useful for tracking down input lag. A command that takes more than 50ms logs at `warn` regardless. Setting `RUST_LOG` yourself (e.g. `RUST_LOG=debug` for everything, or `RUST_LOG=warn` to quiet the per-keystroke lines) fully overrides the default above. |
 
 Each browser tab's video/input connection (WebRTC) picks its own UDP port
