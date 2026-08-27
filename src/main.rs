@@ -21,7 +21,7 @@ use tracing_subscriber::EnvFilter;
 use capture::v4l2::Resolution;
 use capture::CaptureManager;
 use ch9329::writer::{self, SerialCommand};
-use config::{CaptureSettings, MouseMode};
+use config::{CaptureSettings, DeviceState, MouseMode};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -35,24 +35,19 @@ async fn main() -> Result<()> {
     let settings_path = PathBuf::from(env::var("SETTINGS_PATH").unwrap_or_else(|_| "/etc/simple_kvm-settings.json".to_string()));
     let serial_open_delay_secs: u64 = env_parsed("SERIAL_OPEN_DELAY_SECS").unwrap_or(30);
 
-    // --- Capture: probing never fails — an absent card just means video
-    // stays unavailable (soft "no device" state), so the rest of the
-    // server still starts and the page still loads. ---
-    let capture_manager = CaptureManager::probe(&video_path);
-
-    // A settings file from a previous run wins over the capture card's own
-    // default, but only if the card on hand can actually still run it —
-    // it may have changed since the setting was saved.
+    // --- Capture: the card is never opened automatically right here at
+    // startup (see `CaptureManager::run` for exactly when it is). Opening
+    // it unprompted has reliably crashed the real hardware this targets
+    // right at boot (see README's "boot-crash" known issue). A settings
+    // file from a previous run is trusted blindly until the first real
+    // probe corrects the UI - there's no card on hand yet to validate it
+    // against. ---
+    let capture_manager = CaptureManager::new(&video_path);
     let persisted = settings_store::load(&settings_path);
-    let persisted_capture = persisted.filter(|p| capture_manager.supports(p.capture.resolution)).map(|p| p.capture);
-    let default_capture_settings =
-        persisted_capture.or_else(|| capture_manager.default_settings()).unwrap_or(CaptureSettings {
-            resolution: Resolution { width: 1280, height: 720 },
-            fps: 5,
-        });
+    let default_capture_settings = persisted.map(|p| p.capture).unwrap_or(CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5 });
     let default_mouse_mode = persisted.map(|p| p.mouse_mode).unwrap_or(MouseMode::Absolute);
 
-    let (device_state_tx, device_state_rx) = watch::channel(capture_manager.device_state(&default_capture_settings));
+    let (device_state_tx, device_state_rx) = watch::channel(DeviceState::default());
     let (capture_settings_tx, capture_settings_rx) = watch::channel(default_capture_settings);
     let (mouse_mode_tx, _mouse_mode_rx) = watch::channel(default_mouse_mode);
     let (video_bus_tx, video_bus_rx) = video_bus::channel();

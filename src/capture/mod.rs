@@ -14,72 +14,48 @@ use crate::uevent;
 use crate::video_bus::{self, FrameEnvelope};
 use v4l2::SupportedFormat;
 
-/// Backoff delay used when retrying after a capture-device enumeration
-/// error or an unexpected end to a capture pass, so a persistent error
-/// doesn't turn into a busy loop. Device reconnects are detected purely via
-/// kernel uevents (see `capture::uevent`), not by polling.
+/// Backoff delay after a capture pass ends unexpectedly (most likely the
+/// card was unplugged mid-capture), so a persistent non-unplug error (e.g.
+/// a permissions problem) doesn't turn into a busy loop. Device reconnects
+/// are detected purely via kernel uevents (see `capture::uevent`), not by
+/// polling.
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(2);
-
-/// Preferred fps for `CaptureManager::default_settings()` — picked from
-/// whatever the card actually supports at its default resolution rather
-/// than assumed, since fps support varies by resolution on real hardware
-/// (confirmed via `v4l2-ctl --list-formats-ext` on the real device).
-const DEFAULT_TARGET_FPS: u32 = 10;
 
 pub struct CaptureManager {
     device_path: String,
-    format: Option<SupportedFormat>,
 }
 
 impl CaptureManager {
-    /// Probes `device_path` for its supported YUYV resolutions/frame rates,
-    /// once, for the startup snapshot (`device_state`/`default_settings`/etc.
-    /// below — used to build the page's initial state). Never fails - if
-    /// there's no capture device (e.g. in the devcontainer) or it doesn't
-    /// support YUYV, `format` is just `None`. `run` below does its own live
-    /// presence checking and doesn't depend on this snapshot staying
-    /// accurate.
-    pub fn probe(device_path: &str) -> Self {
-        let format = v4l2::enumerate(device_path).unwrap_or_else(|err| {
-            tracing::warn!(%err, device_path, "no capture device found, video will be unavailable");
-            None
-        });
-        Self { device_path: device_path.to_string(), format }
+    /// Just records the path - no ioctls, no opening the device. The card
+    /// is never probed or opened except at the two moments `run` below
+    /// gates on: the device becoming newly present (probe, once, to learn
+    /// capabilities for the settings UI - see `run`'s doc comment for
+    /// exactly when this does and doesn't fire) and a session's WebRTC
+    /// connection reaching `connected` (actually start streaming, via
+    /// `client_count`). Opening the device automatically - at startup or
+    /// otherwise unprompted - has reliably crashed the real hardware this
+    /// targets (see README's "boot-crash" known issue), so nothing here
+    /// ever does that on its own.
+    pub fn new(device_path: &str) -> Self {
+        Self { device_path: device_path.to_string() }
     }
 
-    pub fn default_settings(&self) -> Option<CaptureSettings> {
-        let resolution = v4l2::pick_default(self.format.as_ref())?;
-        let fps = self
-            .format
-            .as_ref()
-            .and_then(|f| f.frame_rates.get(&resolution))
-            .and_then(|rates| rates.iter().copied().filter(|&r| r <= DEFAULT_TARGET_FPS).max().or_else(|| rates.iter().copied().min()))
-            .unwrap_or(DEFAULT_TARGET_FPS);
-        Some(CaptureSettings { resolution, fps })
-    }
-
-    /// The card's current availability and resolution list for the startup
-    /// snapshot used to seed the `DeviceState` watch channel. `run`'s
-    /// hot-plug loop recomputes the same thing live via the free function
-    /// `device_state_for` below.
-    pub fn device_state(&self, settings: &CaptureSettings) -> DeviceState {
-        device_state_for(&self.format, settings)
-    }
-
-    /// Whether the card can actually capture at `resolution`. Used to
-    /// validate a persisted setting before trusting it as the startup
-    /// default — the card on hand may have changed since the setting was
-    /// saved.
-    pub fn supports(&self, resolution: v4l2::Resolution) -> bool {
-        self.format.as_ref().is_some_and(|f| f.resolutions.contains(&resolution))
-    }
-
-    /// Runs forever: whenever the capture card is present and at least one
-    /// WebRTC client is connected, restarts the capture loop whenever
-    /// `settings` changes and publishes frames onto `video_bus`; pauses
-    /// (without restarting) while the client count is zero; whenever the
-    /// device is absent (never plugged in, or unplugged mid-session), polls
-    /// until it reappears instead of exiting for good.
+    /// Runs forever. The capture device is only ever probed for its
+    /// capabilities when it transitions from absent to present - a genuine
+    /// replug, or simply being plugged in for the first time after having
+    /// started absent - and the result is cached in `format` in memory for
+    /// as long as it stays present, so a browser connecting later just
+    /// reads the cached `DeviceState` instead of triggering a fresh probe.
+    /// The one exception is the very first time this loop ever checks and
+    /// finds the device already present (e.g. it was plugged in before the
+    /// service started) - that's the boot-crash-risk moment (right after
+    /// USB enumeration finishes at startup), so that specific transition is
+    /// never auto-probed.
+    ///
+    /// Actual streaming (`run_one_pass`) only starts once `client_count` is
+    /// nonzero - which only happens once a session's WebRTC connection is
+    /// fully stable (`connected`), not merely negotiated - and stops as
+    /// soon as it drops back to zero.
     pub async fn run(
         self,
         mut settings: watch::Receiver<CaptureSettings>,
@@ -89,7 +65,9 @@ impl CaptureManager {
         mut client_count: watch::Receiver<u32>,
     ) {
         let device_path = self.device_path;
+        let mut format: Option<SupportedFormat> = None;
         let mut known_present = false;
+        let mut first_check = true;
         let mut uevents = match uevent::UeventListener::open() {
             Ok(listener) => Some(listener),
             Err(err) => {
@@ -99,10 +77,15 @@ impl CaptureManager {
         };
 
         loop {
-            if !Path::new(&device_path).exists() {
+            let device_present = Path::new(&device_path).exists();
+            let skip_probe_this_transition = first_check && device_present;
+            first_check = false;
+
+            if !device_present {
                 if known_present {
                     tracing::warn!(device_path = %device_path, "capture device disconnected, pausing video until it reconnects");
                     known_present = false;
+                    format = None;
                     let _ = device_state_tx.send(DeviceState::default());
                 }
                 if wait_for_device_or_shutdown(&device_path, &mut settings, &mut uevents).await.is_err() {
@@ -111,32 +94,17 @@ impl CaptureManager {
                 continue;
             }
 
-            let format = match v4l2::enumerate(&device_path) {
-                Ok(format) => format,
-                Err(err) => {
-                    tracing::error!(%err, device_path = %device_path, "failed to enumerate capture device, will retry");
-                    tokio::time::sleep(DEVICE_POLL_INTERVAL).await;
-                    continue;
-                }
-            };
             if !known_present {
-                tracing::info!(device_path = %device_path, "capture device connected");
                 known_present = true;
-            }
-
-            let current = *settings.borrow();
-            let new_state = device_state_for(&format, &current);
-            device_state_tx.send_if_modified(|s| {
-                if *s == new_state {
-                    false
-                } else {
-                    *s = new_state;
-                    true
+                tracing::info!(device_path = %device_path, "capture device connected");
+                if !skip_probe_this_transition {
+                    format = probe(&device_path);
                 }
-            });
+            }
+            publish_device_state(&device_state_tx, &format, &settings.borrow());
 
             if *client_count.borrow() == 0 {
-                if wait_for_client_or_shutdown(&mut client_count, &mut settings).await.is_err() {
+                if wait_for_client_or_shutdown(&mut client_count, &mut settings, &format, &device_state_tx, &mut uevents).await.is_err() {
                     break;
                 }
                 continue;
@@ -147,9 +115,11 @@ impl CaptureManager {
             let stop_task = Arc::clone(&stop);
             let video_bus_task = video_bus.clone();
             let force_keyframe_task = force_keyframe.clone();
+            let format_task = format.clone();
+            let current = *settings.borrow();
 
             tracing::info!("video encoding started");
-            let mut handle = tokio::task::spawn_blocking(move || run_one_pass(&device_path_task, &format, &current, stop_task, video_bus_task, force_keyframe_task));
+            let mut handle = tokio::task::spawn_blocking(move || run_one_pass(&device_path_task, &format_task, &current, stop_task, video_bus_task, force_keyframe_task));
 
             let mut shutdown = false;
             let mut pass_ended_on_its_own = false;
@@ -204,12 +174,55 @@ impl CaptureManager {
     }
 }
 
+/// Probes `device_path` for its supported YUYV resolutions/frame rates.
+/// Never fails - if there's no capture device (e.g. in the devcontainer) or
+/// it doesn't support YUYV, or the ioctl itself errors, this just returns
+/// `None` and logs a warning; the caller treats that the same as "not
+/// probed yet".
+fn probe(device_path: &str) -> Option<SupportedFormat> {
+    v4l2::enumerate(device_path).unwrap_or_else(|err| {
+        tracing::warn!(%err, device_path, "capture device probe failed, video will be unavailable this cycle");
+        None
+    })
+}
+
+/// Recomputes `device_state_for` from whatever `format` is currently
+/// cached and publishes it if it actually changed. Cheap and ioctl-free -
+/// safe to call on every settings change or loop iteration, unlike an
+/// actual probe.
+fn publish_device_state(device_state_tx: &watch::Sender<DeviceState>, format: &Option<SupportedFormat>, settings: &CaptureSettings) {
+    let new_state = device_state_for(format, settings);
+    device_state_tx.send_if_modified(|s| {
+        if *s == new_state {
+            false
+        } else {
+            *s = new_state;
+            true
+        }
+    });
+}
+
 /// Waits until `client_count` becomes nonzero, or returns `Err` once the
 /// settings channel closes (server shutting down, nothing left to wait
-/// for). Also returns `Ok` on a settings change even while the count is
-/// still zero, so the caller re-evaluates from the top of the loop (e.g. to
-/// keep `device_state_tx` current) before waiting again.
-async fn wait_for_client_or_shutdown(client_count: &mut watch::Receiver<u32>, settings: &mut watch::Receiver<CaptureSettings>) -> Result<(), ()> {
+/// for). While waiting, also handles a settings change (recomputes and
+/// republishes `device_state` for the new default resolution, without
+/// probing).
+///
+/// Also returns `Ok` early on a video4linux uevent (plug or unplug), even
+/// though `client_count` is still zero - without this, a device
+/// disconnect/reconnect that happens while no browser is connected would
+/// never be noticed at all, since nothing else here watches for it. The
+/// caller's loop re-checks device presence (and probes on a fresh connect)
+/// at its top, and calls back in here if `client_count` is still zero, so
+/// this just hands control back rather than handling the transition
+/// itself.
+async fn wait_for_client_or_shutdown(
+    client_count: &mut watch::Receiver<u32>,
+    settings: &mut watch::Receiver<CaptureSettings>,
+    format: &Option<SupportedFormat>,
+    device_state_tx: &watch::Sender<DeviceState>,
+    uevents: &mut Option<uevent::UeventListener>,
+) -> Result<(), ()> {
     while *client_count.borrow() == 0 {
         tokio::select! {
             changed = client_count.changed() => {
@@ -221,7 +234,10 @@ async fn wait_for_client_or_shutdown(client_count: &mut watch::Receiver<u32>, se
                 if changed.is_err() {
                     return Err(());
                 }
-                break;
+                publish_device_state(device_state_tx, format, &settings.borrow());
+            }
+            () = wait_for_uevent(uevents) => {
+                return Ok(());
             }
         }
     }
@@ -305,10 +321,9 @@ fn run_one_pass(device_path: &str, format: &Option<SupportedFormat>, settings: &
     }
 }
 
-/// Shared by `CaptureManager::device_state` (the startup snapshot) and
-/// `run`'s hot-plug loop (recomputed fresh on every reconnect) — kept as a
-/// free function over `&Option<SupportedFormat>` so both call sites can use
-/// it without needing a full `CaptureManager` instance.
+/// Shared by `publish_device_state` (used throughout `run`) - kept as a
+/// free function over `&Option<SupportedFormat>` so it doesn't need a
+/// `CaptureManager` instance.
 fn device_state_for(format: &Option<SupportedFormat>, settings: &CaptureSettings) -> DeviceState {
     let Some(format) = format else {
         return DeviceState::default();

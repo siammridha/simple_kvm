@@ -47,12 +47,37 @@ pub struct SessionContext {
     pub hid_connected_rx: watch::Receiver<bool>,
     pub settings_path: PathBuf,
     pub force_keyframe: Arc<AtomicBool>,
+    /// See `super::SharedChannels::client_count_tx` - `handle` below wraps
+    /// this in a `ClientCountGuard` the moment the connection first reaches
+    /// `Connected`, not before.
+    pub client_count_tx: watch::Sender<u32>,
     /// Mirrors the `RTCPeerConnection`'s own connection state (see
     /// `rtc::Handler::on_connection_state_change`) - watched by `handle`'s
     /// main loop so the session shuts down as soon as the connection
     /// disconnects/fails/closes, rather than only when the `control` data
     /// channel happens to notice on its own.
     pub pc_state_rx: watch::Receiver<RTCPeerConnectionState>,
+}
+
+/// Held from the moment a session's `RTCPeerConnection` first reaches
+/// `Connected` (see `handle`'s `pc_state_rx` arm) until the session ends;
+/// its `Drop` is what guarantees the count comes back down no matter which
+/// exit path (clean shutdown, peer-connection failure/close, panic)
+/// actually ends it. `CaptureManager::run` only opens/streams the capture
+/// card while at least one of these is held.
+struct ClientCountGuard(watch::Sender<u32>);
+
+impl ClientCountGuard {
+    fn new(tx: watch::Sender<u32>) -> Self {
+        tx.send_modify(|n| *n += 1);
+        Self(tx)
+    }
+}
+
+impl Drop for ClientCountGuard {
+    fn drop(&mut self) {
+        self.0.send_modify(|n| *n = n.saturating_sub(1));
+    }
 }
 
 /// The two data channels the browser creates before sending its offer
@@ -119,6 +144,10 @@ pub async fn handle(
 
     let mut input_active = true;
     let mut control_open = false;
+    // Created the moment the connection first reaches `Connected` - see the
+    // `pc_state_rx` arm below. Kept `None` until then so the capture card
+    // is never opened/streamed to before the connection is fully stable.
+    let mut client_count_guard: Option<ClientCountGuard> = None;
     // The real capture-time delta between consecutive frames, used as each
     // RTP sample's duration so the browser's jitter buffer gets correct
     // pacing info — see `send_frame`. `None` only for the very first frame
@@ -174,7 +203,10 @@ pub async fn handle(
                         // this tab connected. So the current state has to be
                         // pushed explicitly here, once, rather than relying on the
                         // `changed()` arms below (which still handle every update
-                        // from this point on).
+                        // from this point on). `DeviceState` here is whatever
+                        // `CaptureManager::run` last cached from probing the card
+                        // when it was plugged in - opening this channel doesn't
+                        // trigger a fresh probe of its own.
                         control_open = push_initial_state(&control, &mut device_state_rx, &mut hid_connected_rx, &mut capture_settings_rx, &mut mouse_mode_rx).await.is_ok();
                     }
                     Some(DataChannelEvent::OnMessage(msg)) => {
@@ -231,6 +263,13 @@ pub async fn handle(
                 if matches!(state, RTCPeerConnectionState::Disconnected | RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed) {
                     tracing::debug!(?state, "peer connection state ended, closing session");
                     break;
+                }
+                if state == RTCPeerConnectionState::Connected && client_count_guard.is_none() {
+                    // Only now is the connection fully stable and ready for
+                    // video - see `ClientCountGuard` and
+                    // `CaptureManager::run`, which only opens/streams the
+                    // capture card while at least one of these is held.
+                    client_count_guard = Some(ClientCountGuard::new(ctx.client_count_tx.clone()));
                 }
             }
         }
@@ -419,6 +458,7 @@ mod tests {
         let (_device_state_tx, device_state_rx) = watch::channel(DeviceState::default());
         let (_hid_connected_tx, hid_connected_rx) = watch::channel(false);
         let (_pc_state_tx, pc_state_rx) = watch::channel(RTCPeerConnectionState::New);
+        let (client_count_tx, _client_count_rx) = watch::channel(0u32);
         SessionContext {
             video_bus: video_rx,
             serial_tx,
@@ -430,6 +470,7 @@ mod tests {
             hid_connected_rx,
             settings_path,
             force_keyframe: Arc::new(AtomicBool::new(false)),
+            client_count_tx,
             pc_state_rx,
         }
     }

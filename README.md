@@ -39,12 +39,13 @@ ip>:3000` with:
   session would ever be a keyframe, and joining any later would leave the
   video stuck.
 - **Resolution dropdown**, populated from whatever the capture card
-  actually reports supporting (queried at startup) - not a hardcoded list.
+  actually reports supporting (queried once your browser connects, see
+  below) - not a hardcoded list.
 - **Frame rate dropdown**, populated from whatever the capture card
   actually reports supporting for the currently-selected resolution
-  (queried at startup, like the resolution dropdown) - not a hardcoded
-  list, since real hardware supports different rates at different
-  resolutions. Switching the resolution dropdown (even before clicking
+  (queried once your browser connects, like the resolution dropdown) - not
+  a hardcoded list, since real hardware supports different rates at
+  different resolutions. Switching the resolution dropdown (even before clicking
   Save) repopulates this list to match, so it's never possible to pick a
   rate the card can't actually do at that resolution. Sent to the capture
   card via V4L2's frame-interval negotiation; the card is still free to
@@ -80,13 +81,26 @@ ip>:3000` with:
 - **No login.** Anyone who can reach port 3000 has full control. This is
   meant for a trusted LAN, not the open internet.
 
-Video capture and encoding only run while at least one browser is
-connected - with nobody watching, no CPU/power is spent on capture at all.
-The moment a browser connects, capture starts at whatever resolution/fps
-the settings say; the moment the last browser disconnects, it stops. A
-second browser connecting while one is already active doesn't restart
-anything. Every actual start/stop of a capture pass is logged as `video
-encoding started`/`video encoding stopped`.
+Video capture and encoding only run while at least one browser's WebRTC
+connection is fully up (`connected`, not just negotiating) - with nobody
+actually connected, no CPU/power is spent on capture at all, and the
+capture card itself is never opened. The moment a browser's connection
+reaches that state, capture starts at whatever resolution/fps the settings
+say; the moment the last such browser disconnects, it stops. A second
+browser connecting while one is already active doesn't restart anything.
+Every actual start/stop of a capture pass is logged as `video encoding
+started`/`video encoding stopped`.
+
+The capture card is only ever opened for two reasons: once, to ask it what
+resolutions/frame rates it supports, the moment it's actually plugged in
+(this is what populates the dropdowns above - the result is cached in
+memory, so a browser connecting later just reads that cached answer
+instead of triggering a fresh probe of its own); and to actually stream
+from it, once a browser's connection is fully `connected`. It's never
+opened automatically at startup - not even if it's already plugged in at
+that point - because doing so has reliably crashed the real hardware this
+runs on if it happens too early after boot (see the "Known issue" note
+further down, under Installation).
 
 The server runs fine with no capture card or CH9329 attached - the page
 still loads, the frame rate/resolution dropdowns are disabled and
@@ -110,11 +124,18 @@ device-change broadcast (`NETLINK_KOBJECT_UEVENT`, the same channel udev
 listens on), rather than going through udev itself - the Wyse 3040 image
 this runs on has no udev daemon (it uses the simpler `mdev` instead), so
 udev's own notifications never fire there. Listening straight to the
-kernel works regardless of what (if anything) is managing devices. For the
-capture card, a slow, infrequent poll still runs alongside it as a safety
-net in case that listener can't be opened; the CH9329 side has no such
-fallback, so if its listener fails to open, its reconnects are only
-noticed on the next real keystroke or click instead of immediately.
+kernel works regardless of what (if anything) is managing devices. If the
+listener can't be opened, the capture card's reconnect is instead noticed
+on the next settings change; the CH9329 has no such fallback, so if its
+listener fails to open, its reconnects are only noticed on the next real
+keystroke or click instead of immediately. Every time the capture card
+goes from unplugged to plugged in - a genuine replug while the service is
+running, or simply being plugged in for the first time after the service
+started without it - triggers one fresh capabilities probe, cached in
+memory until it's unplugged again (see above). The one exception is the
+card already being plugged in at the moment the service itself starts -
+that specific transition is never auto-probed, since it's the
+boot-crash-risk moment described below.
 
 **Dropdown changes only take effect when you click Save settings.**
 Changing frame rate, resolution, or mouse mode does nothing on its own -
@@ -125,8 +146,10 @@ disk, together, in one step. If you reload the page (or open a second
 tab) without saving, the dropdowns show whatever the server is actually
 using right now, not your unsaved picks - and if the service restarts
 (e.g. after a reboot) without a save having happened first, it comes back
-up with whatever was last saved, or the capture card's own defaults if
-nothing ever was.
+up with whatever was last saved, or a fixed 1280x720 @ 5fps fallback if
+nothing ever was saved - there's no startup probe of the card to draw a
+"real" default from (see above), so a stale saved resolution is trusted
+until the first browser connects and the dropdowns correct themselves.
 
 Save only includes the settings for hardware that's actually connected:
 resolution/frame rate are sent only if the capture card is
@@ -244,9 +267,16 @@ exact same way once the system had been up a while never did). The
 service used to work around this with a 30-second `start_pre()` sleep in
 `/etc/init.d/simple_kvm` before the binary even launched; that's been
 removed (it was stacking with the CH9329 delay below and needlessly
-delaying every restart, not just boot), and nothing has replaced it yet
-- so a fresh boot can currently still crash the machine. Tracked as
-follow-up work.
+delaying every restart, not just boot).
+
+Instead, the binary itself no longer opens the capture card on its own at
+all - see the [What it does](#what-it-does) section above. It's now only
+opened once a browser actually connects and its WebRTC connection reaches
+`connected`, which in practice is well after boot. This is expected to
+sidestep the specific crash described above, but hasn't actually been
+verified against the real hardware yet - treat it as unconfirmed rather
+than fixed until it's been tested on the Wyse 3040 through a real boot
+cycle.
 
 The CH9329 has shown the same crash-on-connect behavior, so the binary
 itself waits before opening the serial port (`SERIAL_OPEN_DELAY_SECS`,

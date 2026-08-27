@@ -95,13 +95,6 @@ fn frame_rates_for(dev: &Device, fourcc: FourCC, resolution: Resolution) -> Vec<
     rates
 }
 
-/// Picks the largest resolution offered, capped at 1080p. Kept separate
-/// from the ioctl calls above so it's unit-testable on plain data.
-pub fn pick_default(format: Option<&SupportedFormat>) -> Option<Resolution> {
-    const MAX_PIXELS: u32 = 1920 * 1080;
-    format?.resolutions.iter().filter(|r| r.width * r.height <= MAX_PIXELS).max_by_key(|r| r.width * r.height).copied()
-}
-
 /// Runs a blocking YUYV capture loop against `path` at the requested
 /// resolution, until `should_stop` returns true. Meant to run inside
 /// `tokio::task::spawn_blocking`.
@@ -179,21 +172,6 @@ fn fps_mismatch(requested: u32, interval: v4l::fraction::Fraction) -> Option<u32
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn format(resolutions: &[(u32, u32)]) -> SupportedFormat {
-        SupportedFormat { resolutions: resolutions.iter().map(|&(width, height)| Resolution { width, height }).collect(), frame_rates: HashMap::new() }
-    }
-
-    #[test]
-    fn picks_largest_resolution_within_1080p_cap() {
-        let format = format(&[(640, 480), (1920, 1080), (3840, 2160)]);
-        assert_eq!(pick_default(Some(&format)), Some(Resolution { width: 1920, height: 1080 }));
-    }
-
-    #[test]
-    fn no_supported_format_returns_none() {
-        assert_eq!(pick_default(None), None);
-    }
 
     #[test]
     fn fps_mismatch_reports_when_driver_negotiated_differently() {

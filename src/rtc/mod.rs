@@ -47,10 +47,14 @@ pub struct SharedChannels {
     /// `session::handle`'s `video_track.poll()` branch and
     /// `capture::run_one_pass`.
     pub force_keyframe: Arc<AtomicBool>,
-    /// Count of currently-connected WebRTC sessions — incremented in
-    /// `negotiate` before a session is spawned, decremented by
-    /// `ClientCountGuard::drop` however the session ends (clean exit,
-    /// abnormal disconnect, or panic).
+    /// Count of currently-connected, *fully stable* WebRTC sessions —
+    /// incremented by `session::handle` the moment its `RTCPeerConnection`
+    /// first reaches `Connected` (not merely negotiated/spawned), via
+    /// `session::ClientCountGuard`, decremented by that guard's `Drop`
+    /// however the session ends (clean exit, abnormal disconnect, or
+    /// panic). `CaptureManager::run` only opens/streams the capture card
+    /// while this is nonzero, so a session is never "connected" to the
+    /// card before its transport is actually stable and ready for video.
     pub client_count_tx: watch::Sender<u32>,
 }
 
@@ -96,25 +100,6 @@ impl OnceSignal {
         if let Some(tx) = self.tx.lock().await.take() {
             let _ = tx.send(());
         }
-    }
-}
-
-/// Held for the lifetime of one spawned session task; its `Drop` is what
-/// guarantees the count comes back down no matter which of the session's
-/// several exit paths (clean shutdown, peer-connection failure/close,
-/// panic) actually ends it.
-struct ClientCountGuard(watch::Sender<u32>);
-
-impl ClientCountGuard {
-    fn new(tx: watch::Sender<u32>) -> Self {
-        tx.send_modify(|n| *n += 1);
-        Self(tx)
-    }
-}
-
-impl Drop for ClientCountGuard {
-    fn drop(&mut self) {
-        self.0.send_modify(|n| *n = n.saturating_sub(1));
     }
 }
 
@@ -228,12 +213,11 @@ async fn negotiate(offer_sdp: String, channels: SharedChannels) -> Result<String
         hid_connected_rx: channels.hid_connected_rx,
         settings_path: channels.settings_path,
         force_keyframe: channels.force_keyframe,
+        client_count_tx: channels.client_count_tx,
         pc_state_rx,
     };
     let pc_for_session = peer_connection.clone();
-    let client_count_guard = ClientCountGuard::new(channels.client_count_tx.clone());
     tokio::spawn(async move {
-        let _client_count_guard = client_count_guard;
         if let Err(err) = session::handle(pc_for_session, video_track, video_sender, dc_rx, ctx).await {
             tracing::debug!(%err, "WebRTC session ended");
         }
