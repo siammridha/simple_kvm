@@ -126,9 +126,8 @@ this runs on has no udev daemon (it uses the simpler `mdev` instead), so
 udev's own notifications never fire there. Listening straight to the
 kernel works regardless of what (if anything) is managing devices. If the
 listener can't be opened, the capture card's reconnect is instead noticed
-on the next settings change; the CH9329 has no such fallback, so if its
-listener fails to open, its reconnects are only noticed on the next real
-keystroke or click instead of immediately. Every time the capture card
+on the next settings change; the CH9329's presence detection falls back
+to polling every 2 seconds instead. Every time the capture card
 goes from unplugged to plugged in - a genuine replug while the service is
 running, or simply being plugged in for the first time after the service
 started without it - triggers one fresh capabilities probe, cached in
