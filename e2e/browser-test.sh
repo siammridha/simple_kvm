@@ -7,8 +7,10 @@
 # SERIAL_PATH, not that it's real hardware - so the mouse-mode half of
 # Save/settings-push can actually be exercised, while the capture half of
 # that same logic is covered by src/rtc/session.rs's Rust tests instead.
-# This only adds a browser layer on top of the page; it doesn't replace
-# `cargo nextest run`.
+# Also exercises issue #005's renegotiation mechanism (add/remove the
+# video track after the connection is already up) via a debug-only hook -
+# see the "Debug trigger" steps below. This only adds a browser layer on
+# top of the page; it doesn't replace `cargo nextest run`.
 set -eu
 
 cd "$(dirname "$0")/.."
@@ -81,6 +83,64 @@ done
 echo "status indicator: $STATUS_TEXT"
 if [ "$STATUS_TEXT" != "connected" ] && [ "$STATUS_TEXT" != "no video device found" ]; then
 	echo "FAIL: status never reached 'connected' or 'no video device found' - WebRTC didn't connect" >&2
+	exit 1
+fi
+
+# Issue #005: the session starts with no video track at all (see
+# rtc::negotiate). window.__debugToggleVideo (assets/web/app.js) is a
+# test-only hook that sends ControlMessage::DebugToggleVideo, the manual
+# stand-in issue #005 uses to prove the add_track/remove_track +
+# renegotiation mechanism end to end - issue #006 replaces it with a
+# trigger driven by real capture-device availability. There's no real
+# capture card in this container, so no actual video frames ever flow;
+# what's checked here is that renegotiation itself completes cleanly -
+# a receiver appears after "add", the connection stays 'connected'
+# throughout, and it can be exercised twice in a row (add, remove, add).
+echo "Debug trigger: adding a video track and renegotiating..."
+agent-browser eval "window.__debugToggleVideo()" >/dev/null
+sleep 0.5
+RECEIVER_COUNT=$(agent-browser eval "window.__debugPeerConnection().getReceivers().filter(r => r.track && r.track.kind === 'video').length")
+echo "video receivers after add: $RECEIVER_COUNT"
+if [ "$RECEIVER_COUNT" -lt 1 ]; then
+	echo "FAIL: expected a video receiver after the debug add trigger, got $RECEIVER_COUNT" >&2
+	exit 1
+fi
+# agent-browser eval returns JSON.stringify()'d results, so a bare string
+# comes back double-quoted (e.g. `"connected"`) - comparing the raw
+# connectionState string against a bash literal would always fail. Doing
+# the comparison in JS and returning a bool sidesteps that.
+CONN_STATE=$(agent-browser eval "window.__debugPeerConnection().connectionState")
+IS_CONNECTED=$(agent-browser eval "window.__debugPeerConnection().connectionState === 'connected'")
+if [ "$IS_CONNECTED" != "true" ]; then
+	echo "FAIL: connection state should still be 'connected' after adding video, got $CONN_STATE" >&2
+	exit 1
+fi
+
+echo "Debug trigger: removing the video track and renegotiating..."
+agent-browser eval "window.__debugToggleVideo()" >/dev/null
+sleep 0.5
+CONN_STATE=$(agent-browser eval "window.__debugPeerConnection().connectionState")
+IS_CONNECTED=$(agent-browser eval "window.__debugPeerConnection().connectionState === 'connected'")
+if [ "$IS_CONNECTED" != "true" ]; then
+	echo "FAIL: connection state should still be 'connected' after removing video, got $CONN_STATE" >&2
+	exit 1
+fi
+
+echo "Debug trigger: adding the video track again (exercising add/remove/add)..."
+agent-browser eval "window.__debugToggleVideo()" >/dev/null
+sleep 0.5
+RECEIVER_COUNT=$(agent-browser eval "window.__debugPeerConnection().getReceivers().filter(r => r.track && r.track.kind === 'video').length")
+if [ "$RECEIVER_COUNT" -lt 1 ]; then
+	echo "FAIL: expected a video receiver again after the second add trigger, got $RECEIVER_COUNT" >&2
+	exit 1
+fi
+
+echo "Confirming the input/control data channels survived all that renegotiation..."
+DC_STATES=$(agent-browser eval "inputChannel.readyState + ',' + controlChannel.readyState")
+BOTH_OPEN=$(agent-browser eval "inputChannel.readyState === 'open' && controlChannel.readyState === 'open'")
+echo "input,control readyState: $DC_STATES"
+if [ "$BOTH_OPEN" != "true" ]; then
+	echo "FAIL: expected both data channels still 'open' after renegotiating, got $DC_STATES" >&2
 	exit 1
 fi
 

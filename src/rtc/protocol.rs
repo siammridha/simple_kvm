@@ -76,6 +76,15 @@ pub enum ControlMessage {
         mouse_mode: Option<MouseModeWire>,
     },
     Paste { text: String },
+    /// The browser's SDP answer to a `ServerMessage::Offer` — the second
+    /// half of a renegotiation round trip started by
+    /// `rtc::Handler::on_negotiation_needed` (see `session::handle`).
+    Answer { sdp: String },
+    /// Manual/debug trigger for issue #005: toggles this session's video
+    /// track on or off, driving a real `add_track`/`remove_track` +
+    /// renegotiation cycle end to end. Temporary — issue #006 replaces
+    /// this with a trigger driven by real capture-device availability.
+    DebugToggleVideo,
 }
 
 /// Server-to-client messages, pushed down the `control` data channel
@@ -90,6 +99,13 @@ pub enum ServerMessage {
     /// `DeviceState` (which only covers the capture card).
     HidState { available: bool },
     Settings { capture: crate::config::CaptureSettings, mouse_mode: crate::config::MouseMode },
+    /// A fresh SDP offer starting a second (or later) round of
+    /// negotiation, pushed whenever `rtc::Handler::on_negotiation_needed`
+    /// fires after the initial connection is already up — e.g. the
+    /// server just added or removed this session's video track. The
+    /// browser applies it and replies with `ControlMessage::Answer` over
+    /// this same channel.
+    Offer { sdp: String },
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -148,6 +164,19 @@ mod tests {
 
         let msg: ControlMessage = serde_json::from_str(r#"{"type":"paste","text":"hi"}"#).unwrap();
         assert!(matches!(msg, ControlMessage::Paste { text } if text == "hi"));
+
+        let msg: ControlMessage = serde_json::from_str(r#"{"type":"answer","sdp":"v=0..."}"#).unwrap();
+        assert!(matches!(msg, ControlMessage::Answer { sdp } if sdp == "v=0..."));
+
+        let msg: ControlMessage = serde_json::from_str(r#"{"type":"debug_toggle_video"}"#).unwrap();
+        assert!(matches!(msg, ControlMessage::DebugToggleVideo));
+    }
+
+    #[test]
+    fn server_message_offer_serializes_to_json() {
+        let msg = ServerMessage::Offer { sdp: "v=0...".to_string() };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(json, r#"{"type":"offer","sdp":"v=0..."}"#);
     }
 
     #[test]

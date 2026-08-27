@@ -6,7 +6,7 @@
 //! shared `watch<Settings>` and the settings file — the connection itself
 //! is never disturbed, so applying new settings never drops the session.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,13 +18,14 @@ use rtc::media::Sample;
 use rtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use rtc::rtcp::Packet;
+use rtc::rtp_transceiver::rtp_sender::{RTCRtpCodec, RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind};
 use rtc::rtp_transceiver::PayloadType;
 use tokio::sync::{mpsc, watch};
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
 use webrtc::media_stream::track_local::{TrackLocal, TrackLocalEvent};
-use webrtc::media_stream::Track;
-use webrtc::peer_connection::{PeerConnection, RTCPeerConnectionState};
+use webrtc::media_stream::{MediaStreamTrack, Track};
+use webrtc::peer_connection::{PeerConnection, RTCPeerConnectionState, RTCSessionDescription};
 use webrtc::rtp_transceiver::RtpSender;
 
 use crate::capture::v4l2::Resolution;
@@ -47,6 +48,11 @@ pub struct SessionContext {
     pub hid_connected_rx: watch::Receiver<bool>,
     pub settings_path: PathBuf,
     pub force_keyframe: Arc<AtomicBool>,
+    /// The H.264 codec registered on this connection's `MediaEngine` (see
+    /// `negotiate()`), needed to build a fresh `TrackLocalStaticSample`
+    /// whenever `ControlMessage::DebugToggleVideo` adds one — see
+    /// `add_video_track`.
+    pub h264_codec: RTCRtpCodec,
     /// Mirrors the `RTCPeerConnection`'s own connection state (see
     /// `rtc::Handler::on_connection_state_change`) - watched by `handle`'s
     /// main loop so the session shuts down as soon as the connection
@@ -96,18 +102,126 @@ async fn video_target(video_track: &TrackLocalStaticSample, video_sender: &Arc<d
     Ok((ssrc, payload_type))
 }
 
+/// One session's live H.264 track — built fresh whenever
+/// `ControlMessage::DebugToggleVideo` adds one, rather than shared across
+/// sessions or built up front, since `TrackLocalStaticSample` only
+/// supports one peer-connection binding at a time: adding the same track
+/// object to a second connection would silently steal it from the first.
+struct VideoState {
+    track: Arc<TrackLocalStaticSample>,
+    sender: Arc<dyn RtpSender>,
+    /// SSRC and negotiated payload type for `write_sample` calls. Stays
+    /// `None` until the renegotiation this track's `add_track` triggered
+    /// has actually completed (see the `ControlMessage::Answer` arm in
+    /// `handle`) — the sender has no negotiated codec parameters before
+    /// then, even though the track and sender objects already exist.
+    target: Option<(u32, PayloadType)>,
+}
+
+/// Builds a fresh H.264 track and attaches it to `pc`. Per issue #005:
+/// confirmed against the vendored `rtc-0.20.3` source that `add_track`
+/// reuses the transceiver the browser already offered for video (matching
+/// `kind()`/an empty `sender()`) rather than adding a duplicate `m=video`
+/// line, and itself calls `trigger_negotiation_needed()` — which is what
+/// drives `Handler::on_negotiation_needed` (see `super::Handler`) to
+/// create a fresh offer and hand it to this session over
+/// `renegotiation_rx`.
+async fn add_video_track(pc: &Arc<dyn PeerConnection>, codec: &RTCRtpCodec) -> Result<VideoState> {
+    let ssrc = super::rand_u32();
+    let track = Arc::new(
+        TrackLocalStaticSample::new(MediaStreamTrack::new(
+            "simple_kvm-video".to_string(),
+            "simple_kvm-video".to_string(),
+            "simple_kvm-video".to_string(),
+            RtpCodecKind::Video,
+            vec![RTCRtpEncodingParameters {
+                rtp_coding_parameters: RTCRtpCodingParameters { ssrc: Some(ssrc), ..Default::default() },
+                codec: codec.clone(),
+                ..Default::default()
+            }],
+        ))
+        .context("building H.264 track")?,
+    );
+    let sender = pc.add_track(track.clone() as Arc<dyn TrackLocal>).await.context("adding H.264 track")?;
+    Ok(VideoState { track, sender, target: None })
+}
+
+/// Adds or removes this session's video track in response to the debug
+/// trigger (`ControlMessage::DebugToggleVideo` — issue #005's temporary
+/// stand-in for a trigger based on real capture-device availability,
+/// which issue #006 adds). `remove_track`, like `add_track`, calls the
+/// crate's own `trigger_negotiation_needed()`.
+async fn toggle_video(pc: &Arc<dyn PeerConnection>, video: Option<VideoState>, codec: &RTCRtpCodec) -> Option<VideoState> {
+    match video {
+        Some(v) => {
+            if let Err(err) = pc.remove_track(&v.sender).await {
+                tracing::warn!(%err, "failed to remove video track");
+                return Some(v);
+            }
+            tracing::info!("debug trigger: removed video track");
+            None
+        }
+        None => match add_video_track(pc, codec).await {
+            Ok(v) => {
+                tracing::info!("debug trigger: added video track");
+                Some(v)
+            }
+            Err(err) => {
+                tracing::warn!(%err, "failed to add video track");
+                None
+            }
+        },
+    }
+}
+
+/// Polls the current video track's RTCP events, or never resolves if
+/// there isn't one. A plain `video.as_ref().unwrap().track.poll()` in the
+/// `tokio::select!` branch below would panic when `video` is `None`: an
+/// `if` guard only stops the resulting future from being *polled*, not
+/// the branch expression from being *evaluated* — evaluation happens on
+/// every loop iteration regardless of the guard. Wrapping the `None` case
+/// in `std::future::pending()` here keeps evaluation itself infallible.
+async fn poll_video(video: &Option<VideoState>) -> Option<TrackLocalEvent> {
+    match video {
+        Some(v) => v.track.poll().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Applies the browser's answer to a server-initiated renegotiation (see
+/// `ControlMessage::Answer`), completing the round trip
+/// `Handler::on_negotiation_needed` started. Once applied, the current
+/// video track's sender (if any) has its codec actually negotiated, so
+/// `video`'s RTP send target is (re)resolved here too — this is the first
+/// point after `add_video_track` where `video_target` can succeed.
+async fn apply_renegotiation_answer(pc: &Arc<dyn PeerConnection>, sdp: String, video: &mut Option<VideoState>) {
+    let answer = match RTCSessionDescription::answer(sdp) {
+        Ok(answer) => answer,
+        Err(err) => {
+            tracing::debug!(%err, "ignoring malformed renegotiation answer");
+            return;
+        }
+    };
+    if let Err(err) = pc.set_remote_description(answer).await {
+        tracing::warn!(%err, "failed to apply browser's renegotiation answer");
+        return;
+    }
+    if let Some(v) = video {
+        v.target = video_target(&v.track, &v.sender).await.ok();
+    }
+}
+
 pub async fn handle(
-    _pc: Arc<dyn PeerConnection>,
-    video_track: Arc<TrackLocalStaticSample>,
-    video_sender: Arc<dyn RtpSender>,
+    pc: Arc<dyn PeerConnection>,
     dc_rx: mpsc::UnboundedReceiver<Arc<dyn DataChannel>>,
+    mut renegotiation_rx: mpsc::UnboundedReceiver<String>,
     ctx: SessionContext,
 ) -> Result<()> {
     let DataChannels { input, control } = collect_data_channels(dc_rx).await?;
-    let video_target = video_target(&video_track, &video_sender).await;
-    if let Err(err) = &video_target {
-        tracing::warn!(%err, "H.264 track not usable for this session; video will not work, input/control are unaffected");
-    }
+    // Starts with no video track at all (see issue #005) — one is added
+    // later via the debug trigger below, or (once issue #006 lands) real
+    // capture-device availability.
+    let mut video: Option<VideoState> = None;
 
     let mut video_rx = ctx.video_bus.clone();
     let mut device_state_rx = ctx.device_state_rx.clone();
@@ -121,8 +235,10 @@ pub async fn handle(
     let mut control_open = false;
     // The real capture-time delta between consecutive frames, used as each
     // RTP sample's duration so the browser's jitter buffer gets correct
-    // pacing info — see `send_frame`. `None` only for the very first frame
-    // of a session, which has no prior frame to diff against.
+    // pacing info — see `send_frame`. `None` for the very first frame with
+    // a video track actually attached, which has no prior frame to diff
+    // against — true both for a session's first frame ever and for its
+    // first frame after the debug trigger (re)adds a video track.
     let mut last_captured_at: Option<Duration> = None;
     // Set once the video_bus sender is gone for good (only happens if the
     // capture task itself is torn down, e.g. process shutdown - it no
@@ -138,20 +254,25 @@ pub async fn handle(
                 match changed {
                     Ok(()) => {
                         let frame = video_rx.borrow_and_update().clone();
-                        if let Some(frame) = frame {
+                        if let (Some(frame), Some(video)) = (frame, &video) {
                             let duration = last_captured_at.map(|t| frame.captured_at.saturating_sub(t)).unwrap_or(Duration::ZERO);
                             last_captured_at = Some(frame.captured_at);
-                            send_frame(&frame.data, duration, &video_track, video_target.as_ref().ok().copied()).await;
+                            send_frame(&frame.data, duration, &video.track, video.target).await;
                         }
                     }
                     Err(_) => video_closed = true,
                 }
             }
-            event = video_track.poll(), if video_target.is_ok() => {
+            event = poll_video(&video), if video.as_ref().is_some_and(|v| v.target.is_some()) => {
                 if let Some(TrackLocalEvent::OnRtcpPacket(packets)) = event
                     && packets.iter().any(|p| is_keyframe_request(p.as_ref()))
                 {
                     ctx.force_keyframe.store(true, Ordering::Relaxed);
+                }
+            }
+            Some(sdp) = renegotiation_rx.recv() => {
+                if control_open {
+                    let _ = send_server_message(&control, &ServerMessage::Offer { sdp }).await;
                 }
             }
             event = input.poll(), if input_active => {
@@ -179,6 +300,12 @@ pub async fn handle(
                     }
                     Some(DataChannelEvent::OnMessage(msg)) => {
                         match serde_json::from_slice::<ControlMessage>(&msg.data) {
+                            Ok(ControlMessage::Answer { sdp }) => {
+                                apply_renegotiation_answer(&pc, sdp, &mut video).await;
+                            }
+                            Ok(ControlMessage::DebugToggleVideo) => {
+                                video = toggle_video(&pc, video, &ctx.h264_codec).await;
+                            }
                             Ok(msg) => handle_control_message(msg, &ctx),
                             Err(err) => tracing::debug!(%err, "ignoring malformed control message"),
                         }
@@ -401,6 +528,13 @@ fn handle_control_message(msg: ControlMessage, ctx: &SessionContext) {
                 let _ = tx.send(SerialCommand::PasteText(text)).await;
             });
         }
+        // Matched directly in `handle`'s `control.poll()` arm, before it
+        // ever falls through to this function - both need state
+        // (`pc`/`video`) that this function, which only takes `&ctx`,
+        // doesn't have access to.
+        ControlMessage::Answer { .. } | ControlMessage::DebugToggleVideo => {
+            unreachable!("Answer and DebugToggleVideo are handled in handle()'s control.poll() arm")
+        }
     }
 }
 
@@ -430,6 +564,7 @@ mod tests {
             hid_connected_rx,
             settings_path,
             force_keyframe: Arc::new(AtomicBool::new(false)),
+            h264_codec: RTCRtpCodec::default(),
             pc_state_rx,
         }
     }

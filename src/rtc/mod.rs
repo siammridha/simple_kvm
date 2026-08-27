@@ -2,23 +2,20 @@ pub mod protocol;
 pub mod session;
 
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 
 use anyhow::{Context, Result};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, OnceCell};
 use rtc::ice::mdns::MulticastDnsMode;
 use rtc::peer_connection::configuration::media_engine::MIME_TYPE_H264;
 use rtc::peer_connection::configuration::setting_engine::SettingEngine;
-use rtc::rtp_transceiver::rtp_sender::{RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind};
+use rtc::rtp_transceiver::rtp_sender::{RTCRtpCodec, RTCRtpCodecParameters, RtpCodecKind};
 use webrtc::data_channel::DataChannel;
-use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
-use webrtc::media_stream::track_local::TrackLocal;
-use webrtc::media_stream::MediaStreamTrack;
 use webrtc::peer_connection::{
     register_default_interceptors, MediaEngine, PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfigurationBuilder,
     RTCIceGatheringState, RTCPeerConnectionState, RTCSessionDescription, Registry,
@@ -44,7 +41,7 @@ pub struct SharedChannels {
     pub settings_path: PathBuf,
     /// Set by a session on an RTCP keyframe request (PLI/FIR), cleared by
     /// the capture task once it's forced a fresh keyframe — see
-    /// `session::handle`'s `video_track.poll()` branch and
+    /// `session::handle`'s video-track RTCP-poll branch and
     /// `capture::run_one_pass`.
     pub force_keyframe: Arc<AtomicBool>,
     /// Count of currently-connected WebRTC sessions — incremented in
@@ -122,6 +119,39 @@ struct Handler {
     gather_complete: Arc<OnceSignal>,
     dc_tx: mpsc::UnboundedSender<Arc<dyn DataChannel>>,
     state_tx: watch::Sender<RTCPeerConnectionState>,
+    /// Filled in with a weak handle to this connection's own
+    /// `RTCPeerConnection` right after it's built (see `negotiate()`) —
+    /// `Handler` is constructed and handed to `PeerConnectionBuilder`
+    /// before the `RTCPeerConnection` it belongs to exists, so it can't
+    /// simply hold an `Arc` from the start. Weak, not strong, because the
+    /// peer connection itself owns this `Handler` (as a
+    /// `PeerConnectionEventHandler`) — a strong `Arc` back would be a
+    /// reference cycle that leaks the connection.
+    pc: Arc<OnceCell<Weak<dyn PeerConnection>>>,
+    /// Carries a freshly created offer's SDP out to `session::handle`,
+    /// which owns the `control` data channel and actually sends it to the
+    /// browser as a `ServerMessage::Offer` (see `on_negotiation_needed`
+    /// below and the `renegotiation_rx` arm in `session::handle`).
+    renegotiation_tx: mpsc::UnboundedSender<String>,
+    /// False until `negotiate()` has finished the *initial* offer/answer
+    /// exchange and captured its answer SDP. Without this guard,
+    /// `on_negotiation_needed` fires spuriously during that very exchange:
+    /// the browser's offer always includes a recvonly video transceiver
+    /// (see `assets/web/app.js`), so the moment our own answer reaches
+    /// `RTCSignalingState::Stable`, the crate re-runs its own
+    /// negotiation-needed check and finds a `sendonly`-direction
+    /// transceiver (the automatic reverse of the browser's `recvonly`)
+    /// with no sender attached yet - which the crate always reports as
+    /// "still needs negotiating", track or no track. Reacting to that by
+    /// immediately building a new offer races `negotiate()`'s own
+    /// `local_description()` read below: `set_local_description` on the
+    /// spurious offer can land first, so the HTTP response ends up
+    /// carrying an *offer* (always `a=setup:actpass`) instead of the
+    /// intended answer - which every browser correctly rejects, since an
+    /// answer must commit to `active`/`passive`. Confirmed by direct
+    /// reproduction against this exact crate version. Set once, true for
+    /// good, at the end of `negotiate()` - see the `ready.store` there.
+    ready: Arc<AtomicBool>,
 }
 
 #[async_trait::async_trait]
@@ -144,13 +174,52 @@ impl PeerConnectionEventHandler for Handler {
     async fn on_data_channel(&self, data_channel: Arc<dyn DataChannel>) {
         let _ = self.dc_tx.send(data_channel);
     }
+
+    /// Fires whenever this connection has something new to negotiate
+    /// after its initial offer/answer exchange — e.g. `session::handle`
+    /// added or removed the video track in response to a debug trigger
+    /// (issue #005; a real capture-availability trigger replaces it in
+    /// issue #006). Builds a fresh offer and hands its SDP to
+    /// `session::handle` to forward over `control`; the crate's own
+    /// `NegotiationNeededState` coalescing (confirmed in `rtc-0.20.3`)
+    /// already prevents this from firing again for the same connection
+    /// until the resulting round trip completes, so no additional
+    /// debouncing is needed here.
+    async fn on_negotiation_needed(&self) {
+        if !self.ready.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(pc) = self.pc.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        let offer = match pc.create_offer(None).await {
+            Ok(offer) => offer,
+            Err(err) => {
+                tracing::debug!(%err, "skipping renegotiation: couldn't create offer");
+                return;
+            }
+        };
+        if let Err(err) = pc.set_local_description(offer).await {
+            tracing::debug!(%err, "skipping renegotiation: couldn't set local description");
+            return;
+        }
+        let Some(local_description) = pc.local_description().await else {
+            tracing::debug!("skipping renegotiation: no local description after setting one");
+            return;
+        };
+        let _ = self.renegotiation_tx.send(local_description.sdp);
+    }
 }
 
 /// Builds a fresh `RTCPeerConnection` for one browser tab, negotiates the
-/// offer/answer exchange, and spawns `session::handle` to run for the
-/// life of the connection. Returns the answer SDP to send back once ICE
-/// gathering completes (there's nothing left to negotiate after that -
+/// initial offer/answer exchange, and spawns `session::handle` to run for
+/// the life of the connection. Returns the answer SDP to send back once
+/// ICE gathering completes (there's nothing left to negotiate after that -
 /// the browser did the same non-trickle wait before sending its offer).
+/// No video track is attached here — the browser's offer already includes
+/// a recvonly video transceiver (see `assets/web/app.js`'s `connect()`),
+/// but the session starts with nothing sending on it; `session::handle`
+/// attaches one later (see `Handler::on_negotiation_needed`, issue #005).
 async fn negotiate(offer_sdp: String, channels: SharedChannels) -> Result<String> {
     let mut media_engine = MediaEngine::default();
     let h264_codec = RTCRtpCodecParameters {
@@ -178,7 +247,10 @@ async fn negotiate(offer_sdp: String, channels: SharedChannels) -> Result<String
     let (gather_complete, gather_complete_rx) = OnceSignal::new();
     let (dc_tx, dc_rx) = mpsc::unbounded_channel();
     let (state_tx, pc_state_rx) = watch::channel(RTCPeerConnectionState::New);
-    let handler = Arc::new(Handler { gather_complete, dc_tx, state_tx });
+    let (renegotiation_tx, renegotiation_rx) = mpsc::unbounded_channel();
+    let pc_cell: Arc<OnceCell<Weak<dyn PeerConnection>>> = Arc::new(OnceCell::new());
+    let ready = Arc::new(AtomicBool::new(false));
+    let handler = Arc::new(Handler { gather_complete, dc_tx, state_tx, pc: pc_cell.clone(), renegotiation_tx, ready: ready.clone() });
 
     let peer_connection: Arc<dyn PeerConnection> = Arc::new(
         PeerConnectionBuilder::new()
@@ -192,19 +264,10 @@ async fn negotiate(offer_sdp: String, channels: SharedChannels) -> Result<String
             .await
             .context("building RTCPeerConnection")?,
     );
-
-    let ssrc = rand_u32();
-    let video_track = Arc::new(
-        TrackLocalStaticSample::new(MediaStreamTrack::new(
-            "simple_kvm-video".to_string(),
-            "simple_kvm-video".to_string(),
-            "simple_kvm-video".to_string(),
-            RtpCodecKind::Video,
-            vec![RTCRtpEncodingParameters { rtp_coding_parameters: RTCRtpCodingParameters { ssrc: Some(ssrc), ..Default::default() }, codec: h264_codec.rtp_codec, ..Default::default() }],
-        ))
-        .context("building H.264 track")?,
-    );
-    let video_sender = peer_connection.add_track(video_track.clone() as Arc<dyn TrackLocal>).await.context("adding H.264 track")?;
+    // Only settable now that `peer_connection` actually exists - see the
+    // doc comment on `Handler::pc`. Never fails: this is the only place
+    // that ever sets it, once, right here.
+    let _ = pc_cell.set(Arc::downgrade(&peer_connection));
 
     let offer = RTCSessionDescription::offer(offer_sdp).context("parsing browser's SDP offer")?;
     peer_connection.set_remote_description(offer).await.context("applying browser's offer")?;
@@ -216,6 +279,10 @@ async fn negotiate(offer_sdp: String, channels: SharedChannels) -> Result<String
     let _ = gather_complete_rx.await;
 
     let local_description = peer_connection.local_description().await.context("no local description after ICE gathering completed")?;
+    // Only now does `Handler::on_negotiation_needed` start acting on
+    // renegotiation triggers - see the doc comment on `Handler::ready` for
+    // why this can't just be unconditional.
+    ready.store(true, Ordering::Relaxed);
 
     let ctx = SessionContext {
         video_bus: channels.video_bus,
@@ -228,13 +295,14 @@ async fn negotiate(offer_sdp: String, channels: SharedChannels) -> Result<String
         hid_connected_rx: channels.hid_connected_rx,
         settings_path: channels.settings_path,
         force_keyframe: channels.force_keyframe,
+        h264_codec: h264_codec.rtp_codec,
         pc_state_rx,
     };
     let pc_for_session = peer_connection.clone();
     let client_count_guard = ClientCountGuard::new(channels.client_count_tx.clone());
     tokio::spawn(async move {
         let _client_count_guard = client_count_guard;
-        if let Err(err) = session::handle(pc_for_session, video_track, video_sender, dc_rx, ctx).await {
+        if let Err(err) = session::handle(pc_for_session, dc_rx, renegotiation_rx, ctx).await {
             tracing::debug!(%err, "WebRTC session ended");
         }
     });

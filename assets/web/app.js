@@ -4,7 +4,10 @@
 // mouse input goes out as small binary messages on an
 // unreliable/unordered data channel, and settings updates/paste text go
 // out as JSON on a reliable data channel, which also carries
-// device-state/settings pushes back from the server.
+// device-state/settings pushes back from the server. That same reliable
+// channel also carries any *later* offer/answer round trips the server
+// starts (see handleRenegotiationOffer) - there's no other signaling
+// channel left open once the initial connection is up.
 
 const TAG_KEY_EVENT = 1;
 const TAG_MOUSE_ABSOLUTE_MOVE = 2;
@@ -29,6 +32,7 @@ const saveSettings = document.getElementById('save-settings');
 const saveSettingsStatus = document.getElementById('save-settings-status');
 const versionEl = document.getElementById('version');
 
+let pc = null;
 let controlChannel = null;
 let inputChannel = null;
 // Whether the capture card / CH9329 are actually connected right now, per
@@ -361,7 +365,7 @@ async function connect() {
 
   setStatus('connecting…');
   updateSettingsAvailability();
-  const pc = new RTCPeerConnection();
+  pc = new RTCPeerConnection();
 
   pc.addEventListener('connectionstatechange', () => {
     if (pc.connectionState === 'connected') {
@@ -477,7 +481,20 @@ function handleServerMessage(msg) {
     // confirmation of a Save, or an unrelated push) - recompute so Save
     // re-disables itself rather than staying force-enabled.
     updateSaveButtonState();
+  } else if (msg.type === 'offer') {
+    handleRenegotiationOffer(msg.sdp).catch((err) => console.error('renegotiation failed:', err));
   }
+}
+
+// Applies a server-initiated renegotiation offer (see rtc::Handler::
+// on_negotiation_needed) - e.g. the server just added or removed this
+// session's video track. Fully separate from the initial connect() offer/
+// answer: this never touches input/control, which stay open throughout.
+async function handleRenegotiationOffer(sdp) {
+  await pc.setRemoteDescription({ type: 'offer', sdp });
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  sendControl({ type: 'answer', sdp: pc.localDescription.sdp });
 }
 
 function sendInput(bytes) {
@@ -637,6 +654,13 @@ function sendControl(message) {
     // Channel closing - drop it.
   }
 }
+
+// Debug hooks for issue #005's manual renegotiation trigger - no UI
+// element for this on purpose, since it's not a real feature yet (issue
+// #006 replaces it with a trigger driven by real capture-device
+// availability). Exercised by e2e/browser-test.sh via `agent-browser eval`.
+window.__debugToggleVideo = () => sendControl({ type: 'debug_toggle_video' });
+window.__debugPeerConnection = () => pc;
 
 wireTopbar();
 wireSettingsPanel();
