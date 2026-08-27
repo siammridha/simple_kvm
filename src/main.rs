@@ -4,13 +4,11 @@ mod config;
 mod device;
 mod event;
 mod rtc;
-mod settings_store;
 mod uevent;
 mod video_bus;
 mod web;
 
 use std::env;
-use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,20 +32,17 @@ async fn main() -> Result<()> {
     let serial_path = env::var("SERIAL_PATH").unwrap_or_else(|_| "/dev/ttyUSB0".to_string());
     let video_path = env::var("VIDEO_PATH").unwrap_or_else(|_| "/dev/video0".to_string());
     let http_port: u16 = env_parsed("HTTP_PORT").unwrap_or(3000);
-    let settings_path = PathBuf::from(env::var("SETTINGS_PATH").unwrap_or_else(|_| "/etc/simple_kvm-settings.json".to_string()));
     let serial_open_delay_secs: u64 = env_parsed("SERIAL_OPEN_DELAY_SECS").unwrap_or(30);
 
     // --- Capture: the card is never opened automatically right here at
     // startup (see `CaptureManager::run` for exactly when it is). Opening
     // it unprompted has reliably crashed the real hardware this targets
-    // right at boot (see README's "boot-crash" known issue). A settings
-    // file from a previous run is trusted blindly until the first real
-    // probe corrects the UI - there's no card on hand yet to validate it
-    // against. ---
+    // right at boot (see README's "boot-crash" known issue). Settings are
+    // in-memory only - every start uses a fixed default; nothing here is
+    // ever read from or written to disk. ---
     let capture_manager = CaptureManager::new(&video_path);
-    let persisted = settings_store::load(&settings_path);
-    let default_capture_settings = persisted.map(|p| p.capture).unwrap_or(CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5 });
-    let default_mouse_mode = persisted.map(|p| p.mouse_mode).unwrap_or(MouseMode::Absolute);
+    let default_capture_settings = CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5 };
+    let default_mouse_mode = MouseMode::Absolute;
 
     let (device_state_tx, device_state_rx) = watch::channel(DeviceState::default());
     let (capture_settings_tx, capture_settings_rx) = watch::channel(default_capture_settings);
@@ -70,7 +65,6 @@ async fn main() -> Result<()> {
         mouse_mode_tx,
         device_state_rx,
         hid_connected_rx,
-        settings_path,
         force_keyframe: force_keyframe.clone(),
         client_count_tx,
     };

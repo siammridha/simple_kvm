@@ -3,12 +3,11 @@
 //! shared `video_bus`, translating `input` data channel messages into
 //! `SerialCommand`s, and reading `control` data channel JSON (the Save
 //! button's settings update, paste). Settings changes only touch the
-//! shared `watch<Settings>` and the settings file — the connection itself
-//! is never disturbed, so applying new settings never drops the session.
+//! shared `watch<Settings>` — in memory only, the connection itself is
+//! never disturbed, so applying new settings never drops the session.
 
 use anyhow::Result;
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,8 +29,7 @@ use webrtc::rtp_transceiver::RtpSender;
 use crate::capture::v4l2::Resolution;
 use crate::ch9329::keymap::{self, KeyCode};
 use crate::ch9329::writer::SerialCommand;
-use crate::config::{CaptureSettings, DeviceState, MouseMode, PersistedSettings};
-use crate::settings_store;
+use crate::config::{CaptureSettings, DeviceState, MouseMode};
 use crate::video_bus;
 
 use super::protocol::{ControlMessage, InputEvent, MouseModeWire, ServerMessage};
@@ -45,7 +43,6 @@ pub struct SessionContext {
     pub mouse_mode_rx: watch::Receiver<MouseMode>,
     pub device_state_rx: watch::Receiver<DeviceState>,
     pub hid_connected_rx: watch::Receiver<bool>,
-    pub settings_path: PathBuf,
     pub force_keyframe: Arc<AtomicBool>,
     /// See `super::SharedChannels::client_count_tx` - `handle` below wraps
     /// this in a `ClientCountGuard` the moment the connection first reaches
@@ -391,47 +388,32 @@ async fn handle_input_event(event: InputEvent, keyboard: &mut KeyboardState, ctx
 
 fn handle_control_message(msg: ControlMessage, ctx: &SessionContext) {
     match msg {
-        // Applies and persists whichever half the page included, sent when
-        // the page's Save button is clicked (see `assets/web/app.js`) -
-        // dropdowns no longer apply live. `capture` is only present if the
-        // page saw a capture card connected; `mouse_mode` only if it saw
-        // the CH9329 connected - there's nothing meaningful to save for a
-        // device that isn't there, so that half is just left as it was.
+        // Applies whichever half the page included, sent when the page's
+        // Save button is clicked (see `assets/web/app.js`) - dropdowns no
+        // longer apply live. `capture` is only present if the page saw a
+        // capture card connected; `mouse_mode` only if it saw the CH9329
+        // connected - there's nothing meaningful to apply for a device
+        // that isn't there, so that half is just left as it was. In-memory
+        // only: nothing here is ever written to disk.
         ControlMessage::UpdateSettings { capture, mouse_mode } => {
-            let had_update = capture.is_some() || mouse_mode.is_some();
             if let Some(capture) = capture {
                 ctx.capture_settings_tx.send_modify(|s| {
                     s.resolution = Resolution { width: capture.width, height: capture.height };
                     s.fps = capture.fps;
                 });
+                tracing::info!(width = capture.width, height = capture.height, fps = capture.fps, "capture settings updated");
             }
             // The server doesn't need mouse mode to translate input events —
             // that's purely which message variant the client sends (see
             // `InputEvent`) — but it's tracked here anyway so it can be
-            // persisted and reported back as the default on the next page
-            // load.
+            // reported back as the default for the life of this run.
             if let Some(mouse_mode) = mouse_mode {
-                ctx.mouse_mode_tx.send_replace(match mouse_mode {
+                let mouse_mode = match mouse_mode {
                     MouseModeWire::Absolute => MouseMode::Absolute,
                     MouseModeWire::Relative => MouseMode::Relative,
-                });
-            }
-
-            if had_update {
-                let settings = PersistedSettings { capture: *ctx.capture_settings_rx.borrow(), mouse_mode: *ctx.mouse_mode_rx.borrow() };
-                tracing::info!(
-                    width = settings.capture.resolution.width,
-                    height = settings.capture.resolution.height,
-                    fps = settings.capture.fps,
-                    ?settings.mouse_mode,
-                    "settings updated"
-                );
-                let path = ctx.settings_path.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = tokio::task::spawn_blocking(move || settings_store::save(&path, settings)).await {
-                        tracing::error!(%err, "settings save task panicked");
-                    }
-                });
+                };
+                ctx.mouse_mode_tx.send_replace(mouse_mode);
+                tracing::info!(?mouse_mode, "mouse mode updated");
             }
         }
         ControlMessage::Paste { text } => {
@@ -449,7 +431,7 @@ mod tests {
     use crate::capture::v4l2::Resolution;
     use crate::rtc::protocol::CaptureSettingsWire;
 
-    fn test_ctx(settings_path: PathBuf) -> SessionContext {
+    fn test_ctx() -> SessionContext {
         let (_video_tx, video_rx) = video_bus::channel();
         let (serial_tx, _serial_rx) = mpsc::channel(1);
         let (capture_settings_tx, capture_settings_rx) =
@@ -468,23 +450,15 @@ mod tests {
             mouse_mode_rx,
             device_state_rx,
             hid_connected_rx,
-            settings_path,
             force_keyframe: Arc::new(AtomicBool::new(false)),
             client_count_tx,
             pc_state_rx,
         }
     }
 
-    fn temp_settings_path(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("simple_kvm_session_test_{}_{}", name, std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join("settings.json")
-    }
-
     #[tokio::test]
     async fn update_settings_with_capture_only_leaves_mouse_mode_untouched() {
-        let path = temp_settings_path("capture_only");
-        let ctx = test_ctx(path.clone());
+        let ctx = test_ctx();
 
         handle_control_message(
             ControlMessage::UpdateSettings { capture: Some(CaptureSettingsWire { width: 1920, height: 1080, fps: 25 }), mouse_mode: None },
@@ -493,19 +467,11 @@ mod tests {
 
         assert_eq!(*ctx.capture_settings_rx.borrow(), CaptureSettings { resolution: Resolution { width: 1920, height: 1080 }, fps: 25 });
         assert_eq!(*ctx.mouse_mode_rx.borrow(), MouseMode::Absolute);
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let saved = settings_store::load(&path).expect("save spawned by handle_control_message should have run");
-        assert_eq!(saved.capture.fps, 25);
-        assert_eq!(saved.mouse_mode, MouseMode::Absolute);
-
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     #[tokio::test]
     async fn update_settings_with_mouse_mode_only_leaves_capture_untouched() {
-        let path = temp_settings_path("mouse_mode_only");
-        let ctx = test_ctx(path.clone());
+        let ctx = test_ctx();
 
         handle_control_message(ControlMessage::UpdateSettings { capture: None, mouse_mode: Some(MouseModeWire::Relative) }, &ctx);
 
@@ -514,25 +480,18 @@ mod tests {
             CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5 }
         );
         assert_eq!(*ctx.mouse_mode_rx.borrow(), MouseMode::Relative);
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let saved = settings_store::load(&path).expect("save spawned by handle_control_message should have run");
-        assert_eq!(saved.capture.fps, 5);
-        assert_eq!(saved.mouse_mode, MouseMode::Relative);
-
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     #[tokio::test]
-    async fn update_settings_with_neither_field_does_not_write_a_settings_file() {
-        let path = temp_settings_path("neither");
-        let ctx = test_ctx(path.clone());
+    async fn update_settings_with_neither_field_leaves_both_untouched() {
+        let ctx = test_ctx();
 
         handle_control_message(ControlMessage::UpdateSettings { capture: None, mouse_mode: None }, &ctx);
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(settings_store::load(&path).is_none(), "no fields present means nothing should be persisted");
-
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        assert_eq!(
+            *ctx.capture_settings_rx.borrow(),
+            CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5 }
+        );
+        assert_eq!(*ctx.mouse_mode_rx.borrow(), MouseMode::Absolute);
     }
 }

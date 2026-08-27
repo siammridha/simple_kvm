@@ -1,7 +1,6 @@
 pub mod protocol;
 pub mod session;
 
-use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -41,7 +40,6 @@ pub struct SharedChannels {
     pub mouse_mode_tx: watch::Sender<MouseMode>,
     pub device_state_rx: watch::Receiver<DeviceState>,
     pub hid_connected_rx: watch::Receiver<bool>,
-    pub settings_path: PathBuf,
     /// Set by a session on an RTCP keyframe request (PLI/FIR), cleared by
     /// the capture task once it's forced a fresh keyframe — see
     /// `session::handle`'s `video_track.poll()` branch and
@@ -211,7 +209,6 @@ async fn negotiate(offer_sdp: String, channels: SharedChannels) -> Result<String
         mouse_mode_rx: channels.mouse_mode_tx.subscribe(),
         device_state_rx: channels.device_state_rx,
         hid_connected_rx: channels.hid_connected_rx,
-        settings_path: channels.settings_path,
         force_keyframe: channels.force_keyframe,
         client_count_tx: channels.client_count_tx,
         pc_state_rx,

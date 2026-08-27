@@ -23,11 +23,6 @@ SOCAT_PID=$!
 for _ in $(seq 1 50); do [ -e "$TEST_DIR/ch9329" ] && break; sleep 0.1; done
 export SERIAL_PATH="$TEST_DIR/ch9329"
 export SERIAL_OPEN_DELAY_SECS=0
-# The default SETTINGS_PATH (/etc/simple_kvm-settings.json) usually isn't
-# writable by a non-root test user - point at the temp dir instead so the
-# Save-settings persistence check below exercises a real file write, not
-# just the in-memory value surviving a page reload.
-export SETTINGS_PATH="$TEST_DIR/settings.json"
 
 export AGENT_BROWSER_EXECUTABLE_PATH="/usr/bin/chromium"
 export AGENT_BROWSER_ARGS="--no-sandbox"
@@ -108,13 +103,7 @@ agent-browser select "#mouse-mode" relative
 agent-browser click "#save-settings"
 sleep 0.5
 
-if ! grep -q '"mouse_mode": "relative"' "$TEST_DIR/settings.json" 2>/dev/null; then
-	echo "FAIL: settings.json doesn't show mouse_mode: relative after clicking Save" >&2
-	cat "$TEST_DIR/settings.json" 2>&1 >&2 || echo "(file doesn't exist)" >&2
-	exit 1
-fi
-
-echo "Reloading to confirm the change was applied and persisted (not just picked in the dropdown)..."
+echo "Reloading to confirm the change was applied in memory (not just picked in the dropdown)..."
 agent-browser reload
 agent-browser wait --load load
 STATUS_TEXT=""
@@ -131,7 +120,7 @@ fi
 MOUSE_MODE=$(agent-browser get value "#mouse-mode")
 echo "mouse mode after reload: $MOUSE_MODE"
 if [ "$MOUSE_MODE" != "relative" ]; then
-	echo "FAIL: expected mouse mode 'relative' to have persisted through Save + reload, got '$MOUSE_MODE'" >&2
+	echo "FAIL: expected mouse mode 'relative' to still be in effect (in memory) through Save + reload, got '$MOUSE_MODE'" >&2
 	exit 1
 fi
 
@@ -142,4 +131,4 @@ if [ -n "$PAGE_ERRORS" ]; then
 	exit 1
 fi
 
-echo "PASS: page loaded, dropdowns present, WebRTC connected with no TLS anywhere, Save settings applied and persisted, no uncaught JS errors."
+echo "PASS: page loaded, dropdowns present, WebRTC connected with no TLS anywhere, Save settings applied in memory (no settings file), no uncaught JS errors."
