@@ -1,6 +1,8 @@
 mod capture;
 mod ch9329;
 mod config;
+mod device;
+mod event;
 mod rtc;
 mod settings_store;
 mod uevent;
