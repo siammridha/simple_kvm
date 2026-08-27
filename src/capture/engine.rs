@@ -1,9 +1,10 @@
 //! `CaptureEngine`/`CaptureStream` - the `getUserMedia`/`MediaStreamTrack`
 //! equivalent described in `docs/capture-redesign-ideas.md`, built on top
-//! of `Device<CaptureDriver>` (see `capture::driver`). Standalone for now -
-//! nothing in `rtc/` wires up to this yet (that's issue #006);
-//! `CaptureManager` (`capture::mod`) keeps running the app until then.
-#![allow(dead_code)]
+//! of `Device<CaptureDriver>` (see `capture::driver`). Wired into the real
+//! session layer by `rtc::session::handle` (issue #006): a session asks
+//! `request_stream()` for a live stream once its connection is stable, and
+//! subscribes to the returned `CaptureStream`'s `ended` event to know when
+//! to drop it.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -169,6 +170,24 @@ impl CaptureEngine {
         Ok(CaptureStream { inner: Arc::new(StreamInner { frames: AsyncMutex::new(self.shared.video_bus_rx.clone()), ended, _live: LiveMarker { shared: Arc::clone(&self.shared) } }) })
     }
 
+    /// Mirrors `navigator.mediaDevices.ondevicechange` for the specific
+    /// device this engine wraps - forwards presence/capability transitions
+    /// exactly as `Device<CaptureDriver>` reports them. What
+    /// `rtc::session::handle` subscribes to in order to retry
+    /// `request_stream()` once a previously-unavailable device becomes
+    /// present again, without needing a new browser connection - matches
+    /// `request_stream`'s own presence-only gating (`Device::open` matches
+    /// on `DeviceStatus::Present(_)` regardless of whether probing
+    /// succeeded), rather than the stricter "successfully probed" signal
+    /// `DeviceState` carries for the UI.
+    pub fn add_event_listener<F, Fut>(&self, callback: F) -> Subscription<DeviceStatus<SupportedFormat>>
+    where
+        F: Fn(DeviceStatus<SupportedFormat>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.shared.device.add_event_listener(callback)
+    }
+
     /// Test-only hook exposing whether a pass is currently marked as
     /// running, without needing real hardware or waiting on a real
     /// blocking capture thread to actually execute - this is what proves
@@ -182,9 +201,11 @@ impl CaptureEngine {
 
 /// Starts the shared encode pass against `device_path`, reusing
 /// `capture::run_one_pass` (in turn `v4l2::run_capture_loop` and
-/// `h264::H264Encoder`) exactly as `CaptureManager` does today - only the
-/// start/stop trigger differs, tied to `state.live` instead of
-/// `client_count`. Must be called with `state`'s lock already held.
+/// `h264::H264Encoder`) - the same capture/encode machinery the pre-#004
+/// `CaptureManager` used, just with a different start/stop trigger, tied
+/// to `state.live` (this module's own live-stream count) rather than a
+/// raw connected-session counter. Must be called with `state`'s lock
+/// already held.
 fn start_pass(shared: &Arc<Shared>, state: &mut State, device_path: String) {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_task = Arc::clone(&stop);
@@ -292,6 +313,18 @@ impl CaptureStream {
             return None;
         }
         frames.borrow().clone()
+    }
+
+    /// Mirrors `RTCRtpSender.generateKeyFrame()` (roughly) - asks the
+    /// shared encode pass to produce a fresh keyframe as soon as possible,
+    /// rather than waiting for its own periodic schedule. The atomic this
+    /// sets is shared by every currently-live stream against the same
+    /// pass, same as the encoder itself is shared - a keyframe request from
+    /// any one session's decoder benefits every session, not just the one
+    /// that asked. Used by `rtc::session::handle` in response to an RTCP
+    /// PLI/FIR from the browser.
+    pub fn request_keyframe(&self) {
+        self.inner._live.shared.force_keyframe.store(true, Ordering::Relaxed);
     }
 }
 

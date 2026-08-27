@@ -3,15 +3,11 @@
 //! through one interface rather than a separate hand-rolled presence
 //! module per physical device kind (see `docs/capture-redesign-ideas.md`,
 //! "Decided: one generic device module, not one-off per device kind").
-//! The capture card (issue #005+) and the CH9329 (issue #009) each plug in
-//! their own `DeviceDriver` impl for *how* to probe/open; this module
-//! owns everything device-kind-independent: presence detection, event
-//! dispatch (via `crate::event`), and encapsulating the raw device path.
-//!
-//! Pure foundation piece for issue #003 - nothing in the running app wires
-//! this up yet; the capture card and CH9329 get their own `DeviceDriver`
-//! impls in later issues (#005+, #009), which is what gives this a caller.
-#![allow(dead_code)]
+//! The capture card (`capture::driver::CaptureDriver`) and the CH9329
+//! (`ch9329::device::Ch9329Driver`) each plug in their own `DeviceDriver`
+//! impl for *how* to probe/open; this module owns everything
+//! device-kind-independent: presence detection, event dispatch (via
+//! `crate::event`), and encapsulating the raw device path.
 
 use std::fmt;
 use std::future::Future;
@@ -35,10 +31,9 @@ pub trait DeviceDriver: Send + Sync + 'static {
     type Settings: Send + 'static;
     type Open: Send + 'static;
 
-    /// Probes `device_path` for its capabilities. Never errors the caller
-    /// - any failure (no such device, wrong kind, an ioctl error) is
-    /// reported as `None`, the same contract `capture::probe` follows
-    /// today.
+    /// Probes `device_path` for its capabilities. Never errors the caller -
+    /// any failure (no such device, wrong kind, an ioctl error) is reported
+    /// as `None`, the same contract `CaptureDriver::probe` follows.
     fn probe(device_path: &str) -> Option<Self::Info>;
 
     /// Opens `device_path` for actual use with the given settings.
@@ -81,6 +76,19 @@ struct DeviceInner<D: DeviceDriver> {
 /// device isn't currently present).
 pub struct Device<D: DeviceDriver> {
     inner: Arc<DeviceInner<D>>,
+}
+
+/// Manual impl (rather than `#[derive(Clone)]`, which would otherwise
+/// require `D: Clone` itself - no `DeviceDriver` impl needs that) - every
+/// field this actually clones is already `Arc`-backed. Lets a caller (e.g.
+/// `main.rs`) hold two independent handles to the same underlying presence
+/// task/device path - one to build a `CaptureEngine` from, one to
+/// subscribe to directly for `DeviceState` publishing - without the
+/// presence task itself being duplicated.
+impl<D: DeviceDriver> Clone for Device<D> {
+    fn clone(&self) -> Self {
+        Self { inner: Arc::clone(&self.inner) }
+    }
 }
 
 impl<D: DeviceDriver> Device<D> {
@@ -166,8 +174,8 @@ async fn run_presence_task<D: DeviceDriver>(inner: Arc<DeviceInner<D>>, uevent_s
 /// takes "is the device present right now" as a plain `bool` from its
 /// caller rather than checking `Path::exists` itself. Moved and
 /// generalized from the `device_present`/`known_present`/`first_check`
-/// variables and loop structure in `capture::CaptureManager::run`
-/// (`src/capture/mod.rs`), not reinvented.
+/// variables and loop structure the capture card's presence handling used
+/// before this module existed, not reinvented.
 struct PresenceState<D: DeviceDriver> {
     known_present: bool,
     first_check: bool,

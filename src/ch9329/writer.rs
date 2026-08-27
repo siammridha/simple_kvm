@@ -190,8 +190,9 @@ impl SerialWriter {
 /// is sourced from `Ch9329Device`'s shared presence detection (see
 /// `ch9329::device`), which already does the kernel `tty` uevent
 /// listening this function used to do itself — the same immediate-
-/// detection treatment `capture::CaptureManager` gives the capture card,
-/// now shared via the generic device core instead of reimplemented here.
+/// detection treatment `capture::driver::CaptureDevice` gives the capture
+/// card, both built on the generic `device::Device<D>` core instead of
+/// each reimplementing it.
 pub async fn watch_connection(mut present_rx: watch::Receiver<bool>, commands: mpsc::Sender<SerialCommand>) {
     loop {
         if present_rx.changed().await.is_err() {

@@ -1,10 +1,12 @@
 //! Per-connection handling: one task juggling video, input, and control
-//! over `tokio::select!` — sending video frames as they arrive on the
-//! shared `video_bus`, translating `input` data channel messages into
+//! over `tokio::select!` — sending video frames from this session's own
+//! `CaptureStream` once one is attached (see `CaptureEngine::
+//! request_stream`), translating `input` data channel messages into
 //! `SerialCommand`s, and reading `control` data channel JSON (the Save
-//! button's settings update, paste). Settings changes only touch the
-//! shared `watch<Settings>` — in memory only, the connection itself is
-//! never disturbed, so applying new settings never drops the session.
+//! button's settings update, paste, SDP renegotiation answers). Settings
+//! changes only touch the shared `watch<Settings>` — in memory only, the
+//! connection itself is never disturbed, so applying new settings never
+//! drops the session.
 
 use anyhow::{Context, Result};
 use std::collections::HashSet;
@@ -28,16 +30,24 @@ use webrtc::media_stream::{MediaStreamTrack, Track};
 use webrtc::peer_connection::{PeerConnection, RTCPeerConnectionState, RTCSessionDescription};
 use webrtc::rtp_transceiver::RtpSender;
 
-use crate::capture::v4l2::Resolution;
+use crate::capture::engine::{CaptureEngine, CaptureStream, NoDevice};
+use crate::capture::v4l2::{Resolution, SupportedFormat};
 use crate::ch9329::keymap::{self, KeyCode};
 use crate::ch9329::writer::SerialCommand;
 use crate::config::{CaptureSettings, DeviceState, MouseMode};
-use crate::video_bus;
+use crate::device::DeviceStatus;
+use crate::event::Subscription;
+use crate::video_bus::FrameEnvelope;
 
 use super::protocol::{ControlMessage, InputEvent, MouseModeWire, ServerMessage};
 
 pub struct SessionContext {
-    pub video_bus: video_bus::Receiver,
+    /// Shared across every session on this server - see
+    /// `super::SharedChannels::capture_engine`. `handle` calls
+    /// `request_stream()` on this once the connection is stable, and again
+    /// on every later device-availability signal while this session still
+    /// has no track.
+    pub capture_engine: Arc<CaptureEngine>,
     pub serial_tx: mpsc::Sender<SerialCommand>,
     pub capture_settings_tx: watch::Sender<CaptureSettings>,
     pub capture_settings_rx: watch::Receiver<CaptureSettings>,
@@ -45,14 +55,9 @@ pub struct SessionContext {
     pub mouse_mode_rx: watch::Receiver<MouseMode>,
     pub device_state_rx: watch::Receiver<DeviceState>,
     pub hid_connected_rx: watch::Receiver<bool>,
-    pub force_keyframe: Arc<AtomicBool>,
-    /// See `super::SharedChannels::client_count_tx` - `handle` below wraps
-    /// this in a `ClientCountGuard` the moment the connection first reaches
-    /// `Connected`, not before.
-    pub client_count_tx: watch::Sender<u32>,
     /// The H.264 codec registered on this connection's `MediaEngine` (see
     /// `negotiate()`), needed to build a fresh `TrackLocalStaticSample`
-    /// whenever `ControlMessage::DebugToggleVideo` adds one — see
+    /// whenever a live capture stream becomes available — see
     /// `add_video_track`.
     pub h264_codec: RTCRtpCodec,
     /// Mirrors the `RTCPeerConnection`'s own connection state (see
@@ -61,27 +66,6 @@ pub struct SessionContext {
     /// disconnects/fails/closes, rather than only when the `control` data
     /// channel happens to notice on its own.
     pub pc_state_rx: watch::Receiver<RTCPeerConnectionState>,
-}
-
-/// Held from the moment a session's `RTCPeerConnection` first reaches
-/// `Connected` (see `handle`'s `pc_state_rx` arm) until the session ends;
-/// its `Drop` is what guarantees the count comes back down no matter which
-/// exit path (clean shutdown, peer-connection failure/close, panic)
-/// actually ends it. `CaptureManager::run` only opens/streams the capture
-/// card while at least one of these is held.
-struct ClientCountGuard(watch::Sender<u32>);
-
-impl ClientCountGuard {
-    fn new(tx: watch::Sender<u32>) -> Self {
-        tx.send_modify(|n| *n += 1);
-        Self(tx)
-    }
-}
-
-impl Drop for ClientCountGuard {
-    fn drop(&mut self) {
-        self.0.send_modify(|n| *n = n.saturating_sub(1));
-    }
 }
 
 /// The two data channels the browser creates before sending its offer
@@ -125,11 +109,16 @@ async fn video_target(video_track: &TrackLocalStaticSample, video_sender: &Arc<d
     Ok((ssrc, payload_type))
 }
 
-/// One session's live H.264 track — built fresh whenever
-/// `ControlMessage::DebugToggleVideo` adds one, rather than shared across
-/// sessions or built up front, since `TrackLocalStaticSample` only
-/// supports one peer-connection binding at a time: adding the same track
-/// object to a second connection would silently steal it from the first.
+/// One session's live H.264 track, plus the `CaptureStream` that feeds it
+/// and drives its removal - built fresh every time a stream becomes
+/// available, rather than shared across sessions or built up front, since
+/// `TrackLocalStaticSample` only supports one peer-connection binding at a
+/// time (see `docs/video-track-per-session.md`). Holding the
+/// `CaptureStream` here for exactly as long as this session has a track is
+/// what ties the shared encode pass's own start/stop to real consumers
+/// existing (see `CaptureEngine`'s own live-stream count) - dropping
+/// `VideoState`, however that happens (deliberate removal or the whole
+/// session ending), releases this session's hold on it.
 struct VideoState {
     track: Arc<TrackLocalStaticSample>,
     sender: Arc<dyn RtpSender>,
@@ -139,17 +128,28 @@ struct VideoState {
     /// `handle`) — the sender has no negotiated codec parameters before
     /// then, even though the track and sender objects already exist.
     target: Option<(u32, PayloadType)>,
+    stream: CaptureStream,
+    /// Kept alive only for its `Drop`-based deregistration - forwards the
+    /// stream's `ended` event into `handle`'s `video_ended_tx` (see
+    /// `try_attach_video`).
+    _ended_sub: Subscription<()>,
 }
 
-/// Builds a fresh H.264 track and attaches it to `pc`. Per issue #005:
-/// confirmed against the vendored `rtc-0.20.3` source that `add_track`
-/// reuses the transceiver the browser already offered for video (matching
-/// `kind()`/an empty `sender()`) rather than adding a duplicate `m=video`
-/// line, and itself calls `trigger_negotiation_needed()` — which is what
-/// drives `Handler::on_negotiation_needed` (see `super::Handler`) to
-/// create a fresh offer and hand it to this session over
-/// `renegotiation_rx`.
-async fn add_video_track(pc: &Arc<dyn PeerConnection>, codec: &RTCRtpCodec) -> Result<VideoState> {
+/// Just the RTP-track half of what a live capture stream needs -
+/// `try_attach_video` combines this with the `CaptureStream` it's for.
+struct RawVideoTrack {
+    track: Arc<TrackLocalStaticSample>,
+    sender: Arc<dyn RtpSender>,
+}
+
+/// Builds a fresh H.264 track and attaches it to `pc`. Confirmed against
+/// the vendored `rtc-0.20.3` source that `add_track` reuses the
+/// transceiver the browser already offered for video (matching `kind()`/an
+/// empty `sender()`) rather than adding a duplicate `m=video` line, and
+/// itself calls `trigger_negotiation_needed()` — which is what drives
+/// `Handler::on_negotiation_needed` (see `super::Handler`) to create a
+/// fresh offer and hand it to this session over `renegotiation_rx`.
+async fn add_video_track(pc: &Arc<dyn PeerConnection>, codec: &RTCRtpCodec) -> Result<RawVideoTrack> {
     let ssrc = super::rand_u32();
     let track = Arc::new(
         TrackLocalStaticSample::new(MediaStreamTrack::new(
@@ -166,45 +166,79 @@ async fn add_video_track(pc: &Arc<dyn PeerConnection>, codec: &RTCRtpCodec) -> R
         .context("building H.264 track")?,
     );
     let sender = pc.add_track(track.clone() as Arc<dyn TrackLocal>).await.context("adding H.264 track")?;
-    Ok(VideoState { track, sender, target: None })
+    Ok(RawVideoTrack { track, sender })
 }
 
-/// Adds or removes this session's video track in response to the debug
-/// trigger (`ControlMessage::DebugToggleVideo` — issue #005's temporary
-/// stand-in for a trigger based on real capture-device availability,
-/// which issue #006 adds). `remove_track`, like `add_track`, calls the
-/// crate's own `trigger_negotiation_needed()`.
-async fn toggle_video(pc: &Arc<dyn PeerConnection>, video: Option<VideoState>, codec: &RTCRtpCodec) -> Option<VideoState> {
-    match video {
-        Some(v) => {
-            if let Err(err) = pc.remove_track(&v.sender).await {
-                tracing::warn!(%err, "failed to remove video track");
-                return Some(v);
-            }
-            tracing::info!("debug trigger: removed video track");
-            None
+/// Asks the capture engine for a live stream (`CaptureEngine::
+/// request_stream`, mirroring `getUserMedia`) and, on success, builds and
+/// attaches a fresh RTP track for it. Returns `None` if the device isn't
+/// currently available (`NoDevice`) or attaching the track itself failed -
+/// either way the caller just leaves the session without video, ready to
+/// try again the next time `handle`'s `presence_rx` reports the device is
+/// available.
+async fn try_attach_video(
+    pc: &Arc<dyn PeerConnection>,
+    capture_engine: &CaptureEngine,
+    settings: CaptureSettings,
+    codec: &RTCRtpCodec,
+    video_ended_tx: &mpsc::UnboundedSender<()>,
+) -> Option<VideoState> {
+    let stream = match capture_engine.request_stream(settings).await {
+        Ok(stream) => stream,
+        Err(NoDevice) => return None,
+    };
+    let raw = match add_video_track(pc, codec).await {
+        Ok(raw) => raw,
+        Err(err) => {
+            tracing::warn!(%err, "failed to add video track");
+            return None;
         }
-        None => match add_video_track(pc, codec).await {
-            Ok(v) => {
-                tracing::info!("debug trigger: added video track");
-                Some(v)
-            }
-            Err(err) => {
-                tracing::warn!(%err, "failed to add video track");
-                None
-            }
-        },
+    };
+    let video_ended_tx = video_ended_tx.clone();
+    let ended_sub = stream.add_event_listener(move |()| {
+        let video_ended_tx = video_ended_tx.clone();
+        async move {
+            let _ = video_ended_tx.send(());
+        }
+    });
+    tracing::info!("capture device available: added video track");
+    Some(VideoState { track: raw.track, sender: raw.sender, target: None, stream, _ended_sub: ended_sub })
+}
+
+/// Removes this session's video track (in response to its `CaptureStream`'s
+/// `ended` event, forwarded via `handle`'s `video_ended_rx`) and
+/// renegotiates the same way `try_attach_video`'s `add_track` did -
+/// `remove_track`, like `add_track`, calls the crate's own
+/// `trigger_negotiation_needed()`. Always drops `video` regardless of
+/// whether `remove_track` itself succeeds: by the time `ended` has fired,
+/// the underlying capture pass is already gone, so there's nothing left
+/// worth preserving state for - a later device-availability event just
+/// requests a fresh stream and track from scratch.
+async fn remove_video_track(pc: &Arc<dyn PeerConnection>, video: VideoState) {
+    if let Err(err) = pc.remove_track(&video.sender).await {
+        tracing::warn!(%err, "failed to remove video track");
+    }
+    tracing::info!("capture device unavailable: removed video track");
+}
+
+/// Polls the current video stream for its next frame, or never resolves if
+/// there isn't one. A plain `video.as_ref().unwrap().stream.next_frame()`
+/// in the `tokio::select!` branch below would panic when `video` is
+/// `None`: an `if` guard only stops the resulting future from being
+/// *polled*, not the branch expression from being *evaluated* — evaluation
+/// happens on every loop iteration regardless of the guard. Wrapping the
+/// `None` case in `std::future::pending()` here keeps evaluation itself
+/// infallible.
+async fn poll_frame(video: &Option<VideoState>) -> Option<FrameEnvelope> {
+    match video {
+        Some(v) => v.stream.next_frame().await,
+        None => std::future::pending().await,
     }
 }
 
-/// Polls the current video track's RTCP events, or never resolves if
-/// there isn't one. A plain `video.as_ref().unwrap().track.poll()` in the
-/// `tokio::select!` branch below would panic when `video` is `None`: an
-/// `if` guard only stops the resulting future from being *polled*, not
-/// the branch expression from being *evaluated* — evaluation happens on
-/// every loop iteration regardless of the guard. Wrapping the `None` case
-/// in `std::future::pending()` here keeps evaluation itself infallible.
-async fn poll_video(video: &Option<VideoState>) -> Option<TrackLocalEvent> {
+/// Same guard-evaluation reasoning as `poll_frame`, for the current video
+/// track's RTCP events instead of its frames.
+async fn poll_rtcp(video: &Option<VideoState>) -> Option<TrackLocalEvent> {
     match video {
         Some(v) => v.track.poll().await,
         None => std::future::pending().await,
@@ -241,18 +275,41 @@ pub async fn handle(
     ctx: SessionContext,
 ) -> Result<()> {
     let DataChannels { input, control } = collect_data_channels(dc_rx).await?;
-    // Starts with no video track at all (see issue #005) — one is added
-    // later via the debug trigger below, or (once issue #006 lands) real
-    // capture-device availability.
+    // Starts with no video track at all - one is added later, once the
+    // connection is stable *and* the capture device is available (see the
+    // `pc_state_rx`/`presence_rx` arms below), added live via
+    // renegotiation rather than being present from the start.
     let mut video: Option<VideoState> = None;
 
-    let mut video_rx = ctx.video_bus.clone();
     let mut device_state_rx = ctx.device_state_rx.clone();
     let mut capture_settings_rx = ctx.capture_settings_rx.clone();
     let mut mouse_mode_rx = ctx.mouse_mode_rx.clone();
     let mut hid_connected_rx = ctx.hid_connected_rx.clone();
     let mut pc_state_rx = ctx.pc_state_rx.clone();
     let mut keyboard = KeyboardState::default();
+
+    // Forwards `CaptureEngine`'s own device-presence events into this
+    // session's `select!` loop - what drives retrying `request_stream()`
+    // once a previously-unavailable device becomes present again, without
+    // needing a new browser connection. Kept alive for the life of this
+    // session via `_presence_sub`.
+    let (presence_tx, mut presence_rx) = mpsc::unbounded_channel::<DeviceStatus<SupportedFormat>>();
+    let _presence_sub = ctx.capture_engine.add_event_listener(move |status| {
+        let presence_tx = presence_tx.clone();
+        async move {
+            let _ = presence_tx.send(status);
+        }
+    });
+
+    // Fed by whichever `VideoState` is currently attached (see its
+    // `_ended_sub`) - fires once the underlying capture pass ends (device
+    // lost, unrecoverable error), however many times this session
+    // attaches/loses a stream over its lifetime. Only ever one live
+    // `VideoState`/subscription at a time, so there's no risk of a signal
+    // meant for an already-replaced stream arriving late: `video` can only
+    // go back to `Some` after this channel's message for the previous one
+    // has already been drained (that's the only thing that clears it).
+    let (video_ended_tx, mut video_ended_rx) = mpsc::unbounded_channel::<()>();
 
     // Every outbound state message goes through this queue instead of
     // `control.send()` directly - `relay_outbound` below is the only task
@@ -275,45 +332,53 @@ pub async fn handle(
     });
 
     let mut input_active = true;
-    // Created the moment the connection first reaches `Connected` - see the
-    // `pc_state_rx` arm below. Kept `None` until then so the capture card
-    // is never opened/streamed to before the connection is fully stable.
-    let mut client_count_guard: Option<ClientCountGuard> = None;
+    // True from the moment the connection first reaches `Connected` - see
+    // the `pc_state_rx` arm below. Gates every `try_attach_video` attempt
+    // (initial and retry) so the capture device is never touched before
+    // the connection is fully stable.
+    let mut connected = false;
     // The real capture-time delta between consecutive frames, used as each
     // RTP sample's duration so the browser's jitter buffer gets correct
-    // pacing info — see `send_frame`. `None` for the very first frame with
-    // a video track actually attached, which has no prior frame to diff
-    // against — true both for a session's first frame ever and for its
-    // first frame after the debug trigger (re)adds a video track.
+    // pacing info — see `send_frame`. `None` whenever there's no prior
+    // frame in the *current* stream to diff against - reset every time a
+    // fresh stream is attached (both `try_attach_video` call sites below),
+    // not just once per session.
     let mut last_captured_at: Option<Duration> = None;
-    // Set once the video_bus sender is gone for good (only happens if the
-    // capture task itself is torn down, e.g. process shutdown - it no
-    // longer exits just because the card is absent or unplugged, see
-    // `CaptureManager::run`). Keyboard and mouse must keep working either
-    // way, so this only disables the video branch — it must never end the
-    // session.
-    let mut video_closed = false;
 
     loop {
         tokio::select! {
-            changed = video_rx.changed(), if !video_closed => {
-                match changed {
-                    Ok(()) => {
-                        let frame = video_rx.borrow_and_update().clone();
-                        if let (Some(frame), Some(video)) = (frame, &video) {
-                            let duration = last_captured_at.map(|t| frame.captured_at.saturating_sub(t)).unwrap_or(Duration::ZERO);
-                            last_captured_at = Some(frame.captured_at);
-                            send_frame(&frame.data, duration, &video.track, video.target).await;
-                        }
-                    }
-                    Err(_) => video_closed = true,
+            frame = poll_frame(&video), if video.is_some() => {
+                if let (Some(v), Some(frame)) = (&video, frame) {
+                    let duration = last_captured_at.map(|t| frame.captured_at.saturating_sub(t)).unwrap_or(Duration::ZERO);
+                    last_captured_at = Some(frame.captured_at);
+                    send_frame(&frame.data, duration, &v.track, v.target).await;
                 }
+                // `None` means the shared `video_bus` sender is gone for
+                // good (process shutting down, not just the card being
+                // absent/unplugged) - this just stops delivering further
+                // frames; keyboard and mouse must keep working either way,
+                // so this never ends the session on its own.
             }
-            event = poll_video(&video), if video.as_ref().is_some_and(|v| v.target.is_some()) => {
+            event = poll_rtcp(&video), if video.as_ref().is_some_and(|v| v.target.is_some()) => {
                 if let Some(TrackLocalEvent::OnRtcpPacket(packets)) = event
                     && packets.iter().any(|p| is_keyframe_request(p.as_ref()))
+                    && let Some(v) = &video
                 {
-                    ctx.force_keyframe.store(true, Ordering::Relaxed);
+                    v.stream.request_keyframe();
+                }
+            }
+            Some(()) = video_ended_rx.recv() => {
+                if let Some(v) = video.take() {
+                    remove_video_track(&pc, v).await;
+                }
+            }
+            Some(status) = presence_rx.recv() => {
+                if connected && video.is_none() && matches!(status, DeviceStatus::Present(_)) {
+                    let settings = *capture_settings_rx.borrow();
+                    if let Some(v) = try_attach_video(&pc, &ctx.capture_engine, settings, &ctx.h264_codec, &video_ended_tx).await {
+                        last_captured_at = None;
+                        video = Some(v);
+                    }
                 }
             }
             Some(sdp) = renegotiation_rx.recv() => {
@@ -342,9 +407,9 @@ pub async fn handle(
                         // pushed explicitly here, once, rather than relying on the
                         // `changed()` arms below (which still handle every update
                         // from this point on). `DeviceState` here is whatever
-                        // `CaptureManager::run` last cached from probing the card
-                        // when it was plugged in - opening this channel doesn't
-                        // trigger a fresh probe of its own.
+                        // `capture::watch_device_state` last cached from probing
+                        // the card when it was plugged in - opening this channel
+                        // doesn't trigger a fresh probe of its own.
                         if push_initial_state(&outbound_tx, &mut device_state_rx, &mut hid_connected_rx, &mut capture_settings_rx, &mut mouse_mode_rx).is_ok() {
                             control_open.store(true, Ordering::Relaxed);
                         }
@@ -353,9 +418,6 @@ pub async fn handle(
                         match serde_json::from_slice::<ControlMessage>(&msg.data) {
                             Ok(ControlMessage::Answer { sdp }) => {
                                 apply_renegotiation_answer(&pc, sdp, &mut video).await;
-                            }
-                            Ok(ControlMessage::DebugToggleVideo) => {
-                                video = toggle_video(&pc, video, &ctx.h264_codec).await;
                             }
                             Ok(msg) => handle_control_message(msg, &ctx),
                             Err(err) => tracing::debug!(%err, "ignoring malformed control message"),
@@ -398,12 +460,17 @@ pub async fn handle(
                     tracing::debug!(?state, "peer connection state ended, closing session");
                     break;
                 }
-                if state == RTCPeerConnectionState::Connected && client_count_guard.is_none() {
+                if state == RTCPeerConnectionState::Connected && !connected {
                     // Only now is the connection fully stable and ready for
-                    // video - see `ClientCountGuard` and
-                    // `CaptureManager::run`, which only opens/streams the
-                    // capture card while at least one of these is held.
-                    client_count_guard = Some(ClientCountGuard::new(ctx.client_count_tx.clone()));
+                    // video - ask the capture engine right away in case a
+                    // device is already available; if not, `presence_rx`
+                    // above retries later.
+                    connected = true;
+                    let settings = *capture_settings_rx.borrow();
+                    if let Some(v) = try_attach_video(&pc, &ctx.capture_engine, settings, &ctx.h264_codec, &video_ended_tx).await {
+                        last_captured_at = None;
+                        video = Some(v);
+                    }
                 }
             }
         }
@@ -500,8 +567,8 @@ async fn send_server_message(control: &Arc<dyn DataChannel>, msg: &ServerMessage
 
 /// Sends one H.264 frame as RTP via the local video track. Errors are
 /// dropped, not propagated — a not-yet-negotiated track just means this
-/// frame is skipped, the same tolerance the video_bus watch channel
-/// already gives every subscriber.
+/// frame is skipped, the same tolerance the capture stream already gives
+/// every subscriber.
 async fn send_frame(data: &Arc<[u8]>, duration: Duration, video_track: &TrackLocalStaticSample, video_target: Option<(u32, PayloadType)>) {
     let Some((ssrc, payload_type)) = video_target else { return };
     let sample = Sample { data: Bytes::copy_from_slice(data), duration, ..Default::default() };
@@ -513,7 +580,7 @@ async fn send_frame(data: &Arc<[u8]>, duration: Duration, video_track: &TrackLoc
 /// Whether any packet in an incoming RTCP batch is a keyframe request
 /// (PLI or FIR) — the browser sends these automatically when its decoder
 /// can't make progress without a fresh keyframe (see `handle`'s
-/// `video_track.poll()` branch).
+/// `poll_rtcp` branch).
 fn is_keyframe_request(packet: &dyn Packet) -> bool {
     packet.as_any().downcast_ref::<PictureLossIndication>().is_some() || packet.as_any().downcast_ref::<FullIntraRequest>().is_some()
 }
@@ -584,11 +651,11 @@ fn handle_control_message(msg: ControlMessage, ctx: &SessionContext) {
             });
         }
         // Matched directly in `handle`'s `control.poll()` arm, before it
-        // ever falls through to this function - both need state
-        // (`pc`/`video`) that this function, which only takes `&ctx`,
-        // doesn't have access to.
-        ControlMessage::Answer { .. } | ControlMessage::DebugToggleVideo => {
-            unreachable!("Answer and DebugToggleVideo are handled in handle()'s control.poll() arm")
+        // ever falls through to this function - it needs state (`pc`,
+        // `video`) that this function, which only takes `&ctx`, doesn't
+        // have access to.
+        ControlMessage::Answer { .. } => {
+            unreachable!("Answer is handled in handle()'s control.poll() arm")
         }
     }
 }
@@ -596,11 +663,11 @@ fn handle_control_message(msg: ControlMessage, ctx: &SessionContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capture::driver::CaptureDevice;
     use crate::capture::v4l2::Resolution;
     use crate::rtc::protocol::CaptureSettingsWire;
 
     fn test_ctx() -> SessionContext {
-        let (_video_tx, video_rx) = video_bus::channel();
         let (serial_tx, _serial_rx) = mpsc::channel(1);
         let (capture_settings_tx, capture_settings_rx) =
             watch::channel(CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5 });
@@ -608,9 +675,12 @@ mod tests {
         let (_device_state_tx, device_state_rx) = watch::channel(DeviceState::default());
         let (_hid_connected_tx, hid_connected_rx) = watch::channel(false);
         let (_pc_state_tx, pc_state_rx) = watch::channel(RTCPeerConnectionState::New);
-        let (client_count_tx, _client_count_rx) = watch::channel(0u32);
+        // Points at a path that will never exist - these tests only touch
+        // `handle_control_message`, which never asks the engine for a
+        // stream, so a real capture device is neither needed nor wanted.
+        let capture_device = CaptureDevice::spawn("/nonexistent-simple-kvm-test-device", "video4linux");
         SessionContext {
-            video_bus: video_rx,
+            capture_engine: Arc::new(CaptureEngine::new(capture_device)),
             serial_tx,
             capture_settings_tx,
             capture_settings_rx,
@@ -618,8 +688,6 @@ mod tests {
             mouse_mode_rx,
             device_state_rx,
             hid_connected_rx,
-            force_keyframe: Arc::new(AtomicBool::new(false)),
-            client_count_tx,
             h264_codec: RTCRtpCodec::default(),
             pc_state_rx,
         }

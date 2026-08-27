@@ -81,26 +81,39 @@ ip>:3000` with:
 - **No login.** Anyone who can reach port 3000 has full control. This is
   meant for a trusted LAN, not the open internet.
 
-Video capture and encoding only run while at least one browser's WebRTC
-connection is fully up (`connected`, not just negotiating) - with nobody
-actually connected, no CPU/power is spent on capture at all, and the
-capture card itself is never opened. The moment a browser's connection
-reaches that state, capture starts at whatever resolution/fps the settings
-say; the moment the last such browser disconnects, it stops. A second
-browser connecting while one is already active doesn't restart anything.
-Every actual start/stop of a capture pass is logged as `video encoding
-started`/`video encoding stopped`.
+A browser tab doesn't get a video track as part of connecting - the
+initial offer/answer exchange carries none either way. Once a tab's WebRTC
+connection is fully up (`connected`, not just negotiating) *and* the
+capture card is actually available, the server adds a video track for
+that tab live, renegotiating the connection in the background with no page
+reload - the same mechanism used if the card is plugged in only after the
+tab connected, or unplugged and replugged again later. If the card isn't
+available yet when a tab reaches `connected`, that tab just keeps running
+with no video, and gets it automatically the moment the card becomes
+available.
+
+Video capture and encoding only run while at least one browser tab
+actually holds a live video stream this way - with nobody holding one, no
+CPU/power is spent on capture at all, and the capture card itself is never
+opened. A tab losing its stream (its own disconnect, or the card being
+unplugged) stops the encoder only once it was the last one holding it; a
+second tab connecting while a stream is already live doesn't restart
+anything, it just gets its own track off the same running pass. Every
+actual start/stop of a capture pass is logged as `video encoding
+started`/`video encoding stopped`. Keyboard and mouse input are
+unaffected by any of this - a tab losing or regaining video never touches
+its input path.
 
 The capture card is only ever opened for two reasons: once, to ask it what
 resolutions/frame rates it supports, the moment it's actually plugged in
 (this is what populates the dropdowns above - the result is cached in
 memory, so a browser connecting later just reads that cached answer
 instead of triggering a fresh probe of its own); and to actually stream
-from it, once a browser's connection is fully `connected`. It's never
-opened automatically at startup - not even if it's already plugged in at
-that point - because doing so has reliably crashed the real hardware this
-runs on if it happens too early after boot (see the "Known issue" note
-further down, under Installation).
+from it, once at least one tab holds a live video stream from it (see
+above). It's never opened automatically at startup - not even if it's
+already plugged in at that point - because doing so has reliably crashed
+the real hardware this runs on if it happens too early after boot (see the
+"Known issue" note further down, under Installation).
 
 The server runs fine with no capture card or CH9329 attached - the page
 still loads, the frame rate/resolution dropdowns are disabled and
@@ -125,9 +138,9 @@ listens on), rather than going through udev itself - the Wyse 3040 image
 this runs on has no udev daemon (it uses the simpler `mdev` instead), so
 udev's own notifications never fire there. Listening straight to the
 kernel works regardless of what (if anything) is managing devices. If the
-listener can't be opened, the capture card's reconnect is instead noticed
-on the next settings change; the CH9329's presence detection falls back
-to polling every 2 seconds instead. Every time the capture card
+listener can't be opened, both the capture card's and the CH9329's
+presence detection fall back to polling every 2 seconds instead. Every
+time the capture card
 goes from unplugged to plugged in - a genuine replug while the service is
 running, or simply being plugged in for the first time after the service
 started without it - triggers one fresh capabilities probe, cached in
@@ -321,12 +334,15 @@ cargo nextest run
 
 `e2e/browser-test.sh` drives the actual page with `agent-browser` against
 the container's system Chromium. No real capture card or CH9329 is
-needed: the capture card stays in its soft "no device" state (no
-`v4l2loopback` support in the container to fake one), while the CH9329 is
-faked with `socat` (a linked PTY pair - the app just needs something to
-open at `SERIAL_PATH`, real hardware or not), which is enough to exercise
-the mouse-mode half of Save. The capture half of that same scoping logic
-is covered by Rust tests in `src/rtc/session.rs` instead, since
-it can't be exercised without real capture hardware. This script needs
-`socat` installed; it's a layer on top of the Rust tests, not a
-replacement for them.
+needed: the capture card is faked as a plain regular file at `VIDEO_PATH`
+(no `v4l2loopback` support in the container for a real one) - enough to
+drive the real presence-gated add-track/renegotiation path and prove a
+session gets video live and loses it again on a simulated capture
+failure, without a page reload. The CH9329 is faked with `socat` (a
+linked PTY pair - the app just needs something to open at `SERIAL_PATH`,
+real hardware or not), which is enough to exercise the mouse-mode half of
+Save. A genuine mid-session replug can't be simulated this way (it needs
+a real kernel uevent this container has no privileged way to generate) -
+that half is covered by Rust tests in `src/device.rs` and
+`src/capture/engine.rs` instead. This script needs `socat` installed;
+it's a layer on top of the Rust tests, not a replacement for them.

@@ -20,9 +20,9 @@ use webrtc::peer_connection::{
     RTCIceGatheringState, RTCPeerConnectionState, RTCSessionDescription, Registry,
 };
 
+use crate::capture::engine::CaptureEngine;
 use crate::ch9329::writer::SerialCommand;
 use crate::config::{CaptureSettings, DeviceState, MouseMode};
-use crate::video_bus;
 use session::SessionContext;
 
 /// Everything a new WebRTC session needs, shared across every browser tab
@@ -31,26 +31,18 @@ use session::SessionContext;
 /// HTTP requests rather than a long-lived server loop.
 #[derive(Clone)]
 pub struct SharedChannels {
-    pub video_bus: video_bus::Receiver,
+    /// Shared across every session - `session::handle` calls
+    /// `request_stream()` on this once its connection is stable, and again
+    /// any time a device-availability event says it's worth retrying (see
+    /// `CaptureEngine::add_event_listener`). The encode pass this wraps
+    /// starts/stops as a direct consequence of how many sessions currently
+    /// hold a live `CaptureStream` - nothing here counts that by hand.
+    pub capture_engine: Arc<CaptureEngine>,
     pub serial_tx: mpsc::Sender<SerialCommand>,
     pub capture_settings_tx: watch::Sender<CaptureSettings>,
     pub mouse_mode_tx: watch::Sender<MouseMode>,
     pub device_state_rx: watch::Receiver<DeviceState>,
     pub hid_connected_rx: watch::Receiver<bool>,
-    /// Set by a session on an RTCP keyframe request (PLI/FIR), cleared by
-    /// the capture task once it's forced a fresh keyframe — see
-    /// `session::handle`'s video-track RTCP-poll branch and
-    /// `capture::run_one_pass`.
-    pub force_keyframe: Arc<AtomicBool>,
-    /// Count of currently-connected, *fully stable* WebRTC sessions —
-    /// incremented by `session::handle` the moment its `RTCPeerConnection`
-    /// first reaches `Connected` (not merely negotiated/spawned), via
-    /// `session::ClientCountGuard`, decremented by that guard's `Drop`
-    /// however the session ends (clean exit, abnormal disconnect, or
-    /// panic). `CaptureManager::run` only opens/streams the capture card
-    /// while this is nonzero, so a session is never "connected" to the
-    /// card before its transport is actually stable and ready for video.
-    pub client_count_tx: watch::Sender<u32>,
 }
 
 #[derive(Deserialize)]
@@ -160,10 +152,11 @@ impl PeerConnectionEventHandler for Handler {
 
     /// Fires whenever this connection has something new to negotiate
     /// after its initial offer/answer exchange — e.g. `session::handle`
-    /// added or removed the video track in response to a debug trigger
-    /// (issue #005; a real capture-availability trigger replaces it in
-    /// issue #006). Builds a fresh offer and hands its SDP to
-    /// `session::handle` to forward over `control`; the crate's own
+    /// added or removed the video track in response to real
+    /// capture-device availability (`CaptureEngine::request_stream`/
+    /// `CaptureStream`'s `ended` event). Builds a fresh offer and hands
+    /// its SDP to `session::handle` to forward over `control`; the crate's
+    /// own
     /// `NegotiationNeededState` coalescing (confirmed in `rtc-0.20.3`)
     /// already prevents this from firing again for the same connection
     /// until the resulting round trip completes, so no additional
@@ -202,7 +195,8 @@ impl PeerConnectionEventHandler for Handler {
 /// No video track is attached here — the browser's offer already includes
 /// a recvonly video transceiver (see `assets/web/app.js`'s `connect()`),
 /// but the session starts with nothing sending on it; `session::handle`
-/// attaches one later (see `Handler::on_negotiation_needed`, issue #005).
+/// attaches one later, once its connection is stable and a capture stream
+/// is actually available (see `Handler::on_negotiation_needed`).
 async fn negotiate(offer_sdp: String, channels: SharedChannels) -> Result<String> {
     let mut media_engine = MediaEngine::default();
     let h264_codec = RTCRtpCodecParameters {
@@ -268,7 +262,7 @@ async fn negotiate(offer_sdp: String, channels: SharedChannels) -> Result<String
     ready.store(true, Ordering::Relaxed);
 
     let ctx = SessionContext {
-        video_bus: channels.video_bus,
+        capture_engine: channels.capture_engine,
         serial_tx: channels.serial_tx,
         capture_settings_tx: channels.capture_settings_tx.clone(),
         capture_settings_rx: channels.capture_settings_tx.subscribe(),
@@ -276,8 +270,6 @@ async fn negotiate(offer_sdp: String, channels: SharedChannels) -> Result<String
         mouse_mode_rx: channels.mouse_mode_tx.subscribe(),
         device_state_rx: channels.device_state_rx,
         hid_connected_rx: channels.hid_connected_rx,
-        force_keyframe: channels.force_keyframe,
-        client_count_tx: channels.client_count_tx,
         h264_codec: h264_codec.rtp_codec,
         pc_state_rx,
     };

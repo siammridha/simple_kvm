@@ -655,11 +655,9 @@ function sendControl(message) {
   }
 }
 
-// Debug hooks for issue #005's manual renegotiation trigger - no UI
-// element for this on purpose, since it's not a real feature yet (issue
-// #006 replaces it with a trigger driven by real capture-device
-// availability). Exercised by e2e/browser-test.sh via `agent-browser eval`.
-window.__debugToggleVideo = () => sendControl({ type: 'debug_toggle_video' });
+// Test-only hook so e2e/browser-test.sh can inspect the connection
+// directly (video receiver count, connectionState) via `agent-browser
+// eval` - no UI element needed for it.
 window.__debugPeerConnection = () => pc;
 
 wireTopbar();

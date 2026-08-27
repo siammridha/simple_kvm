@@ -16,9 +16,8 @@ pub struct CaptureDriver;
 /// here, `Device<CaptureDriver>` plus this driver - ever holds the raw
 /// device path). The actual v4l2 open/ioctls happen later, inside
 /// `run_one_pass`/`v4l2::run_capture_loop` when the encode pass actually
-/// starts, exactly as `CaptureManager` does it today - `open` itself stays
-/// a cheap, infallible bundling step rather than a second, redundant
-/// device open.
+/// starts - `open` itself stays a cheap, infallible bundling step rather
+/// than a second, redundant device open.
 pub struct RawCapture {
     device_path: String,
 }

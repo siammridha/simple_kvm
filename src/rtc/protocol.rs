@@ -80,11 +80,6 @@ pub enum ControlMessage {
     /// half of a renegotiation round trip started by
     /// `rtc::Handler::on_negotiation_needed` (see `session::handle`).
     Answer { sdp: String },
-    /// Manual/debug trigger for issue #005: toggles this session's video
-    /// track on or off, driving a real `add_track`/`remove_track` +
-    /// renegotiation cycle end to end. Temporary — issue #006 replaces
-    /// this with a trigger driven by real capture-device availability.
-    DebugToggleVideo,
 }
 
 /// Server-to-client messages, pushed down the `control` data channel
@@ -167,9 +162,6 @@ mod tests {
 
         let msg: ControlMessage = serde_json::from_str(r#"{"type":"answer","sdp":"v=0..."}"#).unwrap();
         assert!(matches!(msg, ControlMessage::Answer { sdp } if sdp == "v=0..."));
-
-        let msg: ControlMessage = serde_json::from_str(r#"{"type":"debug_toggle_video"}"#).unwrap();
-        assert!(matches!(msg, ControlMessage::DebugToggleVideo));
     }
 
     #[test]

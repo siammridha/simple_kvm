@@ -9,7 +9,6 @@ mod video_bus;
 mod web;
 
 use std::env;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,11 +17,12 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tracing_subscriber::EnvFilter;
 
+use capture::driver::CaptureDevice;
+use capture::engine::CaptureEngine;
 use capture::v4l2::Resolution;
-use capture::CaptureManager;
 use ch9329::device::Ch9329Device;
 use ch9329::writer::{self, SerialCommand};
-use config::{CaptureSettings, DeviceState, MouseMode};
+use config::{CaptureSettings, MouseMode};
 use device::DeviceStatus;
 
 #[tokio::main]
@@ -37,22 +37,28 @@ async fn main() -> Result<()> {
     let serial_open_delay_secs: u64 = env_parsed("SERIAL_OPEN_DELAY_SECS").unwrap_or(30);
 
     // --- Capture: the card is never opened automatically right here at
-    // startup (see `CaptureManager::run` for exactly when it is). Opening
-    // it unprompted has reliably crashed the real hardware this targets
-    // right at boot (see README's "boot-crash" known issue). Settings are
+    // startup. Opening it unprompted has reliably crashed the real hardware
+    // this targets right at boot (see README's "boot-crash" known issue) -
+    // `Device<CaptureDriver>`'s presence task (spawned by `CaptureDevice::
+    // spawn` below) deliberately never probes the very first time it finds
+    // the device already present, for exactly that reason. Settings are
     // in-memory only - every start uses a fixed default; nothing here is
     // ever read from or written to disk. ---
-    let capture_manager = CaptureManager::new(&video_path);
     let default_capture_settings = CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5 };
     let default_mouse_mode = MouseMode::Absolute;
 
-    let (device_state_tx, device_state_rx) = watch::channel(DeviceState::default());
     let (capture_settings_tx, capture_settings_rx) = watch::channel(default_capture_settings);
     let (mouse_mode_tx, _mouse_mode_rx) = watch::channel(default_mouse_mode);
-    let (video_bus_tx, video_bus_rx) = video_bus::channel();
     let (hid_connected_tx, hid_connected_rx) = watch::channel(false);
-    let force_keyframe = Arc::new(AtomicBool::new(false));
-    let (client_count_tx, client_count_rx) = watch::channel(0u32);
+
+    // Two independent handles to the same underlying presence task (see
+    // `Device::clone`) - one feeds `CaptureEngine`'s own presence-driven
+    // `request_stream()` gating, the other publishes `DeviceState` for the
+    // web UI. Neither holds the raw device path itself past this point;
+    // everything downstream only ever sees presence/capability state.
+    let capture_device = CaptureDevice::spawn(&video_path, "video4linux");
+    let device_state_rx = capture::watch_device_state(capture_device.clone(), capture_settings_rx.clone());
+    let capture_engine = Arc::new(CaptureEngine::new(capture_device));
 
     // --- Serial: same soft-unavailable treatment as capture. Commands sent
     // to `serial_tx` before the port is open just queue up in the channel,
@@ -60,16 +66,7 @@ async fn main() -> Result<()> {
     let (serial_tx, serial_rx) = mpsc::channel::<SerialCommand>(256);
     tokio::spawn(open_serial_after_delay(serial_path, serial_open_delay_secs, serial_tx.clone(), serial_rx, hid_connected_tx));
 
-    let channels = rtc::SharedChannels {
-        video_bus: video_bus_rx,
-        serial_tx,
-        capture_settings_tx,
-        mouse_mode_tx,
-        device_state_rx,
-        hid_connected_rx,
-        force_keyframe: force_keyframe.clone(),
-        client_count_tx,
-    };
+    let channels = rtc::SharedChannels { capture_engine, serial_tx, capture_settings_tx, mouse_mode_tx, device_state_rx, hid_connected_rx };
     let http_addr = std::net::SocketAddr::from(([0, 0, 0, 0], http_port));
     tracing::info!(port = http_port, "page and WebRTC signaling server listening");
     let http_handle = tokio::spawn(async move {
@@ -85,9 +82,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    let capture_handle = tokio::spawn(capture_manager.run(capture_settings_rx, video_bus_tx, device_state_tx, force_keyframe, client_count_rx));
-
-    let _ = tokio::join!(http_handle, capture_handle);
+    let _ = http_handle.await;
     Ok(())
 }
 
