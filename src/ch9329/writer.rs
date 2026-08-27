@@ -16,8 +16,6 @@ use anyhow::{Context, Result};
 use serialport::SerialPort;
 use tokio::sync::{mpsc, watch};
 
-use crate::uevent::UeventListener;
-
 use super::{paste, protocol};
 
 const BAUD_RATE: u32 = 9600;
@@ -87,38 +85,39 @@ pub fn open(path: &str) -> Result<Option<Box<dyn SerialPort>>> {
 pub struct SerialWriter {
     path: String,
     port: Option<Box<dyn SerialPort>>,
-    connected_tx: watch::Sender<bool>,
+    present_rx: watch::Receiver<bool>,
 }
 
 impl SerialWriter {
-    /// `connected_tx` lets the WebRTC session layer know whether the
-    /// CH9329 is plugged in right now, the HID counterpart of the capture
-    /// card's `DeviceState` — see `rtc::session`.
-    pub fn new(path: String, connected_tx: watch::Sender<bool>) -> Self {
-        Self { path, port: None, connected_tx }
+    /// `present_rx` reports whether the CH9329 is plugged in right now,
+    /// sourced from `Ch9329Device`'s shared presence detection (see
+    /// `ch9329::device`) rather than this struct checking `Path::exists`
+    /// itself — the same channel the WebRTC session layer reads from to
+    /// tell the browser (the HID counterpart of the capture card's
+    /// `DeviceState` — see `rtc::session`), so both sides agree on presence
+    /// by construction.
+    pub fn new(path: String, present_rx: watch::Receiver<bool>) -> Self {
+        Self { path, port: None, present_rx }
     }
 
-    /// Checks whether the CH9329 is plugged in right now, and opens or
-    /// drops `self.port` to match — so a write is only attempted while the
-    /// device is actually present, and a stale handle from a device that
-    /// vanished mid-session gets dropped instead of erroring on every
-    /// command after it.
+    /// Opens or drops `self.port` to match the shared presence signal — so
+    /// a write is only attempted while the device is actually present, and
+    /// a stale handle from a device that vanished mid-session gets dropped
+    /// instead of erroring on every command after it.
     fn sync_connection_state(&mut self) {
-        let present = std::path::Path::new(&self.path).exists();
+        let present = *self.present_rx.borrow();
         match (&self.port, present) {
             (None, true) => match open(&self.path) {
                 Ok(Some(port)) => {
                     tracing::info!(path = %self.path, "CH9329 connected");
                     self.port = Some(port);
-                    let _ = self.connected_tx.send(true);
                 }
-                Ok(None) => {} // vanished again between the exists() check and opening it
+                Ok(None) => {} // vanished again between the presence signal and opening it
                 Err(err) => tracing::error!(%err, path = %self.path, "failed to open CH9329 serial port"),
             },
             (Some(_), false) => {
                 tracing::warn!(path = %self.path, "CH9329 disconnected, pausing writes until it reconnects");
                 self.port = None;
-                let _ = self.connected_tx.send(false);
             }
             _ => {}
         }
@@ -185,22 +184,19 @@ impl SerialWriter {
 }
 
 /// Runs forever, prompting `SerialWriter::run` (via `commands`) to re-check
-/// whether the CH9329 is plugged in as soon as the kernel reports a `tty`
-/// device change — the same immediate-detection treatment
-/// `capture::CaptureManager` gives the capture card, applied here to the
-/// CH9329/CH340 side. If the uevent listener can't be opened, reconnects
-/// are only noticed on the next real keystroke or click, since there's no
-/// polling fallback.
-pub async fn watch_connection(commands: mpsc::Sender<SerialCommand>) {
-    let mut listener = match UeventListener::open() {
-        Ok(listener) => listener,
-        Err(err) => {
-            tracing::warn!(%err, "failed to open kernel uevent listener, CH9329 reconnects won't be noticed until the next command");
-            return;
-        }
-    };
+/// connection state (open or drop its port) as soon as `present_rx`
+/// reports a presence change — so a reconnect is noticed immediately
+/// instead of waiting for the next real keystroke or click. `present_rx`
+/// is sourced from `Ch9329Device`'s shared presence detection (see
+/// `ch9329::device`), which already does the kernel `tty` uevent
+/// listening this function used to do itself — the same immediate-
+/// detection treatment `capture::CaptureManager` gives the capture card,
+/// now shared via the generic device core instead of reimplemented here.
+pub async fn watch_connection(mut present_rx: watch::Receiver<bool>, commands: mpsc::Sender<SerialCommand>) {
     loop {
-        listener.wait_for_subsystem("tty").await;
+        if present_rx.changed().await.is_err() {
+            return; // presence sender dropped, nothing left to watch for
+        }
         if commands.send(SerialCommand::CheckConnection).await.is_err() {
             return; // writer loop exited, nothing left to watch for
         }

@@ -20,8 +20,10 @@ use tracing_subscriber::EnvFilter;
 
 use capture::v4l2::Resolution;
 use capture::CaptureManager;
+use ch9329::device::Ch9329Device;
 use ch9329::writer::{self, SerialCommand};
 use config::{CaptureSettings, DeviceState, MouseMode};
+use device::DeviceStatus;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -95,10 +97,16 @@ fn env_parsed<T: std::str::FromStr>(key: &str) -> Option<T> {
 
 /// Waits `delay_secs` (giving the CH9329's USB enumeration time to settle,
 /// the same crash-avoidance reasoning as the capture card's boot delay —
-/// see `deploy/install.sh`), then runs the writer loop. The writer itself
-/// checks whether the CH9329 is actually plugged in before every command,
-/// so it's a no-op whenever the device isn't there and picks back up on
-/// its own once it is — no need to decide that once, up front, here.
+/// see `deploy/install.sh`), then starts `Ch9329Device`'s presence
+/// detection and runs the writer loop. Presence detection itself is
+/// harmless (a filesystem check plus a kernel uevent listener, no device
+/// I/O), but it's still started only after the delay so the browser learns
+/// about CH9329 connectivity at the same point in time it always has —
+/// this refactor changes how presence is detected, not when it's first
+/// reported. The writer itself checks whether the CH9329 is actually
+/// plugged in before every command, so it's a no-op whenever the device
+/// isn't there and picks back up on its own once it is — no need to decide
+/// that once, up front, here.
 async fn open_serial_after_delay(
     serial_path: String,
     delay_secs: u64,
@@ -110,8 +118,18 @@ async fn open_serial_after_delay(
         tracing::info!(seconds = delay_secs, "waiting before opening CH9329 serial port");
         tokio::time::sleep(Duration::from_secs(delay_secs)).await;
     }
-    tokio::spawn(writer::watch_connection(serial_tx));
-    let writer = writer::SerialWriter::new(serial_path, hid_connected_tx);
+
+    let ch9329_device = Ch9329Device::spawn(serial_path.clone(), "tty");
+    let hid_connected_tx_for_device = hid_connected_tx.clone();
+    let _presence_sub = ch9329_device.add_event_listener(move |status| {
+        let hid_connected_tx = hid_connected_tx_for_device.clone();
+        async move {
+            let _ = hid_connected_tx.send(matches!(status, DeviceStatus::Present(_)));
+        }
+    });
+
+    tokio::spawn(writer::watch_connection(hid_connected_tx.subscribe(), serial_tx));
+    let writer = writer::SerialWriter::new(serial_path, hid_connected_tx.subscribe());
     let _ = tokio::task::spawn_blocking(move || writer.run(serial_rx)).await;
 }
 
