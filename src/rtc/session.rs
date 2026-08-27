@@ -8,6 +8,7 @@
 
 use anyhow::Result;
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -117,8 +118,26 @@ pub async fn handle(
     let mut pc_state_rx = ctx.pc_state_rx.clone();
     let mut keyboard = KeyboardState::default();
 
+    // Every outbound state message goes through this queue instead of
+    // `control.send()` directly - `relay_outbound` below is the only task
+    // that ever writes to `control`, so concurrent producers (the four
+    // `changed()` arms and `push_initial_state`) can never race each other
+    // on the wire and reorder same-type updates.
+    let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    let control_open = Arc::new(AtomicBool::new(false));
+    tokio::spawn({
+        let control = Arc::clone(&control);
+        let control_open = Arc::clone(&control_open);
+        async move {
+            relay_outbound(outbound_rx, control_open, |msg| {
+                let control = Arc::clone(&control);
+                async move { send_server_message(&control, &msg).await }
+            })
+            .await;
+        }
+    });
+
     let mut input_active = true;
-    let mut control_open = false;
     // The real capture-time delta between consecutive frames, used as each
     // RTP sample's duration so the browser's jitter buffer gets correct
     // pacing info — see `send_frame`. `None` only for the very first frame
@@ -175,7 +194,9 @@ pub async fn handle(
                         // pushed explicitly here, once, rather than relying on the
                         // `changed()` arms below (which still handle every update
                         // from this point on).
-                        control_open = push_initial_state(&control, &mut device_state_rx, &mut hid_connected_rx, &mut capture_settings_rx, &mut mouse_mode_rx).await.is_ok();
+                        if push_initial_state(&outbound_tx, &mut device_state_rx, &mut hid_connected_rx, &mut capture_settings_rx, &mut mouse_mode_rx).is_ok() {
+                            control_open.store(true, Ordering::Relaxed);
+                        }
                     }
                     Some(DataChannelEvent::OnMessage(msg)) => {
                         match serde_json::from_slice::<ControlMessage>(&msg.data) {
@@ -187,40 +208,28 @@ pub async fn handle(
                     _ => {}
                 }
             }
-            changed = device_state_rx.changed(), if control_open => {
+            changed = device_state_rx.changed(), if control_open.load(Ordering::Relaxed) => {
                 if changed.is_ok() {
                     let state = device_state_rx.borrow_and_update().clone();
-                    let msg = ServerMessage::DeviceState(state);
-                    if send_server_message(&control, &msg).await.is_err() {
-                        control_open = false;
-                    }
+                    let _ = outbound_tx.send(ServerMessage::DeviceState(state));
                 }
             }
-            changed = capture_settings_rx.changed(), if control_open => {
+            changed = capture_settings_rx.changed(), if control_open.load(Ordering::Relaxed) => {
                 if changed.is_ok() {
                     let capture = *capture_settings_rx.borrow_and_update();
-                    let msg = ServerMessage::Settings { capture, mouse_mode: *mouse_mode_rx.borrow() };
-                    if send_server_message(&control, &msg).await.is_err() {
-                        control_open = false;
-                    }
+                    let _ = outbound_tx.send(ServerMessage::Settings { capture, mouse_mode: *mouse_mode_rx.borrow() });
                 }
             }
-            changed = mouse_mode_rx.changed(), if control_open => {
+            changed = mouse_mode_rx.changed(), if control_open.load(Ordering::Relaxed) => {
                 if changed.is_ok() {
                     let mouse_mode = *mouse_mode_rx.borrow_and_update();
-                    let msg = ServerMessage::Settings { capture: *capture_settings_rx.borrow(), mouse_mode };
-                    if send_server_message(&control, &msg).await.is_err() {
-                        control_open = false;
-                    }
+                    let _ = outbound_tx.send(ServerMessage::Settings { capture: *capture_settings_rx.borrow(), mouse_mode });
                 }
             }
-            changed = hid_connected_rx.changed(), if control_open => {
+            changed = hid_connected_rx.changed(), if control_open.load(Ordering::Relaxed) => {
                 if changed.is_ok() {
                     let available = *hid_connected_rx.borrow_and_update();
-                    let msg = ServerMessage::HidState { available };
-                    if send_server_message(&control, &msg).await.is_err() {
-                        control_open = false;
-                    }
+                    let _ = outbound_tx.send(ServerMessage::HidState { available });
                 }
             }
             changed = pc_state_rx.changed() => {
@@ -273,26 +282,50 @@ impl KeyboardState {
     }
 }
 
-/// Pushes the full current state (device availability, HID connectivity,
-/// settings) down the just-opened `control` channel. Needed because
-/// `changed()` on a receiver only fires for changes from here on — it
-/// doesn't tell a freshly connected tab about state that was already
-/// current before it connected (see the call site in `handle`).
-async fn push_initial_state(
-    control: &Arc<dyn DataChannel>,
+/// Enqueues the full current state (device availability, HID connectivity,
+/// settings) onto the outbound queue for the just-opened `control` channel.
+/// Needed because `changed()` on a receiver only fires for changes from
+/// here on — it doesn't tell a freshly connected tab about state that was
+/// already current before it connected (see the call site in `handle`).
+fn push_initial_state(
+    outbound_tx: &mpsc::UnboundedSender<ServerMessage>,
     device_state_rx: &mut watch::Receiver<DeviceState>,
     hid_connected_rx: &mut watch::Receiver<bool>,
     capture_settings_rx: &mut watch::Receiver<CaptureSettings>,
     mouse_mode_rx: &mut watch::Receiver<MouseMode>,
 ) -> Result<()> {
     let device_state = device_state_rx.borrow_and_update().clone();
-    send_server_message(control, &ServerMessage::DeviceState(device_state)).await?;
+    outbound_tx.send(ServerMessage::DeviceState(device_state)).map_err(|_| anyhow::anyhow!("outbound queue closed"))?;
     let hid_available = *hid_connected_rx.borrow_and_update();
-    send_server_message(control, &ServerMessage::HidState { available: hid_available }).await?;
+    outbound_tx
+        .send(ServerMessage::HidState { available: hid_available })
+        .map_err(|_| anyhow::anyhow!("outbound queue closed"))?;
     let capture = *capture_settings_rx.borrow_and_update();
     let mouse_mode = *mouse_mode_rx.borrow_and_update();
-    send_server_message(control, &ServerMessage::Settings { capture, mouse_mode }).await?;
+    outbound_tx.send(ServerMessage::Settings { capture, mouse_mode }).map_err(|_| anyhow::anyhow!("outbound queue closed"))?;
     Ok(())
+}
+
+/// Drains a session's outbound queue in order, handing each message to
+/// `send` one at a time — the single point where messages actually reach
+/// the wire, so two producers enqueueing back to back can never race each
+/// other and land out of order (see the `outbound_tx`/`relay_outbound` spawn
+/// site in `handle`). Generic over `send` rather than tied to
+/// `Arc<dyn DataChannel>` so the ordering guarantee is unit-testable
+/// without a `DataChannel` mock. Stops for good on the first failed send,
+/// which is how the session now learns `control` is closed — mirrored back
+/// to `handle`'s `select!` guards via `control_open`.
+async fn relay_outbound<F, Fut>(mut rx: mpsc::UnboundedReceiver<ServerMessage>, control_open: Arc<AtomicBool>, mut send: F)
+where
+    F: FnMut(ServerMessage) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    while let Some(msg) = rx.recv().await {
+        if send(msg).await.is_err() {
+            control_open.store(false, Ordering::Relaxed);
+            break;
+        }
+    }
 }
 
 async fn send_server_message(control: &Arc<dyn DataChannel>, msg: &ServerMessage) -> Result<()> {
@@ -493,5 +526,62 @@ mod tests {
         assert!(settings_store::load(&path).is_none(), "no fields present means nothing should be persisted");
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn relay_outbound_delivers_messages_in_the_order_they_were_sent() {
+        let (tx, rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let control_open = Arc::new(AtomicBool::new(true));
+        let received: Arc<std::sync::Mutex<Vec<ServerMessage>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // Two rapid same-type updates - the exact scenario the reordering
+        // race could otherwise bite, per issue 007.
+        let first = ServerMessage::Settings { capture: CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5 }, mouse_mode: MouseMode::Absolute };
+        let second =
+            ServerMessage::Settings { capture: CaptureSettings { resolution: Resolution { width: 1920, height: 1080 }, fps: 30 }, mouse_mode: MouseMode::Relative };
+        tx.send(first.clone()).unwrap();
+        tx.send(second.clone()).unwrap();
+        drop(tx);
+
+        let recorded = Arc::clone(&received);
+        relay_outbound(rx, control_open, move |msg| {
+            let recorded = Arc::clone(&recorded);
+            async move {
+                recorded.lock().unwrap().push(msg);
+                Ok(())
+            }
+        })
+        .await;
+
+        // `ServerMessage` has no `PartialEq` (it's a wire type, compared by
+        // its JSON shape elsewhere) - serialize both sides for the equality
+        // check instead of adding a derive this issue doesn't otherwise need.
+        let got: Vec<String> = received.lock().unwrap().iter().map(|m| serde_json::to_string(m).unwrap()).collect();
+        let want: Vec<String> = [&first, &second].iter().map(|m| serde_json::to_string(m).unwrap()).collect();
+        assert_eq!(got, want);
+    }
+
+    #[tokio::test]
+    async fn relay_outbound_stops_and_marks_closed_after_a_failed_send() {
+        let (tx, rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let control_open = Arc::new(AtomicBool::new(true));
+        let attempts = Arc::new(std::sync::Mutex::new(0u32));
+
+        tx.send(ServerMessage::HidState { available: true }).unwrap();
+        tx.send(ServerMessage::HidState { available: false }).unwrap();
+        drop(tx);
+
+        let attempts_clone = Arc::clone(&attempts);
+        relay_outbound(rx, Arc::clone(&control_open), move |_msg| {
+            let attempts = Arc::clone(&attempts_clone);
+            async move {
+                *attempts.lock().unwrap() += 1;
+                Err(anyhow::anyhow!("simulated closed channel"))
+            }
+        })
+        .await;
+
+        assert_eq!(*attempts.lock().unwrap(), 1, "should stop after the first failure, not keep draining the queue");
+        assert!(!control_open.load(Ordering::Relaxed), "control_open should flip to closed once the relay task sees a send fail");
     }
 }
