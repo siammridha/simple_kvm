@@ -5,10 +5,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use anyhow::{Context, Result};
-use axum::extract::State;
-use axum::http::StatusCode;
-use axum::Json;
-use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch, Mutex, OnceCell};
 use rtc::ice::mdns::MulticastDnsMode;
 use rtc::peer_connection::configuration::media_engine::MIME_TYPE_H264;
@@ -24,13 +20,17 @@ use crate::capture::engine::CaptureEngine;
 use crate::hid::Hid;
 use session::SessionContext;
 
-/// The WebRTC module itself, and the router state `web` hands back to
-/// `offer_handler` on every signaling request. Just the two modules a
-/// session talks to — there is no shared state here beyond them, and no
-/// channel: everything a session needs to know it either asks for
+/// The WebRTC module itself: peer sessions and the offer→answer command
+/// `web` calls on every signaling request. Just the two modules a session
+/// talks to — there is no shared state here beyond them, and no channel:
+/// everything a session needs to know it either asks for
 /// (`CaptureEngine::settings`, `Hid::mouse_mode`, …) or subscribes to for
 /// itself (see `session::handle`), so nothing has to be pre-wired per
 /// process and cloned into every tab.
+///
+/// Nothing here knows it is reached over HTTP — no request type, no status
+/// code, no framework import (`ARCHITECTURE.md` §3.4/§I6). `web` does the
+/// parsing and the status mapping.
 #[derive(Clone)]
 pub struct Rtc {
     /// Shared across every session - `session::handle` calls
@@ -50,32 +50,32 @@ impl Rtc {
     pub fn new(capture_engine: Arc<CaptureEngine>, hid: Arc<Hid>) -> Self {
         Self { capture_engine, hid }
     }
-}
 
-#[derive(Deserialize)]
-pub struct OfferRequest {
-    sdp: String,
-}
-
-#[derive(Serialize)]
-pub struct AnswerResponse {
-    sdp: String,
-}
-
-/// `POST /rtc/offer`: the browser's entire signaling exchange in one round
-/// trip (see `assets/web/app.js`'s `connect()`). No trickle ICE, no
-/// WebSocket — the browser waits for its own ICE gathering to finish
-/// before sending the offer, and this handler waits for its own gathering
-/// to finish before responding, so one request/response is enough.
-pub async fn offer_handler(State(rtc): State<Rtc>, Json(body): Json<OfferRequest>) -> Result<Json<AnswerResponse>, StatusCode> {
-    match negotiate(body.sdp, rtc).await {
-        Ok(answer_sdp) => Ok(Json(AnswerResponse { sdp: answer_sdp })),
-        Err(err) => {
-            tracing::warn!(%err, "failed to negotiate WebRTC session");
-            Err(StatusCode::BAD_REQUEST)
-        }
+    /// The whole signaling surface: hand it the browser's offer SDP, get
+    /// the answer SDP back. One call is the entire exchange (see
+    /// `assets/web/app.js`'s `connect()`) — no trickle ICE, no WebSocket:
+    /// the browser waits for its own ICE gathering to finish before
+    /// sending the offer, and this waits for its own gathering to finish
+    /// before returning, so one round trip is enough.
+    pub async fn handle_offer(&self, offer_sdp: String) -> Result<String, SignalingError> {
+        negotiate(offer_sdp, self.clone()).await.map_err(SignalingError)
     }
 }
+
+/// Signaling failed. Every way it can fail is the caller's offer being
+/// unusable — a malformed SDP, or one this peer can't build a connection
+/// for — so there is nothing here for a caller to branch on, only
+/// something to report.
+#[derive(Debug)]
+pub struct SignalingError(anyhow::Error);
+
+impl std::fmt::Display for SignalingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for SignalingError {}
 
 /// Fires once per event, the first time it happens - a bounded `mpsc`
 /// used as a single-shot signal, since `oneshot::Sender` isn't `Clone` and
@@ -259,7 +259,7 @@ async fn negotiate(offer_sdp: String, rtc: Rtc) -> Result<String> {
     peer_connection.set_local_description(answer).await.context("setting local description")?;
 
     // Block until ICE gathering is complete (non-trickle) - see the doc
-    // comment on `offer_handler`.
+    // comment on `Rtc::handle_offer`.
     let _ = gather_complete_rx.await;
 
     let local_description = peer_connection.local_description().await.context("no local description after ICE gathering completed")?;

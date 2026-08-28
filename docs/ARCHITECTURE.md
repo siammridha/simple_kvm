@@ -85,18 +85,18 @@ The module is named `rtc`, not `webrtc`: a module called `webrtc` would shadow t
 depends on.
 
 - **Responsible for:** managing peer sessions, producing an answer from an offer, and controlling **when** media is negotiated.
-- **How it works:** exposes a signaling API (offer → answer) that `web` calls. It attaches a video track **only after** a session is `Connected` **and** the capture device is available (subscribes to presence through `CaptureEngine::add_event_listener`, calls `capture.request_stream`, renegotiates), and removes it on that stream's `ended` event. Peer input goes straight to the `hid` API, described in input terms (`InputCommand`) — no keymap lookup, no modifier bitmask, no report shape. Capture settings and `DeviceState` are read from and (for settings) written to `capture`, mouse mode from and to `hid`; the page's Save button becomes a `CaptureEngine::update_settings` call, and the state pushed down a session's `control` channel is whatever those two modules report.
+- **How it works:** exposes a transport-free signaling command (`handle_offer(offer_sdp) -> Result<answer_sdp, SignalingError>`) that `web` calls; it names no HTTP type and imports nothing from the HTTP framework, so the status code and the JSON shapes are `web`'s business alone. It attaches a video track **only after** a session is `Connected` **and** the capture device is available (subscribes to presence through `CaptureEngine::add_event_listener`, calls `capture.request_stream`, renegotiates), and removes it on that stream's `ended` event. Peer input goes straight to the `hid` API, described in input terms (`InputCommand`) — no keymap lookup, no modifier bitmask, no report shape. Capture settings and `DeviceState` are read from and (for settings) written to `capture`, mouse mode from and to `hid`; the page's Save button becomes a `CaptureEngine::update_settings` call, and the state pushed down a session's `control` channel is whatever those two modules report.
 - **Events and commands, per session, nothing pre-wired.** `Rtc` — the object `main` builds and `web` holds as router state — is just the `CaptureEngine` and the `Hid` handle. There is no shared bundle of channels between it and a session: each session **subscribes for itself** to capture settings, capture device state, HID presence and mouse mode when it starts, reads the current value of all four straight from the owning module when its `control` channel opens (an event only fires on a change, so it says nothing about what was already true), and calls a command to apply one. The subscriptions are **owned by the session**, so they deregister when it ends (see §5.1).
 - **Every outbound `control` message goes through the session's own queue.** One task writes to `control`; the event callbacks enqueue onto it rather than writing to `control` themselves, so two producers can never reorder same-type updates on the wire. Because listeners are dispatched fire-and-forget on their own tasks, two changes in quick succession can run in either order, so a callback re-reads the current value from the owning module instead of trusting the payload it was handed — the worst case is then a duplicate of the current value rather than a tab stuck on a stale one.
 - **Owns exclusively:** peer session state, signaling/renegotiation logic, media-negotiation timing, and each session's outbound `control` queue.
 - **May depend on:** `capture` (`request_stream`, settings, device state, and their subscriptions), `hid` (send, mouse mode, presence, and their subscriptions).
-- **Must not:** run the HTTP server, touch device paths, hold a `Device` handle, hold the capture settings or `DeviceState` itself, or implement capture/HID logic — including translating keys or assembling reports.
+- **Must not:** run the HTTP server, import the HTTP framework, touch device paths, hold a `Device` handle, hold the capture settings or `DeviceState` itself, or implement capture/HID logic — including translating keys or assembling reports.
 
 ### 3.5 `web` — HTTP transport & signaling front door
 
-- **Responsible for:** serving the page on a given port and exposing endpoints that establish a WebRTC connection.
-- **How it works:** an endpoint receives an offer, calls the `rtc` signaling API for an answer, and returns it. Pure transport.
-- **Owns exclusively:** the HTTP server, routing, static assets, and request/response (de)serialization.
+- **Responsible for:** serving the page on its own configured port and exposing endpoints that establish a WebRTC connection.
+- **How it works:** `serve(rtc)` reads this module's own port (`HTTP_PORT`, default `3000` — I2, same as any other module's config), binds the listener and runs the server; `main` only calls it. An endpoint receives an offer, calls `rtc.handle_offer` for an answer, and returns it — mapping a `SignalingError` to `400`, the only failure status the browser ever sees here. Pure transport.
+- **Owns exclusively:** the HTTP server and its port config, the listener, routing, static assets, and request/response (de)serialization — including the offer/answer wire shapes, which are HTTP payload types, not `rtc` types.
 - **May depend on:** `rtc` (command) only.
 - **Must not:** generate an answer, hold session/media state, validate on another module's behalf, or talk to `device`/`capture`/`hid`.
 
@@ -104,7 +104,7 @@ depends on.
 
 - **Constructs:** the `CaptureDevice`, `CaptureEngine`, `Hid`, `rtc`, `web`.
 - **Wires:** `CaptureEngine(capture_device)`, `rtc(capture_engine, hid)`, `web(rtc)`.
-- **Starts:** the capture card's presence task (via `CaptureDevice::spawn`), `rtc`, `web`. `CaptureEngine` is a passive factory; `Hid` spawns its own `Ch9329Device` and worker after its settle delay, so `main` starts no HID task.
+- **Starts:** the capture card's presence task (via `CaptureDevice::spawn`) and the page server (via `web::serve`, which owns the port and the listener). `Rtc` is constructed, not started — a session begins when an offer arrives. `CaptureEngine` is a passive factory; `Hid` spawns its own `Ch9329Device` and worker after its settle delay, so `main` starts no HID task.
 - **Must not:** configure any module, pass any device path (each `Device` reads its own), or contain domain logic.
 
 ---
@@ -177,7 +177,7 @@ Anything not in this table is a violation — including `web → device/capture/
 
 ## 6. Lifecycle
 
-1. `main` spawns the `CaptureDevice` (which reads its own path and begins its presence task), constructs and wires the rest, and starts `rtc` and `web`. `Hid` accepts commands immediately; it spawns its own `Ch9329Device` and drain worker once its settle delay has passed.
+1. `main` spawns the `CaptureDevice` (which reads its own path and begins its presence task), constructs and wires the rest, and calls `web::serve`, which reads its own port, binds and runs until the process ends. `Hid` accepts commands immediately; it spawns its own `Ch9329Device` and drain worker once its settle delay has passed.
 2. Capture card plugged → `CaptureDevice` probes → dispatches `devicechange`, which `CaptureEngine` forwards to its own subscribers. For each `Connected` session, `rtc` calls `capture.request_stream`, `add_track`s, and renegotiates; the encode pass starts, and *that* is what opens the card (`Device::open` → `CaptureHandle`).
 3. Browser hits the `web` signaling endpoint → `web` calls `rtc.handle_offer` → returns the answer.
 4. The session's `control` channel opens → it reads the current capture settings, capture device state, HID presence and mouse mode from `capture` and `hid` and pushes them to that tab, once. From then on its own subscriptions push every change, so an already-open tab follows a hot-plug or another tab's Save with no reload. The Save button itself is a command back the other way (`capture.update_settings` / `hid.set_mouse_mode`), and the change event that follows is what echoes it to every tab, including the one that saved.

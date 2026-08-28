@@ -4,11 +4,9 @@ mod hid;
 mod rtc;
 mod web;
 
-use std::env;
 use std::sync::Arc;
 
 use anyhow::Result;
-use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
 use capture::engine::CaptureEngine;
@@ -20,8 +18,6 @@ async fn main() -> Result<()> {
     init_logging();
     log_startup_banner(env!("CARGO_PKG_VERSION"));
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "simple_kvm starting");
-
-    let http_port: u16 = env_parsed("HTTP_PORT").unwrap_or(3000);
 
     // --- Capture: the card is never opened automatically right here at
     // startup. Opening it unprompted has reliably crashed the real hardware
@@ -42,27 +38,11 @@ async fn main() -> Result<()> {
     let hid = Hid::spawn();
 
     let rtc = rtc::Rtc::new(capture_engine, hid);
-    let http_addr = std::net::SocketAddr::from(([0, 0, 0, 0], http_port));
-    tracing::info!(port = http_port, "page and WebRTC signaling server listening");
-    let http_handle = tokio::spawn(async move {
-        let listener = match TcpListener::bind(http_addr).await {
-            Ok(listener) => listener,
-            Err(err) => {
-                tracing::error!(%err, "failed to bind HTTP listener");
-                return;
-            }
-        };
-        if let Err(err) = axum::serve(listener, web::router(rtc)).await {
-            tracing::error!(%err, "page server exited");
-        }
-    });
 
-    let _ = http_handle.await;
+    // --- Web: owns the port, the listener and every route. Runs until the
+    // process ends, which is what keeps the whole service alive. ---
+    web::serve(rtc).await;
     Ok(())
-}
-
-fn env_parsed<T: std::str::FromStr>(key: &str) -> Option<T> {
-    env::var(key).ok().and_then(|v| v.parse().ok())
 }
 
 /// Used only when `RUST_LOG` isn't set. Everything else stays at `info`,
