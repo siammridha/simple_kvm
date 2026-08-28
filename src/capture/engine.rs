@@ -1,7 +1,7 @@
 //! `CaptureEngine`/`CaptureStream` - the `getUserMedia`/`MediaStreamTrack`
 //! equivalent described in `docs/capture-redesign-ideas.md`, built on top
-//! of `Device<CaptureDriver>` (see `capture::driver`). Wired into the real
-//! session layer by `rtc::session::handle` (issue #006): a session asks
+//! of `Device<CaptureDriver>` (see `device::capture_driver`). Wired into
+//! the real session layer by `rtc::session::handle` (issue #006): a session asks
 //! `request_stream()` for a live stream once its connection is stable, and
 //! subscribes to the returned `CaptureStream`'s `ended` event to know when
 //! to drop it.
@@ -12,11 +12,8 @@ use std::sync::{Arc, Mutex, Weak};
 
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::capture::driver::CaptureDevice;
-use crate::capture::v4l2::{Resolution, SupportedFormat};
 use crate::capture::video_bus::{self, FrameEnvelope};
-use crate::config::CaptureSettings;
-use crate::device::{DeviceStatus, EventEmitter, Subscription};
+use crate::device::{CaptureDevice, CaptureSettings, DeviceStatus, EventEmitter, Resolution, Subscription, SupportedFormat};
 
 /// Startup default, falling back to the device's first reported
 /// resolution/frame-rate combination if this specific one isn't
@@ -151,9 +148,15 @@ impl CaptureEngine {
     /// device isn't currently present; otherwise (re)uses the shared
     /// encode pass, starting it if it isn't already running, and hands
     /// back a new per-consumer `CaptureStream`.
+    ///
+    /// Presence is checked per consumer, but the device is opened only by
+    /// the pass this may start (see `start_pass`): a V4L2 device can only
+    /// have its format negotiated by one holder at a time, so a second
+    /// consumer joining a running pass must not open it a second time.
     pub async fn request_stream(&self, settings: CaptureSettings) -> Result<CaptureStream, NoDevice> {
-        let raw = self.shared.device.open(&settings).map_err(|_| NoDevice)?;
-        let device_path = raw.device_path().to_string();
+        if !self.shared.device.is_present() {
+            return Err(NoDevice);
+        }
 
         let ended = Arc::new(EventEmitter::new());
         {
@@ -161,7 +164,7 @@ impl CaptureEngine {
             let should_start = state.live.increment();
             if should_start {
                 state.settings = settings;
-                start_pass(&self.shared, &mut state, device_path);
+                start_pass(&self.shared, &mut state);
             }
             state.ended_emitters.push(Arc::downgrade(&ended));
         }
@@ -175,10 +178,10 @@ impl CaptureEngine {
     /// `rtc::session::handle` subscribes to in order to retry
     /// `request_stream()` once a previously-unavailable device becomes
     /// present again, without needing a new browser connection - matches
-    /// `request_stream`'s own presence-only gating (`Device::open` matches
-    /// on `DeviceStatus::Present(_)` regardless of whether probing
-    /// succeeded), rather than the stricter "successfully probed" signal
-    /// `DeviceState` carries for the UI.
+    /// `request_stream`'s own presence-only gating (`Device::is_present`
+    /// is true for `DeviceStatus::Present(_)` regardless of whether
+    /// probing succeeded), rather than the stricter "successfully probed"
+    /// signal `DeviceState` carries for the UI.
     pub fn add_event_listener<F, Fut>(&self, callback: F) -> Subscription<DeviceStatus<SupportedFormat>>
     where
         F: Fn(DeviceStatus<SupportedFormat>) -> Fut + Send + Sync + 'static,
@@ -198,23 +201,27 @@ impl CaptureEngine {
     }
 }
 
-/// Starts the shared encode pass against `device_path`, reusing
-/// `capture::run_one_pass` (in turn `v4l2::run_capture_loop` and
-/// `h264::H264Encoder`) - the same capture/encode machinery the pre-#004
-/// `CaptureManager` used, just with a different start/stop trigger, tied
-/// to `state.live` (this module's own live-stream count) rather than a
-/// raw connected-session counter. Must be called with `state`'s lock
-/// already held.
-fn start_pass(shared: &Arc<Shared>, state: &mut State, device_path: String) {
+/// Starts the shared encode pass, reusing `capture::run_one_pass` (in turn
+/// `Device::open`, `v4l2::run_capture_loop` and `h264::H264Encoder`) - the
+/// same capture/encode machinery the pre-#004 `CaptureManager` used, just
+/// with a different start/stop trigger, tied to `state.live` (this
+/// module's own live-stream count) rather than a raw connected-session
+/// counter. Must be called with `state`'s lock already held.
+///
+/// The device handle is opened by `run_one_pass` on the blocking thread,
+/// not here: the open is real I/O against the card, and this runs inside
+/// an async task holding a lock.
+fn start_pass(shared: &Arc<Shared>, state: &mut State) {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_task = Arc::clone(&stop);
     let settings = state.settings;
     let format = state.format.clone();
+    let device = shared.device.clone();
     let video_bus = shared.video_bus_tx.clone();
     let force_keyframe = Arc::clone(&shared.force_keyframe);
 
     tracing::info!("video encoding started");
-    let handle = tokio::task::spawn_blocking(move || super::run_one_pass(&device_path, &format, &settings, stop_task, video_bus, force_keyframe));
+    let handle = tokio::task::spawn_blocking(move || super::run_one_pass(&device, &format, &settings, stop_task, video_bus, force_keyframe));
 
     let supervisor_shared = Arc::clone(shared);
     let supervisor_stop = Arc::clone(&stop);
@@ -397,13 +404,13 @@ mod tests {
     // pointed at a plain temp file standing in for the device path - see
     // issue #004's acceptance criteria: "no real hardware needed if
     // CaptureDriver's open is exercised against a fake/mock path in
-    // tests". A plain file always fails `v4l2::enumerate`'s probe (it's
-    // not a real V4L2 device), so `format` stays `None` deterministically
-    // - which `run_one_pass` treats as "nothing to do", exiting
-    // immediately without ever asking to stop deliberately. That's
-    // exactly what's needed to exercise the "pass ended on its own ->
-    // ended() fires" path without any real hardware or racy ioctl
-    // failure timing. ---
+    // tests". A plain file always fails `CaptureDriver::probe` (it's not
+    // a real V4L2 device), so `format` stays `None` deterministically -
+    // which `run_one_pass` treats as "nothing to do", exiting immediately
+    // (before it would even open the device) without ever asking to stop
+    // deliberately. That's exactly what's needed to exercise the "pass
+    // ended on its own -> ended() fires" path without any real hardware or
+    // racy ioctl failure timing. ---
 
     async fn present_device_at(path: &str) -> CaptureDevice {
         let device = CaptureDevice::spawn(path, "video4linux");

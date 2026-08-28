@@ -93,7 +93,7 @@ pub enum ServerMessage {
     /// Whether the CH9329 is plugged in right now — the HID counterpart of
     /// `DeviceState` (which only covers the capture card).
     HidState { available: bool },
-    Settings { capture: crate::config::CaptureSettings, mouse_mode: crate::config::MouseMode },
+    Settings { capture: crate::capture::CaptureSettings, mouse_mode: crate::config::MouseMode },
     /// A fresh SDP offer starting a second (or later) round of
     /// negotiation, pushed whenever `rtc::Handler::on_negotiation_needed`
     /// fires after the initial connection is already up — e.g. the

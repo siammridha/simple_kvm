@@ -1,6 +1,10 @@
-//! Owns the single open connection to the CH9329 over `/dev/ttyUSB*` and
+//! Owns the single open connection to the CH9329's serial port and
 //! serializes all writes onto it. Runs as a dedicated blocking loop (driven
 //! by `run`), fed by a channel so every input source shares one writer.
+//!
+//! It still opens that port itself, from a path handed in by the
+//! composition root, rather than through `device::Ch9329Device` - #016
+//! rewires it.
 //!
 //! Absolute mouse mode on this hardware only conveys X/Y — confirmed by an
 //! end-to-end loopback test against the real chip (see the plan doc).
@@ -67,7 +71,7 @@ impl SerialCommand {
 /// Opens the CH9329's serial port. Returns `Ok(None)` (not an error) if no
 /// device is present at `path` — callers should run in a soft
 /// "no CH9329 attached" state rather than failing to start.
-pub fn open(path: &str) -> Result<Option<Box<dyn SerialPort>>> {
+fn open(path: &str) -> Result<Option<Box<dyn SerialPort>>> {
     match serialport::new(path, BAUD_RATE).timeout(OPEN_TIMEOUT).open() {
         Ok(port) => Ok(Some(port)),
         Err(err)
@@ -91,7 +95,7 @@ pub struct SerialWriter {
 impl SerialWriter {
     /// `present_rx` reports whether the CH9329 is plugged in right now,
     /// sourced from `Ch9329Device`'s shared presence detection (see
-    /// `hid::device`) rather than this struct checking `Path::exists`
+    /// `device::ch9329_driver`) rather than this struct checking `Path::exists`
     /// itself — the same channel the WebRTC session layer reads from to
     /// tell the browser (the HID counterpart of the capture card's
     /// `DeviceState` — see `rtc::session`), so both sides agree on presence
@@ -188,11 +192,11 @@ impl SerialWriter {
 /// reports a presence change — so a reconnect is noticed immediately
 /// instead of waiting for the next real keystroke or click. `present_rx`
 /// is sourced from `Ch9329Device`'s shared presence detection (see
-/// `hid::device`), which already does the kernel `tty` uevent
+/// `device::ch9329_driver`), which already does the kernel `tty` uevent
 /// listening this function used to do itself — the same immediate-
-/// detection treatment `capture::driver::CaptureDevice` gives the capture
-/// card, both built on the generic `device::Device<D>` core instead of
-/// each reimplementing it.
+/// detection treatment `device::CaptureDevice` gives the capture card,
+/// both built on the generic `device::Device<D>` core instead of each
+/// reimplementing it.
 pub async fn watch_connection(mut present_rx: watch::Receiver<bool>, commands: mpsc::Sender<SerialCommand>) {
     loop {
         if present_rx.changed().await.is_err() {

@@ -35,7 +35,9 @@ Each module lists what it is **responsible for**, **owns exclusively**, **may de
 
 - **Responsible for:** detecting plug/unplug, probing a device's capabilities when it appears, and notifying subscribers. **Sole owner of every OS device path.**
 - **How it works:** a generic `Device<D: DeviceDriver>` core (presence task + event dispatch + path encapsulation) plus per-kind **drivers** (`CaptureDriver`, `Ch9329Driver`, future UART). One instance per physical device; each reads its own path from its own config. `Device::open()` is the only path-touching call and hands back an OS handle, never the path.
-- **Owns exclusively:** all device paths and path→device mapping; the generic core **and** the drivers (their `probe`/`open` is the only code that touches a path or does a raw OS open); the `devicechange` events; `open()`; the kernel uevent listener; and the `EventEmitter`/`Subscription` pair (§5.1), which it **re-exports** publicly because every `add_event_listener` in the codebase hands back a `Subscription`.
+- **Owns exclusively:** all device paths and path→device mapping; the generic core **and** the drivers (their `probe`/`open` is the only code that touches a path or does a raw OS open); the handle types their `open` hands back (`CaptureHandle`, the CH9329's serial port) and the capture types the capture driver produces (`Resolution`, `SupportedFormat`, `CaptureSettings` — `capture` re-exports these as part of its own API); the `devicechange` events; `open()`; the kernel uevent listener; and the `EventEmitter`/`Subscription` pair (§5.1), which it **re-exports** publicly because every `add_event_listener` in the codebase hands back a `Subscription`.
+- **Handles carry what only the open could learn.** `CaptureHandle` is an already-open V4L2 device plus the resolution the driver *actually negotiated*, which is free to differ from the requested one. The negotiated value is the only one the encode loop can see, because buffers sized from the requested one read past the end of a real frame.
+- **`is_present()` alongside `open()`.** A real open is neither free nor repeatable — negotiating a format can only be done by one holder at a time — so presence is also queryable on its own, for callers that must reject early (`getUserMedia`-style) without opening.
 - **May depend on:** the OS/kernel only. Leaf of the graph.
 - **Must not:** encode, negotiate, speak the CH9329 protocol, or run HTTP.
 
@@ -51,8 +53,9 @@ Each module lists what it is **responsible for**, **owns exclusively**, **may de
 ### 3.2 `capture` — encode pipeline (mirrors `getUserMedia`)
 
 - **Responsible for:** turning capture settings into a per-consumer video stream.
-- **How it works:** `CaptureEngine` holds a `CaptureDevice`. `request_stream(settings) -> CaptureStream` opens via the Device API and returns a per-consumer stream (= `MediaStreamTrack`) carrying an `ended` event; it fails the same way `open()` does when the device is absent.
-- **Owns exclusively:** the encode loop, the frame bus the encode pass publishes to, the `CaptureStream` type and its `ended` signal, and the current capture settings (held in memory). The bus stays private; only `FrameEnvelope`, the frame a session pulls off a stream, is re-exported.
+- **How it works:** `CaptureEngine` holds a `CaptureDevice`. `request_stream(settings) -> CaptureStream` returns a per-consumer stream (= `MediaStreamTrack`) carrying an `ended` event; it rejects with `NoDevice` when the device is absent (`Device::is_present`). The device itself is opened **once per encode pass**, by the pass, on its own blocking thread — not once per consumer: a second consumer joining a running pass must not re-open and re-negotiate a device that is already streaming. A failed open ends that pass, which fires `ended` exactly as device loss does.
+- **Opening is consumer-triggered, always.** The first `request_stream` is what causes an open; presence detection and probing never do. This is a hardware constraint, not a preference — opening the card unprompted at boot has crashed the real device (see §3.1's probe-skip on the first check).
+- **Owns exclusively:** the encode loop (driven from the `CaptureHandle`, sizing its buffers from that handle's negotiated resolution), the frame bus the encode pass publishes to, the `CaptureStream` type and its `ended` signal, and the current capture settings (held in memory). The bus stays private; only `FrameEnvelope`, the frame a session pulls off a stream, is re-exported.
 - **May depend on:** `device` (holds a `CaptureDevice`: subscribe + `open`).
 - **Must not:** know the device path; talk to `rtc`/`hid`/`web`; own peer sessions.
 
@@ -153,14 +156,14 @@ Anything not in this table is a violation — including `web → device/capture/
 
 ### 5.2 Commands — direct API
 
-- A caller invokes a callee's public async API (expressed as a **trait/port**) and awaits a typed result or error: `device.open(settings)`, `capture.request_stream(settings)`, `hid.send(msg)`, `rtc.handle_offer(offer)`.
+- A caller invokes a callee's public async API (expressed as a **trait/port**) and awaits a typed result or error: `device.open(settings)` / `device.is_present()`, `capture.request_stream(settings)`, `hid.send(msg)`, `rtc.handle_offer(offer)`.
 
 ---
 
 ## 6. Lifecycle
 
 1. `main` spawns both `Device`s (each reads its own path, begins its presence task), constructs and wires the rest, and starts `rtc` and `web`.
-2. Capture card plugged → `CaptureDevice` probes → dispatches `devicechange`, which `CaptureEngine` forwards to its own subscribers. For each `Connected` session, `rtc` calls `capture.request_stream`, `add_track`s, and renegotiates; the encoder starts.
+2. Capture card plugged → `CaptureDevice` probes → dispatches `devicechange`, which `CaptureEngine` forwards to its own subscribers. For each `Connected` session, `rtc` calls `capture.request_stream`, `add_track`s, and renegotiates; the encode pass starts, and *that* is what opens the card (`Device::open` → `CaptureHandle`).
 3. Browser hits the `web` signaling endpoint → `web` calls `rtc.handle_offer` → returns the answer.
 4. Peer input arrives → `rtc` calls `hid.send` → HID's queue drains in order.
 5. Card unplugged → every live `CaptureStream` fires `ended` → each session `remove_track`s + renegotiates → the encoder stops.

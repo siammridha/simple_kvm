@@ -30,12 +30,12 @@ use webrtc::media_stream::{MediaStreamTrack, Track};
 use webrtc::peer_connection::{PeerConnection, RTCPeerConnectionState, RTCSessionDescription};
 use webrtc::rtp_transceiver::RtpSender;
 
-use crate::capture::engine::{CaptureEngine, CaptureStream, NoDevice};
-use crate::capture::v4l2::{Resolution, SupportedFormat};
 use crate::capture::FrameEnvelope;
+use crate::capture::engine::{CaptureEngine, CaptureStream, NoDevice};
+use crate::capture::{CaptureSettings, Resolution, SupportedFormat};
+use crate::config::{DeviceState, MouseMode};
 use crate::hid::keymap::{self, KeyCode};
 use crate::hid::writer::SerialCommand;
-use crate::config::{CaptureSettings, DeviceState, MouseMode};
 use crate::device::{DeviceStatus, Subscription};
 
 use super::protocol::{ControlMessage, InputEvent, MouseModeWire, ServerMessage};
@@ -662,8 +662,7 @@ fn handle_control_message(msg: ControlMessage, ctx: &SessionContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::driver::CaptureDevice;
-    use crate::capture::v4l2::Resolution;
+    use crate::capture::CaptureDevice;
     use crate::rtc::protocol::CaptureSettingsWire;
 
     fn test_ctx() -> SessionContext {

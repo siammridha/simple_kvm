@@ -3,12 +3,19 @@
 //! through one interface rather than a separate hand-rolled presence
 //! module per physical device kind (see `docs/capture-redesign-ideas.md`,
 //! "Decided: one generic device module, not one-off per device kind").
-//! The capture card (`capture::driver::CaptureDriver`) and the CH9329
-//! (`hid::device::Ch9329Driver`) each plug in their own `DeviceDriver`
-//! impl for *how* to probe/open; this module owns everything
-//! device-kind-independent: presence detection, event dispatch (via
-//! `event`), and encapsulating the raw device path.
+//! The capture card (`capture_driver`) and the CH9329 (`ch9329_driver`)
+//! each plug in their own `DeviceDriver` impl for *how* to probe/open;
+//! this module owns everything device-kind-independent: presence
+//! detection, event dispatch (via `event`), and encapsulating the raw
+//! device path.
+//!
+//! The drivers live here, not in the modules that consume them, because
+//! `probe`/`open` are the only calls that touch a device path or do a raw
+//! OS open. What they hand back is an already-open OS handle; no handle
+//! ever exposes the path it came from (see `ARCHITECTURE.md` I3).
 
+mod capture_driver;
+mod ch9329_driver;
 mod event;
 mod uevent;
 
@@ -25,6 +32,12 @@ use std::time::Duration;
 /// than duplicating keeps one implementation and adds no dependency edge:
 /// both already depend on `device`.
 pub use event::{EventEmitter, Subscription};
+
+/// The driver types themselves stay unexported - a device kind's whole
+/// public surface is its `Device<D>` alias, the handle its `open` hands
+/// back, and (for the capture card) the types its driver produces.
+pub use capture_driver::{CaptureDevice, CaptureHandle, CaptureSettings, Resolution, SupportedFormat};
+pub use ch9329_driver::Ch9329Device;
 
 /// Backoff-free fallback poll interval, used only when the kernel uevent
 /// listener itself failed to open (see `uevent::UeventListener::open`) -
@@ -136,6 +149,17 @@ impl<D: DeviceDriver> Device<D> {
             DeviceStatus::Present(_) => D::open(&self.inner.device_path, settings),
             DeviceStatus::Absent => Err(OpenError("device is not currently present".to_string())),
         }
+    }
+
+    /// Whether the device is plugged in right now - exactly the gate
+    /// `open` applies, exposed on its own so a caller can reject early
+    /// (the way `getUserMedia` rejects with no matching device) without
+    /// performing a real open. A real open is neither free nor repeatable:
+    /// opening the capture card negotiates a format, which only works
+    /// while nothing else is already streaming from it, so `capture`
+    /// checks presence per consumer but opens once per encode pass.
+    pub fn is_present(&self) -> bool {
+        matches!(&*self.inner.current.lock().unwrap(), DeviceStatus::Present(_))
     }
 
     /// Test-only: builds a `Device` in a given status without spawning
@@ -355,5 +379,26 @@ mod tests {
 
         let device = Device::<Fake>::from_status("dummy", DeviceStatus::Present(Some(FakeInfo(1))));
         assert_eq!(device.open(&()).unwrap(), "opened");
+    }
+
+    #[test]
+    fn is_present_reports_the_same_gate_open_applies() {
+        struct Fake;
+        impl DeviceDriver for Fake {
+            type Info = FakeInfo;
+            type Settings = ();
+            type Open = ();
+            fn probe(_device_path: &str) -> Option<Self::Info> {
+                None
+            }
+            fn open(_device_path: &str, _settings: &Self::Settings) -> Result<Self::Open, OpenError> {
+                Ok(())
+            }
+        }
+
+        assert!(!Device::<Fake>::from_status("dummy", DeviceStatus::Absent).is_present());
+        // The boot-time "present but deliberately not probed" case still
+        // counts as present, same as `open` treats it.
+        assert!(Device::<Fake>::from_status("dummy", DeviceStatus::Present(None)).is_present());
     }
 }

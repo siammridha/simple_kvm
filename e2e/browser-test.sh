@@ -20,8 +20,8 @@
 # drive a real CaptureEngine::request_stream() success and prove the
 # session's add-track + renegotiation path end to end. The fake file also
 # isn't a real V4L2 device, so the capture pass started for it fails
-# immediately once it runs (v4l2::enumerate never reports a supported
-# format) - CaptureStream's `ended` event fires from that exactly as it
+# immediately once it runs (CaptureDriver::probe never reports a
+# supported format) - CaptureStream's `ended` event fires from that as it
 # would from a genuine mid-session unplug, proving the remove-track half
 # too, all without needing any uevent at all.
 #
@@ -162,8 +162,8 @@ wait_for_log_count "capture device available: added video track" 1
 echo "server added a video track for this session"
 assert_still_connected "after adding video"
 
-# The fake device file isn't a real V4L2 device, so v4l2::enumerate never
-# reports a supported format for it - the capture pass started for it
+# The fake device file isn't a real V4L2 device, so CaptureDriver::probe
+# never reports a supported format for it - the capture pass started for it
 # fails immediately (see src/capture/mod.rs's run_one_pass and
 # src/capture/engine.rs's own "ended_fires_exactly_once_on_unrecoverable_
 # pass_failure" test, which exercises the exact same fake-file setup).

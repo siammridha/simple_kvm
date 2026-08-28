@@ -20,9 +20,10 @@ use webrtc::peer_connection::{
     RTCIceGatheringState, RTCPeerConnectionState, RTCSessionDescription, Registry,
 };
 
+use crate::capture::CaptureSettings;
 use crate::capture::engine::CaptureEngine;
+use crate::config::{DeviceState, MouseMode};
 use crate::hid::writer::SerialCommand;
-use crate::config::{CaptureSettings, DeviceState, MouseMode};
 use session::SessionContext;
 
 /// Everything a new WebRTC session needs, shared across every browser tab

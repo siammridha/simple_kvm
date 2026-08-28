@@ -1,17 +1,16 @@
-//! Shared, live-mutable settings — changed by a dropdown on the page,
-//! read by the capture task and the WebRTC session layer via
+//! Shared, live-mutable state — changed by a dropdown on the page, read
+//! by the capture task and the WebRTC session layer via
 //! `tokio::sync::watch`, so a change never has to touch the connection
 //! itself. In-memory only: nothing here is ever persisted to disk.
+//!
+//! The capture settings type itself now lives with the driver that
+//! consumes it (`device::capture_driver`, re-exported as
+//! `capture::CaptureSettings`); this module is what's left, and #018
+//! removes it entirely.
 
 use serde::{Deserialize, Serialize};
 
-use crate::capture::v4l2::Resolution;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CaptureSettings {
-    pub resolution: Resolution,
-    pub fps: u32,
-}
+use crate::capture::Resolution;
 
 /// Live state of the capture card itself — whether it's plugged in right
 /// now, and what resolutions/frame rates it supports. Published by

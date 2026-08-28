@@ -14,12 +14,9 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tracing_subscriber::EnvFilter;
 
-use capture::driver::CaptureDevice;
 use capture::engine::CaptureEngine;
-use capture::v4l2::Resolution;
-use config::{CaptureSettings, MouseMode};
-use device::DeviceStatus;
-use hid::device::Ch9329Device;
+use config::MouseMode;
+use device::{CaptureDevice, CaptureSettings, Ch9329Device, DeviceStatus, Resolution};
 use hid::writer::{self, SerialCommand};
 
 #[tokio::main]
