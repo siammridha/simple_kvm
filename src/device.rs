@@ -4,7 +4,7 @@
 //! module per physical device kind (see `docs/capture-redesign-ideas.md`,
 //! "Decided: one generic device module, not one-off per device kind").
 //! The capture card (`capture::driver::CaptureDriver`) and the CH9329
-//! (`ch9329::device::Ch9329Driver`) each plug in their own `DeviceDriver`
+//! (`hid::device::Ch9329Driver`) each plug in their own `DeviceDriver`
 //! impl for *how* to probe/open; this module owns everything
 //! device-kind-independent: presence detection, event dispatch (via
 //! `crate::event`), and encapsulating the raw device path.

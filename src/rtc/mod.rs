@@ -21,7 +21,7 @@ use webrtc::peer_connection::{
 };
 
 use crate::capture::engine::CaptureEngine;
-use crate::ch9329::writer::SerialCommand;
+use crate::hid::writer::SerialCommand;
 use crate::config::{CaptureSettings, DeviceState, MouseMode};
 use session::SessionContext;
 

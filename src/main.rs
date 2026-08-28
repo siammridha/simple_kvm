@@ -1,8 +1,8 @@
 mod capture;
-mod ch9329;
 mod config;
 mod device;
 mod event;
+mod hid;
 mod rtc;
 mod uevent;
 mod video_bus;
@@ -20,10 +20,10 @@ use tracing_subscriber::EnvFilter;
 use capture::driver::CaptureDevice;
 use capture::engine::CaptureEngine;
 use capture::v4l2::Resolution;
-use ch9329::device::Ch9329Device;
-use ch9329::writer::{self, SerialCommand};
 use config::{CaptureSettings, MouseMode};
 use device::DeviceStatus;
+use hid::device::Ch9329Device;
+use hid::writer::{self, SerialCommand};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -133,7 +133,7 @@ async fn open_serial_after_delay(
 /// reports are visible in the log immediately, with no configuration step
 /// needed first - setting `RUST_LOG` explicitly still overrides this
 /// entirely, same as any `EnvFilter`.
-const DEFAULT_LOG_FILTER: &str = "info,simple_kvm::rtc::session=debug,simple_kvm::ch9329::writer=debug";
+const DEFAULT_LOG_FILTER: &str = "info,simple_kvm::rtc::session=debug,simple_kvm::hid::writer=debug";
 
 fn init_logging() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));

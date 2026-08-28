@@ -574,7 +574,7 @@ function wireInput() {
 
 function buttonMask(domButtons) {
   // DOM MouseEvent.buttons: bit0=left bit1=right bit2=middle — matches
-  // ch9329::protocol::button's bit layout directly.
+  // hid::protocol::button's bit layout directly.
   return domButtons & 0x07;
 }
 

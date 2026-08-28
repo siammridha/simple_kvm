@@ -91,7 +91,7 @@ pub struct SerialWriter {
 impl SerialWriter {
     /// `present_rx` reports whether the CH9329 is plugged in right now,
     /// sourced from `Ch9329Device`'s shared presence detection (see
-    /// `ch9329::device`) rather than this struct checking `Path::exists`
+    /// `hid::device`) rather than this struct checking `Path::exists`
     /// itself — the same channel the WebRTC session layer reads from to
     /// tell the browser (the HID counterpart of the capture card's
     /// `DeviceState` — see `rtc::session`), so both sides agree on presence
@@ -188,7 +188,7 @@ impl SerialWriter {
 /// reports a presence change — so a reconnect is noticed immediately
 /// instead of waiting for the next real keystroke or click. `present_rx`
 /// is sourced from `Ch9329Device`'s shared presence detection (see
-/// `ch9329::device`), which already does the kernel `tty` uevent
+/// `hid::device`), which already does the kernel `tty` uevent
 /// listening this function used to do itself — the same immediate-
 /// detection treatment `capture::driver::CaptureDevice` gives the capture
 /// card, both built on the generic `device::Device<D>` core instead of

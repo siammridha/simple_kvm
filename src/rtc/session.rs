@@ -32,8 +32,8 @@ use webrtc::rtp_transceiver::RtpSender;
 
 use crate::capture::engine::{CaptureEngine, CaptureStream, NoDevice};
 use crate::capture::v4l2::{Resolution, SupportedFormat};
-use crate::ch9329::keymap::{self, KeyCode};
-use crate::ch9329::writer::SerialCommand;
+use crate::hid::keymap::{self, KeyCode};
+use crate::hid::writer::SerialCommand;
 use crate::config::{CaptureSettings, DeviceState, MouseMode};
 use crate::device::DeviceStatus;
 use crate::event::Subscription;

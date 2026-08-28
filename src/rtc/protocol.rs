@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 pub enum InputEvent {
     /// A physical key's press/release state changed. `code` is a
     /// `KeyboardEvent.code` value (e.g. `"KeyA"`); translated via
-    /// `ch9329::keymap`.
+    /// `hid::keymap`.
     KeyEvent { pressed: bool, code: String },
     /// Absolute cursor position as a fraction of the video frame.
     MouseAbsoluteMove { x_frac: f32, y_frac: f32 },
@@ -20,7 +20,7 @@ pub enum InputEvent {
     MouseRelativeMove { buttons: u8, dx: i8, dy: i8, wheel: i8 },
     /// Click/scroll state without moving the cursor — used for absolute
     /// mode, where the hardware only honors position, not buttons/wheel,
-    /// in its own absolute report (see `ch9329::writer`).
+    /// in its own absolute report (see `hid::writer`).
     MouseButtons { buttons: u8, wheel: i8 },
 }
 

@@ -58,7 +58,7 @@ ip>:3000` with:
   was built against, clicks and scroll wheel only work through its
   *relative* HID report, so absolute mode sends position via the absolute
   report and clicks/scroll via a zero-motion relative report - invisible
-  from the browser, just how `ch9329::writer` talks to this chip. Mouse
+  from the browser, just how `hid::writer` talks to this chip. Mouse
   movement used to be sent on every native `mousemove` event, which was
   fast enough to crash-reboot the Wyse 3040 (a power/brownout issue), so
   it's now throttled to send at most once per video frame - matching
@@ -315,7 +315,7 @@ if you need to change one):
 | `SERIAL_OPEN_DELAY_SECS` | `30` | How long to wait before opening the CH9329 serial port, for the same reason as the capture card's boot delay below — set to `0` to disable. |
 | `VIDEO_PATH` | `/dev/video0` | Capture card device |
 | `HTTP_PORT` | `3000` | Port for the page and WebRTC signaling (`POST /rtc/offer`) |
-| `RUST_LOG` | `info,simple_kvm::rtc::session=debug,simple_kvm::ch9329::writer=debug` | Standard `tracing` log filter. By default, every keystroke/click is already logged at `debug` - no configuration needed first - since each log line includes how long that event took to queue/write, which is useful for tracking down input lag. A command that takes more than 50ms logs at `warn` regardless. Setting `RUST_LOG` yourself (e.g. `RUST_LOG=debug` for everything, or `RUST_LOG=warn` to quiet the per-keystroke lines) fully overrides the default above. |
+| `RUST_LOG` | `info,simple_kvm::rtc::session=debug,simple_kvm::hid::writer=debug` | Standard `tracing` log filter. By default, every keystroke/click is already logged at `debug` - no configuration needed first - since each log line includes how long that event took to queue/write, which is useful for tracking down input lag. A command that takes more than 50ms logs at `warn` regardless. Setting `RUST_LOG` yourself (e.g. `RUST_LOG=debug` for everything, or `RUST_LOG=warn` to quiet the per-keystroke lines) fully overrides the default above. |
 
 Each browser tab's video/input connection (WebRTC) picks its own UDP port
 automatically - there's no fixed port to configure for it, and nothing to
