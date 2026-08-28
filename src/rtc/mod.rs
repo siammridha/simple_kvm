@@ -20,9 +20,8 @@ use webrtc::peer_connection::{
     RTCIceGatheringState, RTCPeerConnectionState, RTCSessionDescription, Registry,
 };
 
-use crate::capture::CaptureSettings;
 use crate::capture::engine::CaptureEngine;
-use crate::config::DeviceState;
+use crate::capture::{CaptureSettings, DeviceState};
 use crate::device::{DeviceStatus, Subscription};
 use crate::hid::{Hid, MouseMode};
 use session::SessionContext;
@@ -44,7 +43,15 @@ pub struct SharedChannels {
     /// every key/mouse event. The queue, the port and the drain worker
     /// live behind it; nothing here holds any of them.
     pub hid: Arc<Hid>,
-    pub capture_settings_tx: watch::Sender<CaptureSettings>,
+    /// Temporary, with the same fate under #019 as the two below:
+    /// `capture` owns the settings themselves, and `new` bridges its
+    /// change event into this `watch` so a session's `select!` can wait on
+    /// it. A session applies a change by calling
+    /// `CaptureEngine::update_settings`, never through this.
+    pub capture_settings_rx: watch::Receiver<CaptureSettings>,
+    /// Temporary, same reason and same fate: `capture` computes and owns
+    /// `DeviceState`, and `new` bridges its change event into this
+    /// `watch`.
     pub device_state_rx: watch::Receiver<DeviceState>,
     /// Temporary: `session` still *polls* HID presence, so `new` bridges
     /// `Hid`'s presence events into this `watch`. #019 replaces it with a
@@ -59,17 +66,30 @@ pub struct SharedChannels {
     pub mouse_mode_rx: watch::Receiver<MouseMode>,
     /// Keep the bridging listeners registered for as long as any session
     /// can still read the receivers above (see `Subscription`).
+    _capture_settings_sub: Arc<Subscription<CaptureSettings>>,
+    _device_state_sub: Arc<Subscription<DeviceState>>,
     _hid_presence_sub: Arc<Subscription<DeviceStatus<()>>>,
     _mouse_mode_sub: Arc<Subscription<MouseMode>>,
 }
 
 impl SharedChannels {
-    pub fn new(
-        capture_engine: Arc<CaptureEngine>,
-        hid: Arc<Hid>,
-        capture_settings_tx: watch::Sender<CaptureSettings>,
-        device_state_rx: watch::Receiver<DeviceState>,
-    ) -> Self {
+    pub fn new(capture_engine: Arc<CaptureEngine>, hid: Arc<Hid>) -> Self {
+        let (capture_settings_tx, capture_settings_rx) = watch::channel(capture_engine.settings());
+        let capture_settings_sub = capture_engine.add_settings_listener(move |settings| {
+            let capture_settings_tx = capture_settings_tx.clone();
+            async move {
+                let _ = capture_settings_tx.send(settings);
+            }
+        });
+
+        let (device_state_tx, device_state_rx) = watch::channel(capture_engine.device_state());
+        let device_state_sub = capture_engine.add_device_state_listener(move |state| {
+            let device_state_tx = device_state_tx.clone();
+            async move {
+                let _ = device_state_tx.send(state);
+            }
+        });
+
         let (hid_connected_tx, hid_connected_rx) = watch::channel(false);
         let hid_presence_sub = hid.add_event_listener(move |status| {
             let hid_connected_tx = hid_connected_tx.clone();
@@ -89,10 +109,12 @@ impl SharedChannels {
         Self {
             capture_engine,
             hid,
-            capture_settings_tx,
+            capture_settings_rx,
             device_state_rx,
             hid_connected_rx,
             mouse_mode_rx,
+            _capture_settings_sub: Arc::new(capture_settings_sub),
+            _device_state_sub: Arc::new(device_state_sub),
             _hid_presence_sub: Arc::new(hid_presence_sub),
             _mouse_mode_sub: Arc::new(mouse_mode_sub),
         }
@@ -318,8 +340,7 @@ async fn negotiate(offer_sdp: String, channels: SharedChannels) -> Result<String
     let ctx = SessionContext {
         capture_engine: channels.capture_engine,
         hid: channels.hid,
-        capture_settings_tx: channels.capture_settings_tx.clone(),
-        capture_settings_rx: channels.capture_settings_tx.subscribe(),
+        capture_settings_rx: channels.capture_settings_rx,
         mouse_mode_rx: channels.mouse_mode_rx.clone(),
         device_state_rx: channels.device_state_rx,
         hid_connected_rx: channels.hid_connected_rx,

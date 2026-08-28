@@ -58,12 +58,14 @@ Each module lists what it is **responsible for**, **owns exclusively**, **may de
 
 ### 3.2 `capture` — encode pipeline (mirrors `getUserMedia`)
 
-- **Responsible for:** turning capture settings into a per-consumer video stream.
-- **How it works:** `CaptureEngine` holds a `CaptureDevice`. `request_stream(settings) -> CaptureStream` returns a per-consumer stream (= `MediaStreamTrack`) carrying an `ended` event; it rejects with `NoDevice` when the device is absent (`Device::is_present`). The device itself is opened **once per encode pass**, by the pass, on its own blocking thread — not once per consumer: a second consumer joining a running pass must not re-open and re-negotiate a device that is already streaming. A failed open ends that pass, which fires `ended` exactly as device loss does.
+- **Responsible for:** turning capture settings into a per-consumer video stream, and holding those settings and the card's UI-facing state.
+- **How it works:** `CaptureEngine` holds a `CaptureDevice`. `request_stream() -> CaptureStream` returns a per-consumer stream (= `MediaStreamTrack`) carrying an `ended` event; it rejects with `NoDevice` when the device is absent (`Device::is_present`). It takes no settings — the engine owns them, and a pass is shared by every consumer, so there is only ever one set in play. The device itself is opened **once per encode pass**, by the pass, on its own blocking thread — not once per consumer: a second consumer joining a running pass must not re-open and re-negotiate a device that is already streaming. A failed open ends that pass, which fires `ended` exactly as device loss does.
 - **Opening is consumer-triggered, always.** The first `request_stream` is what causes an open; presence detection and probing never do. This is a hardware constraint, not a preference — opening the card unprompted at boot has crashed the real device (see §3.1's probe-skip on the first check).
-- **Owns exclusively:** the encode loop (driven from the `CaptureHandle`, sizing its buffers from that handle's negotiated resolution), the frame bus the encode pass publishes to, the `CaptureStream` type and its `ended` signal, and the current capture settings (held in memory). The bus stays private; only `FrameEnvelope`, the frame a session pulls off a stream, is re-exported.
+- **Settings are the engine's, in memory, never on disk.** `settings()` reads them, `update_settings(new)` applies them and fires a settings-changed event so every open tab updates live. A format is negotiated at open time, so changing settings under a running pass is impossible: the engine stops that pass and the pass's own supervisor starts the replacement once the old one has actually let go of the card. Startup defaults are decided here too — a fixed default combination, replaced by the card's first reported combination if the card turns out not to support it, and never overwritten once a person has picked settings by hand.
+- **`DeviceState` is computed here, because only here has both halves.** Whether the card is usable, what it supports, and which combination is selected all follow from the probed capabilities *and* the applied settings, and `CaptureEngine` is the only thing holding both. `device_state()` reads it; a device-state event fires whenever either half moves.
+- **Owns exclusively:** the encode loop (driven from the `CaptureHandle`, sizing its buffers from that handle's negotiated resolution), the frame bus the encode pass publishes to, the `CaptureStream` type and its `ended` signal, the current capture settings (held in memory) and their change event, and the `DeviceState`/`ResolutionFrameRates` types plus their change event. The bus stays private; only `FrameEnvelope`, the frame a session pulls off a stream, is re-exported.
 - **May depend on:** `device` (holds a `CaptureDevice`: subscribe + `open`).
-- **Must not:** know the device path; talk to `rtc`/`hid`/`web`; own peer sessions.
+- **Must not:** know the device path; read or write settings to disk; talk to `rtc`/`hid`/`web`; own peer sessions.
 
 ### 3.3 `hid` — CH9329 keyboard/mouse bridge
 
@@ -83,10 +85,10 @@ The module is named `rtc`, not `webrtc`: a module called `webrtc` would shadow t
 depends on.
 
 - **Responsible for:** managing peer sessions, producing an answer from an offer, and controlling **when** media is negotiated.
-- **How it works:** exposes a signaling API (offer → answer) that `web` calls. It attaches a video track **only after** a session is `Connected` **and** the capture device is available (subscribes to presence through `CaptureEngine::add_event_listener`, calls `capture.request_stream`, renegotiates), and removes it on that stream's `ended` event. Peer input goes straight to the `hid` API, described in input terms (`InputCommand`) — no keymap lookup, no modifier bitmask, no report shape. Mouse mode is read from and written to `hid` too.
+- **How it works:** exposes a signaling API (offer → answer) that `web` calls. It attaches a video track **only after** a session is `Connected` **and** the capture device is available (subscribes to presence through `CaptureEngine::add_event_listener`, calls `capture.request_stream`, renegotiates), and removes it on that stream's `ended` event. Peer input goes straight to the `hid` API, described in input terms (`InputCommand`) — no keymap lookup, no modifier bitmask, no report shape. Capture settings and `DeviceState` are read from and (for settings) written to `capture`, mouse mode from and to `hid`; the page's Save button becomes a `CaptureEngine::update_settings` call, and the state pushed down a session's `control` channel is whatever those two modules report.
 - **Owns exclusively:** peer session state, signaling/renegotiation logic, and media-negotiation timing.
-- **May depend on:** `capture` (`request_stream` + presence subscription), `hid` (send, mouse mode, presence).
-- **Must not:** run the HTTP server, touch device paths, hold a `Device` handle, or implement capture/HID logic — including translating keys or assembling reports.
+- **May depend on:** `capture` (`request_stream`, settings, device state, presence subscription), `hid` (send, mouse mode, presence).
+- **Must not:** run the HTTP server, touch device paths, hold a `Device` handle, hold the capture settings or `DeviceState` itself, or implement capture/HID logic — including translating keys or assembling reports.
 
 ### 3.5 `web` — HTTP transport & signaling front door
 
@@ -122,7 +124,7 @@ graph TD
     device --> kernel
     capture -->|hold CaptureDevice: subscribe + open| device
     hid -->|hold Ch9329Device: subscribe + open| device
-    rtc -->|request_stream + subscribe presence| capture
+    rtc -->|request_stream, settings, device state + subscribe| capture
     rtc -->|send| hid
     web -->|signaling command| rtc
 
@@ -137,7 +139,7 @@ graph TD
 |------|-----|------|
 | `capture` | `device` | holds `CaptureDevice` — subscribe + `open` |
 | `hid` | `device` | holds `Ch9329Device` — subscribe + `open` |
-| `rtc` | `capture` | command (`request_stream`) + subscribe presence |
+| `rtc` | `capture` | command (`request_stream`, `settings`/`update_settings`, `device_state`) + subscribe presence/settings/device state |
 | `rtc` | `hid` | command (`send`, mouse mode) + subscribe presence/mouse mode |
 | `web` | `rtc` | command (signaling) |
 | `main` | all | construct/wire/start only |
@@ -159,7 +161,7 @@ Anything not in this table is a violation — including `web → device/capture/
 
 ### 5.1 Events — callback subscriptions (`EventTarget`-style) **[decided]**
 
-- One `EventEmitter<T>` per event kind (typed payload; a mismatch is a compile error, not a silent no-op). Publishers include `Device` (`devicechange`), `CaptureStream` (`ended`), and `Hid` (its device's `devicechange`, forwarded).
+- One `EventEmitter<T>` per event kind (typed payload; a mismatch is a compile error, not a silent no-op). Publishers include `Device` (`devicechange`), `CaptureStream` (`ended`), `CaptureEngine` (settings changed, device state changed, plus its device's `devicechange` forwarded), and `Hid` (mouse mode changed, plus its device's `devicechange` forwarded).
 - The emitter is **not** a shared utility module: it lives in `device` (§3.1), whose `devicechange` events are its reason to exist, and is re-exported from there. `capture` and `rtc` reach it over the `capture → device` / type-only-`device` imports they already have, so it costs no extra edge.
 - `add_event_listener(cb) -> Subscription`. The `Subscription` **auto-deregisters on drop** (mirrors `removeEventListener`) — no manual cleanup to forget, no listener left calling into dropped state.
 - `dispatch` fires each listener via its own `tokio::spawn`, **fire-and-forget, no join**, so one slow or broken listener can't stall another listener or the caller.
@@ -167,7 +169,7 @@ Anything not in this table is a violation — including `web → device/capture/
 
 ### 5.2 Commands — direct API
 
-- A caller invokes a callee's public async API (expressed as a **trait/port**) and awaits a typed result or error: `device.open(settings)` / `device.is_present()`, `capture.request_stream(settings)`, `hid.send(input)` / `hid.set_mouse_mode(mode)`, `rtc.handle_offer(offer)`.
+- A caller invokes a callee's public async API (expressed as a **trait/port**) and awaits a typed result or error: `device.open(settings)` / `device.is_present()`, `capture.request_stream()` / `capture.update_settings(new)`, `hid.send(input)` / `hid.set_mouse_mode(mode)`, `rtc.handle_offer(offer)`.
 
 ---
 

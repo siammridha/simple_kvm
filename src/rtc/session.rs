@@ -4,8 +4,8 @@
 //! request_stream`), forwarding `input` data channel messages to `hid` as
 //! `InputCommand`s, and reading `control` data channel JSON (the Save
 //! button's settings update, paste, SDP renegotiation answers). Settings
-//! changes only touch in-memory state — the shared `watch<Settings>` for
-//! capture, `hid` itself for mouse mode; the connection is never
+//! changes only touch in-memory state — `capture` itself for the capture
+//! settings, `hid` itself for mouse mode; the connection is never
 //! disturbed, so applying new settings never drops the session.
 
 use anyhow::{Context, Result};
@@ -31,8 +31,7 @@ use webrtc::rtp_transceiver::RtpSender;
 
 use crate::capture::FrameEnvelope;
 use crate::capture::engine::{CaptureEngine, CaptureStream, NoDevice};
-use crate::capture::{CaptureSettings, Resolution, SupportedFormat};
-use crate::config::DeviceState;
+use crate::capture::{CaptureSettings, DeviceState, Resolution, SupportedFormat};
 use crate::hid::{Hid, InputCommand, MouseMode};
 use crate::device::{DeviceStatus, Subscription};
 
@@ -47,7 +46,9 @@ pub struct SessionContext {
     pub capture_engine: Arc<CaptureEngine>,
     /// The HID bridge - see `super::SharedChannels::hid`.
     pub hid: Arc<Hid>,
-    pub capture_settings_tx: watch::Sender<CaptureSettings>,
+    /// Change signal only - `capture` owns the value itself, and a change
+    /// is applied by calling `CaptureEngine::update_settings`. See
+    /// `super::SharedChannels::capture_settings_rx`.
     pub capture_settings_rx: watch::Receiver<CaptureSettings>,
     /// Change signal only - `hid` owns the value itself. See
     /// `super::SharedChannels::mouse_mode_rx`.
@@ -175,14 +176,8 @@ async fn add_video_track(pc: &Arc<dyn PeerConnection>, codec: &RTCRtpCodec) -> R
 /// either way the caller just leaves the session without video, ready to
 /// try again the next time `handle`'s `presence_rx` reports the device is
 /// available.
-async fn try_attach_video(
-    pc: &Arc<dyn PeerConnection>,
-    capture_engine: &CaptureEngine,
-    settings: CaptureSettings,
-    codec: &RTCRtpCodec,
-    video_ended_tx: &mpsc::UnboundedSender<()>,
-) -> Option<VideoState> {
-    let stream = match capture_engine.request_stream(settings).await {
+async fn try_attach_video(pc: &Arc<dyn PeerConnection>, capture_engine: &CaptureEngine, codec: &RTCRtpCodec, video_ended_tx: &mpsc::UnboundedSender<()>) -> Option<VideoState> {
+    let stream = match capture_engine.request_stream().await {
         Ok(stream) => stream,
         Err(NoDevice) => return None,
     };
@@ -371,12 +366,11 @@ pub async fn handle(
                 }
             }
             Some(status) = presence_rx.recv() => {
-                if connected && video.is_none() && matches!(status, DeviceStatus::Present(_)) {
-                    let settings = *capture_settings_rx.borrow();
-                    if let Some(v) = try_attach_video(&pc, &ctx.capture_engine, settings, &ctx.h264_codec, &video_ended_tx).await {
-                        last_captured_at = None;
-                        video = Some(v);
-                    }
+                if connected && video.is_none() && matches!(status, DeviceStatus::Present(_))
+                    && let Some(v) = try_attach_video(&pc, &ctx.capture_engine, &ctx.h264_codec, &video_ended_tx).await
+                {
+                    last_captured_at = None;
+                    video = Some(v);
                 }
             }
             Some(sdp) = renegotiation_rx.recv() => {
@@ -464,8 +458,7 @@ pub async fn handle(
                     // device is already available; if not, `presence_rx`
                     // above retries later.
                     connected = true;
-                    let settings = *capture_settings_rx.borrow();
-                    if let Some(v) = try_attach_video(&pc, &ctx.capture_engine, settings, &ctx.h264_codec, &video_ended_tx).await {
+                    if let Some(v) = try_attach_video(&pc, &ctx.capture_engine, &ctx.h264_codec, &video_ended_tx).await {
                         last_captured_at = None;
                         video = Some(v);
                     }
@@ -589,10 +582,12 @@ fn handle_control_message(msg: ControlMessage, ctx: &SessionContext) {
         // only: nothing here is ever written to disk.
         ControlMessage::UpdateSettings { capture, mouse_mode } => {
             if let Some(capture) = capture {
-                ctx.capture_settings_tx.send_modify(|s| {
-                    s.resolution = Resolution { width: capture.width, height: capture.height };
-                    s.fps = capture.fps;
-                });
+                // `capture` owns the value - it's the module that decides
+                // what reaches the card, and restarts a running encode
+                // pass so the new resolution/frame rate actually take
+                // effect - and its change event is what reaches every
+                // already-open tab (see `super::SharedChannels::new`).
+                ctx.capture_engine.update_settings(CaptureSettings { resolution: Resolution { width: capture.width, height: capture.height }, fps: capture.fps });
                 tracing::info!(width = capture.width, height = capture.height, fps = capture.fps, "capture settings updated");
             }
             // `hid` owns the value - it's the module that decides what
@@ -631,8 +626,9 @@ mod tests {
     use crate::rtc::protocol::CaptureSettingsWire;
 
     fn test_ctx() -> SessionContext {
-        let (capture_settings_tx, capture_settings_rx) =
-            watch::channel(CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5 });
+        // Only a change signal in production too (see
+        // `SharedChannels::new`); the value itself comes from `capture`.
+        let (_capture_settings_tx, capture_settings_rx) = watch::channel(CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5 });
         // Only a change signal in production too (see
         // `SharedChannels::new`); the value itself comes from `hid`.
         let (_mouse_mode_tx, mouse_mode_rx) = watch::channel(MouseMode::Absolute);
@@ -649,7 +645,6 @@ mod tests {
             // ever spawned - these tests only reach
             // `handle_control_message`.
             hid: Hid::spawn_for_test(),
-            capture_settings_tx,
             capture_settings_rx,
             mouse_mode_rx,
             device_state_rx,
@@ -668,7 +663,7 @@ mod tests {
             &ctx,
         );
 
-        assert_eq!(*ctx.capture_settings_rx.borrow(), CaptureSettings { resolution: Resolution { width: 1920, height: 1080 }, fps: 25 });
+        assert_eq!(ctx.capture_engine.settings(), CaptureSettings { resolution: Resolution { width: 1920, height: 1080 }, fps: 25 });
         assert_eq!(ctx.hid.mouse_mode(), MouseMode::Absolute);
     }
 
@@ -678,10 +673,7 @@ mod tests {
 
         handle_control_message(ControlMessage::UpdateSettings { capture: None, mouse_mode: Some(MouseModeWire::Relative) }, &ctx);
 
-        assert_eq!(
-            *ctx.capture_settings_rx.borrow(),
-            CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5 }
-        );
+        assert_eq!(ctx.capture_engine.settings(), CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5 });
         assert_eq!(ctx.hid.mouse_mode(), MouseMode::Relative);
     }
 
@@ -691,10 +683,7 @@ mod tests {
 
         handle_control_message(ControlMessage::UpdateSettings { capture: None, mouse_mode: None }, &ctx);
 
-        assert_eq!(
-            *ctx.capture_settings_rx.borrow(),
-            CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5 }
-        );
+        assert_eq!(ctx.capture_engine.settings(), CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5 });
         assert_eq!(ctx.hid.mouse_mode(), MouseMode::Absolute);
     }
 

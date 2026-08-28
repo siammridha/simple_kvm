@@ -1,5 +1,4 @@
 mod capture;
-mod config;
 mod device;
 mod hid;
 mod rtc;
@@ -10,11 +9,10 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::net::TcpListener;
-use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
 use capture::engine::CaptureEngine;
-use device::{CaptureDevice, CaptureSettings, Resolution};
+use device::CaptureDevice;
 use hid::Hid;
 
 #[tokio::main]
@@ -30,22 +28,12 @@ async fn main() -> Result<()> {
     // this targets right at boot (see README's "boot-crash" known issue) -
     // `Device<CaptureDriver>`'s presence task (spawned by `CaptureDevice::
     // spawn` below) deliberately never probes the very first time it finds
-    // the device already present, for exactly that reason. Settings are
-    // in-memory only - every start uses a fixed default; nothing here is
-    // ever read from or written to disk. ---
-    let default_capture_settings = CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5 };
-
-    let (capture_settings_tx, capture_settings_rx) = watch::channel(default_capture_settings);
-
-    // Two independent handles to the same underlying presence task (see
-    // `Device::clone`) - one feeds `CaptureEngine`'s own presence-driven
-    // `request_stream()` gating, the other publishes `DeviceState` for the
-    // web UI. Neither ever sees the raw device path - the device reads it
-    // from its own config; everything here only ever sees
-    // presence/capability state.
-    let capture_device = CaptureDevice::spawn();
-    let device_state_rx = capture::watch_device_state(capture_device.clone(), capture_settings_rx.clone());
-    let capture_engine = Arc::new(CaptureEngine::new(capture_device));
+    // the device already present, for exactly that reason. `CaptureEngine`
+    // owns the capture settings and the UI-facing device state; both are
+    // in-memory only, and nothing here is ever read from or written to
+    // disk. Nothing here ever sees the raw device path either - the device
+    // reads it from its own config. ---
+    let capture_engine = Arc::new(CaptureEngine::new(CaptureDevice::spawn()));
 
     // --- Serial: same soft-unavailable treatment as capture. `Hid` owns
     // its own device, queue, drain worker, enumeration-settle delay and
@@ -53,7 +41,7 @@ async fn main() -> Result<()> {
     // than being lost, so nothing here holds up the HTTP page starting. ---
     let hid = Hid::spawn();
 
-    let channels = rtc::SharedChannels::new(capture_engine, hid, capture_settings_tx, device_state_rx);
+    let channels = rtc::SharedChannels::new(capture_engine, hid);
     let http_addr = std::net::SocketAddr::from(([0, 0, 0, 0], http_port));
     tracing::info!(port = http_port, "page and WebRTC signaling server listening");
     let http_handle = tokio::spawn(async move {

@@ -4,13 +4,10 @@ mod v4l2;
 mod video_bus;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::Context as _;
-use tokio::sync::watch;
-
-use crate::config::{DeviceState, ResolutionFrameRates};
-use crate::device::DeviceStatus;
+use serde::Serialize;
 
 /// The frame bus itself stays private to `capture`, but the frame it
 /// carries is what a session pulls off a `CaptureStream`, so the type has
@@ -24,74 +21,28 @@ pub use video_bus::FrameEnvelope;
 /// past `capture` into `device` for them.
 pub use crate::device::{CaptureDevice, CaptureSettings, Resolution, SupportedFormat};
 
-/// Publishes `DeviceState` for the web UI from the capture device's own
-/// presence/capability stream (`Device<CaptureDriver>`, via `device`) and
-/// the live `CaptureSettings` - the sole owner/source of that state now
-/// that presence tracking lives in `Device<D>` and streaming lives in
-/// `CaptureEngine`, replacing the inline probe-and-push loop
-/// `CaptureManager::run` used to own. Runs for the life of the process,
-/// via the subscription kept alive inside the spawned task below; the
-/// returned `watch::Receiver` starts at `DeviceState::default()` until the
-/// first presence event or settings snapshot arrives.
-pub fn watch_device_state(device: CaptureDevice, mut settings_rx: watch::Receiver<CaptureSettings>) -> watch::Receiver<DeviceState> {
-    let (tx, rx) = watch::channel(DeviceState::default());
-    let format: Arc<Mutex<Option<SupportedFormat>>> = Arc::new(Mutex::new(None));
-
-    let tx_for_presence = tx.clone();
-    let format_for_presence = Arc::clone(&format);
-    let settings_for_presence = settings_rx.clone();
-    let sub = device.add_event_listener(move |status| {
-        let tx = tx_for_presence.clone();
-        let format = Arc::clone(&format_for_presence);
-        let settings = settings_for_presence.clone();
-        async move {
-            // `Present(None)` is the boot-crash-risk "already present,
-            // deliberately not probed" transition (see `device::Device`'s
-            // doc comment) - `format` is left exactly as it was (`None`
-            // the first time this ever fires), so `DeviceState` correctly
-            // stays unavailable until a genuine transition actually probes
-            // the device.
-            let new_format = match status {
-                DeviceStatus::Present(Some(info)) => Some(info),
-                DeviceStatus::Present(None) => format.lock().unwrap().clone(),
-                DeviceStatus::Absent => None,
-            };
-            *format.lock().unwrap() = new_format.clone();
-            publish_device_state(&tx, &new_format, &settings.borrow());
-        }
-    });
-
-    // Also republishes on every settings change - `device_state_for`'s
-    // `default_resolution` depends on the currently-applied `settings`,
-    // not just on `format`. Holds `sub` alive for as long as this task
-    // runs, which is the life of the process (the settings channel only
-    // closes at shutdown).
-    tokio::spawn(async move {
-        let _sub = sub;
-        while settings_rx.changed().await.is_ok() {
-            let current = *settings_rx.borrow();
-            let current_format = format.lock().unwrap().clone();
-            publish_device_state(&tx, &current_format, &current);
-        }
-    });
-
-    rx
+/// Live state of the capture card itself — whether it's plugged in right
+/// now, and what resolutions/frame rates it supports. Computed and
+/// published by `CaptureEngine`, which is the only thing holding both the
+/// card's reported capabilities and the currently-applied settings, and
+/// pushed to the web page over the `control` data channel (see
+/// `rtc::session::handle`) so an already-open tab reflects a
+/// hot-plug/unplug instead of being frozen at server-startup values.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct DeviceState {
+    pub available: bool,
+    pub resolutions: Vec<Resolution>,
+    pub default_resolution: Option<Resolution>,
+    pub frame_rates: Vec<ResolutionFrameRates>,
 }
 
-/// Recomputes `device_state_for` from whatever `format` is currently
-/// cached and publishes it if it actually changed. Cheap and ioctl-free -
-/// safe to call on every presence event or settings change, unlike an
-/// actual probe.
-fn publish_device_state(device_state_tx: &watch::Sender<DeviceState>, format: &Option<SupportedFormat>, settings: &CaptureSettings) {
-    let new_state = device_state_for(format, settings);
-    device_state_tx.send_if_modified(|s| {
-        if *s == new_state {
-            false
-        } else {
-            *s = new_state;
-            true
-        }
-    });
+/// One resolution's discrete frame-rate list — `Vec` rather than a
+/// `Resolution`-keyed map, since JSON object keys must be strings and
+/// `Resolution` isn't one.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ResolutionFrameRates {
+    pub resolution: Resolution,
+    pub rates: Vec<u32>,
 }
 
 /// `pub(crate)` (rather than private) so `capture::engine`'s `CaptureEngine`
@@ -152,7 +103,10 @@ pub(crate) fn run_one_pass(device: &CaptureDevice, format: &Option<SupportedForm
     }
 }
 
-/// Shared by `publish_device_state` - kept as a free function over
+/// Called by `CaptureEngine` every time either half of what it depends on
+/// moves - the card's reported capabilities or the applied settings. Cheap
+/// and ioctl-free, so it's safe to run on every presence event or settings
+/// change, unlike an actual probe. Kept as a free function over
 /// `&Option<SupportedFormat>` rather than tied to any particular struct.
 fn device_state_for(format: &Option<SupportedFormat>, settings: &CaptureSettings) -> DeviceState {
     let Some(format) = format else {
