@@ -1,0 +1,46 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Plain ubuntu-latest, not the release job's alpine:3.23 container. This
+    # job only has to compile and run tests, so it has no reason to match the
+    # Wyse 3040's musl libc - and apt has clang/libva/linux headers ready to
+    # go, where the Alpine container has to install a toolchain from scratch
+    # first. The release job in build.yml still builds against musl.
+    #
+    # e2e/browser-test.sh is deliberately NOT run here. It needs Chromium at
+    # the hard-coded path /usr/bin/chromium (GitHub's runners ship Google
+    # Chrome instead, and Ubuntu's apt chromium is a snap stub that doesn't
+    # install in CI) plus agent-browser, which has no release binary and would
+    # have to be built from source on every run. Wiring it up would mean
+    # changing the script and adding third-party browser actions, so it stays
+    # a local-only test until that's worth doing properly.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config clang libclang-dev linux-libc-dev libva-dev
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --locked --all-targets
+
+      - name: Test
+        run: cargo nextest run --locked

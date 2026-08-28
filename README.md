@@ -186,6 +186,13 @@ for why this replaced an earlier WebTransport-based design.
   the release binary in a native x86_64 Alpine container (matching the
   Wyse 3040 exactly, so it's a normal build, not a cross-compile) and
   publishes it as a GitHub Release.
+- `.github/workflows/test.yml` - on every push and pull request, builds
+  the crate and runs the full `cargo nextest run` suite. It runs on a
+  plain `ubuntu-latest` runner rather than the release job's Alpine
+  container, because it only has to compile and run tests - it has no
+  reason to match the device's musl libc, and apt already has the
+  clang/libva/linux headers the build needs. `e2e/browser-test.sh` is not
+  run in CI; see the comment at the top of the workflow for why.
 - `deploy/install.sh` - run on the device; downloads the latest release
   binary from GitHub and sets it up as an OpenRC service that starts on
   boot.
@@ -194,7 +201,9 @@ Building needs a few extra Alpine packages beyond a bare Rust toolchain:
 `clang-dev` and `linux-headers` (the `v4l` crate generates V4L2 bindings
 with `bindgen` at build time) and `libva-dev` (the GPU H.264 encoder's
 `bindgen`-based build script, and linking against libva). Both the
-devcontainer and the release workflow already install these.
+devcontainer and the release workflow already install these; the test
+workflow installs the Debian equivalents (`clang`, `libclang-dev`,
+`linux-libc-dev`, `libva-dev`) with apt.
 
 **Fast local iteration, without a tag/release for every change:** the
 devcontainer can cross-compile a debug binary directly, for testing
