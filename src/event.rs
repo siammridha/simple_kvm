@@ -6,10 +6,9 @@
 //! kind already gets its own type, so a mismatch is a compile error
 //! instead of a silent no-op.
 //!
-//! Pure foundation piece for issue #003 - nothing in the running app wires
-//! this up yet (that starts with `device.rs`, then later issues #004-#009
-//! wire `Device<D>` into the real capture/CH9329 code), so nothing here
-//! has a caller yet.
+//! Used by `Device<D>` for its `devicechange` events and by
+//! `CaptureEngine` for a `CaptureStream`'s `ended` event; `rtc::session`
+//! holds the `Subscription`s those hand back.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
