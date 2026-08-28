@@ -6,7 +6,6 @@ mod web;
 
 use std::sync::Arc;
 
-use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
 use capture::engine::CaptureEngine;
@@ -14,7 +13,7 @@ use device::CaptureDevice;
 use hid::Hid;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     init_logging();
     log_startup_banner(env!("CARGO_PKG_VERSION"));
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "simple_kvm starting");
@@ -42,7 +41,6 @@ async fn main() -> Result<()> {
     // --- Web: owns the port, the listener and every route. Runs until the
     // process ends, which is what keeps the whole service alive. ---
     web::serve(rtc).await;
-    Ok(())
 }
 
 /// Used only when `RUST_LOG` isn't set. Everything else stays at `info`,

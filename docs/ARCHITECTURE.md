@@ -18,7 +18,7 @@ design mirrors the browser's own device/track model (`mediaDevices`/`getUserMedi
 
 ## 2. Invariants (non-negotiable)
 
-- **I1 — One composition root.** `main.rs` only *constructs* modules and *wires* dependencies. No domain logic, no config values, no path strings.
+- **I1 — One composition root.** `main.rs` only *constructs* modules and *wires* dependencies. No domain logic, no config values, no path strings. Logging setup and the startup banner are the single deliberate exception (§7).
 - **I2 — Config is module-local.** Every module loads its **own** config — including its device path(s), read from its own env/config, never passed in by `main`.
 - **I3 — Device paths are secret.** Only the `device` module knows or references an OS device path. Every other module reaches a device only through `Device::open()`, which returns an OS handle, **never the path**.
 - **I4 — Two communication patterns only.** **Events** (callback subscriptions, `EventTarget`-style) and **commands** (async API call returning a typed result). No shared mutable globals, no reaching into another module's internals.
@@ -105,7 +105,8 @@ depends on.
 - **Constructs:** the `CaptureDevice`, `CaptureEngine`, `Hid`, `rtc`, `web`.
 - **Wires:** `CaptureEngine(capture_device)`, `rtc(capture_engine, hid)`, `web(rtc)`.
 - **Starts:** the capture card's presence task (via `CaptureDevice::spawn`) and the page server (via `web::serve`, which owns the port and the listener). `Rtc` is constructed, not started — a session begins when an offer arrives. `CaptureEngine` is a passive factory; `Hid` spawns its own `Ch9329Device` and worker after its settle delay, so `main` starts no HID task.
-- **Must not:** configure any module, pass any device path (each `Device` reads its own), or contain domain logic.
+- **Plus, deliberately:** logging setup and the startup banner, and nothing else — see §7 for why they stay.
+- **Must not:** configure any module, pass any device path (each `Device` reads its own), or contain domain logic. It holds no environment read, no port, no default resolution/frame rate/mouse mode, and constructs no channel. It has no fallible step of its own — every error belongs to the module that can act on it — so `main` returns `()`, not a `Result`.
 
 ---
 
@@ -177,7 +178,7 @@ Anything not in this table is a violation — including `web → device/capture/
 
 ## 6. Lifecycle
 
-1. `main` spawns the `CaptureDevice` (which reads its own path and begins its presence task), constructs and wires the rest, and calls `web::serve`, which reads its own port, binds and runs until the process ends. `Hid` accepts commands immediately; it spawns its own `Ch9329Device` and drain worker once its settle delay has passed.
+1. `main` initialises logging and prints the banner (§7), spawns the `CaptureDevice` (which reads its own path and begins its presence task), constructs and wires the rest, and calls `web::serve`, which reads its own port, binds and runs until the process ends. `Hid` accepts commands immediately; it spawns its own `Ch9329Device` and drain worker once its settle delay has passed.
 2. Capture card plugged → `CaptureDevice` probes → dispatches `devicechange`, which `CaptureEngine` forwards to its own subscribers. For each `Connected` session, `rtc` calls `capture.request_stream`, `add_track`s, and renegotiates; the encode pass starts, and *that* is what opens the card (`Device::open` → `CaptureHandle`).
 3. Browser hits the `web` signaling endpoint → `web` calls `rtc.handle_offer` → returns the answer.
 4. The session's `control` channel opens → it reads the current capture settings, capture device state, HID presence and mouse mode from `capture` and `hid` and pushes them to that tab, once. From then on its own subscriptions push every change, so an already-open tab follows a hot-plug or another tab's Save with no reload. The Save button itself is a command back the other way (`capture.update_settings` / `hid.set_mouse_mode`), and the change event that follows is what echoes it to every tab, including the one that saved.
@@ -193,6 +194,8 @@ Anything not in this table is a violation — including `web → device/capture/
 - **Errors:** typed per module; callers handle them. No panics or `unwrap()` on fallible I/O in library code.
 - **Async:** all waits are async; never block an async task, never hold a lock across `.await`.
 - **Handles:** OS handles expose I/O only; they never expose or stringify the path.
+- **Logging lives in the composition root, on purpose.** `main.rs` initialises `tracing` and prints the startup banner. Process-level observability is not domain logic, and the composition root *is* the process, so this is the one thing there that is neither construct, wire, nor start. Its `DEFAULT_LOG_FILTER` names two modules by path on purpose — `simple_kvm::rtc::session` and `simple_kvm::hid::writer` at `debug`, everything else at `info` — so an input-lag report is readable straight out of the log with no configuration step first. Setting `RUST_LOG` still overrides it entirely. Do not remove those module paths as a boundary violation; when a module is renamed or moved, update them so the default keeps working.
+- **Naming a concrete type is not a dependency edge.** A composition root has to name `CaptureDevice`, `CaptureEngine`, `Hid`, `Rtc` and `web::serve` to construct and wire them; that is what a composition root is for. §4 constrains what the *modules* import from each other, so `main.rs`'s imports are not measured against it and any automated boundary check must exempt them.
 
 ---
 
@@ -205,7 +208,7 @@ other module named below.
 1. **Path secrecy (I3):** `rg '/dev/' src --glob '!src/device.rs' --glob '!src/device/**'` returns nothing, and so does the same search for device `*_PATH` env reads (`rg '_PATH' src --glob '!src/device.rs' --glob '!src/device/**'`).
 2. **Dependency edges (I5):** each module's cross-module `use crate::` matches only §4. `web` imports only `rtc`; `capture`/`hid` import only `device`; `rtc` imports only `capture` and `hid` (plus `device::DeviceStatus` and `device::Subscription`, the type-only payload and handle of the subscriptions `capture` and `hid` hand it — see §4); `device` imports no sibling.
 3. **Config locality (I2):** module config, paths included, is defined and read inside that module; `main.rs` has no config literals or path strings — `rg 'env::var|/dev/' src/main.rs` returns nothing.
-4. **Composition root (I1):** `main.rs` is construct/wire/start only.
+4. **Composition root (I1):** `main.rs` is construct/wire/start only, apart from the logging setup and startup banner of §7. It declares the modules, builds them, hands each its dependencies, and awaits `web::serve`; it defines no other function.
 5. **Web is thin (I6):** no SDP/media/HID logic in `web`; every handler ends in an `rtc` call. The HTTP server itself lives in `web` — `rg 'axum|TcpListener' src --glob '!src/web/**'` returns nothing.
 
 ### Recommended structure
