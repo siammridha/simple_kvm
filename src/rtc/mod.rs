@@ -23,7 +23,8 @@ use webrtc::peer_connection::{
 use crate::capture::CaptureSettings;
 use crate::capture::engine::CaptureEngine;
 use crate::config::{DeviceState, MouseMode};
-use crate::hid::writer::SerialCommand;
+use crate::device::{DeviceStatus, Subscription};
+use crate::hid::Hid;
 use session::SessionContext;
 
 /// Everything a new WebRTC session needs, shared across every browser tab
@@ -39,11 +40,41 @@ pub struct SharedChannels {
     /// starts/stops as a direct consequence of how many sessions currently
     /// hold a live `CaptureStream` - nothing here counts that by hand.
     pub capture_engine: Arc<CaptureEngine>,
-    pub serial_tx: mpsc::Sender<SerialCommand>,
+    /// Shared across every session - `session` calls `send` on this for
+    /// every key/mouse event. The queue, the port and the drain worker
+    /// live behind it; nothing here holds any of them.
+    pub hid: Arc<Hid>,
     pub capture_settings_tx: watch::Sender<CaptureSettings>,
     pub mouse_mode_tx: watch::Sender<MouseMode>,
     pub device_state_rx: watch::Receiver<DeviceState>,
+    /// Temporary: `session` still *polls* HID presence, so `new` bridges
+    /// `Hid`'s presence events into this `watch`. #019 replaces it with a
+    /// per-session `hid.add_event_listener` subscription and deletes both
+    /// this field and `_hid_presence_sub`.
     pub hid_connected_rx: watch::Receiver<bool>,
+    /// Keeps the bridging listener registered for as long as any session
+    /// can still read `hid_connected_rx` (see `Subscription`).
+    _hid_presence_sub: Arc<Subscription<DeviceStatus<()>>>,
+}
+
+impl SharedChannels {
+    pub fn new(
+        capture_engine: Arc<CaptureEngine>,
+        hid: Arc<Hid>,
+        capture_settings_tx: watch::Sender<CaptureSettings>,
+        mouse_mode_tx: watch::Sender<MouseMode>,
+        device_state_rx: watch::Receiver<DeviceState>,
+    ) -> Self {
+        let (hid_connected_tx, hid_connected_rx) = watch::channel(false);
+        let hid_presence_sub = hid.add_event_listener(move |status| {
+            let hid_connected_tx = hid_connected_tx.clone();
+            async move {
+                let _ = hid_connected_tx.send(matches!(status, DeviceStatus::Present(_)));
+            }
+        });
+
+        Self { capture_engine, hid, capture_settings_tx, mouse_mode_tx, device_state_rx, hid_connected_rx, _hid_presence_sub: Arc::new(hid_presence_sub) }
+    }
 }
 
 #[derive(Deserialize)]
@@ -264,7 +295,7 @@ async fn negotiate(offer_sdp: String, channels: SharedChannels) -> Result<String
 
     let ctx = SessionContext {
         capture_engine: channels.capture_engine,
-        serial_tx: channels.serial_tx,
+        hid: channels.hid,
         capture_settings_tx: channels.capture_settings_tx.clone(),
         capture_settings_rx: channels.capture_settings_tx.subscribe(),
         mouse_mode_tx: channels.mouse_mode_tx.clone(),

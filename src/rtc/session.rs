@@ -35,7 +35,7 @@ use crate::capture::engine::{CaptureEngine, CaptureStream, NoDevice};
 use crate::capture::{CaptureSettings, Resolution, SupportedFormat};
 use crate::config::{DeviceState, MouseMode};
 use crate::hid::keymap::{self, KeyCode};
-use crate::hid::writer::SerialCommand;
+use crate::hid::{Hid, SerialCommand};
 use crate::device::{DeviceStatus, Subscription};
 
 use super::protocol::{ControlMessage, InputEvent, MouseModeWire, ServerMessage};
@@ -47,7 +47,8 @@ pub struct SessionContext {
     /// on every later device-availability signal while this session still
     /// has no track.
     pub capture_engine: Arc<CaptureEngine>,
-    pub serial_tx: mpsc::Sender<SerialCommand>,
+    /// The HID bridge - see `super::SharedChannels::hid`.
+    pub hid: Arc<Hid>,
     pub capture_settings_tx: watch::Sender<CaptureSettings>,
     pub capture_settings_rx: watch::Receiver<CaptureSettings>,
     pub mouse_mode_tx: watch::Sender<MouseMode>,
@@ -604,7 +605,7 @@ async fn handle_input_event(event: InputEvent, keyboard: &mut KeyboardState, ctx
         InputEvent::MouseButtons { buttons, wheel } => SerialCommand::MouseButtons { buttons, wheel },
     };
     let kind = cmd.kind();
-    let sent = ctx.serial_tx.send(cmd).await.is_ok();
+    let sent = ctx.hid.send(cmd).await.is_ok();
     let elapsed = start.elapsed();
     if elapsed > SLOW_ENQUEUE_THRESHOLD {
         tracing::warn!(kind, sent, elapsed_ms = elapsed.as_millis(), "input event took longer than expected to queue for CH9329");
@@ -644,9 +645,9 @@ fn handle_control_message(msg: ControlMessage, ctx: &SessionContext) {
             }
         }
         ControlMessage::Paste { text } => {
-            let tx = ctx.serial_tx.clone();
+            let hid = Arc::clone(&ctx.hid);
             tokio::spawn(async move {
-                let _ = tx.send(SerialCommand::PasteText(text)).await;
+                let _ = hid.send(SerialCommand::PasteText(text)).await;
             });
         }
         // Matched directly in `handle`'s `control.poll()` arm, before it
@@ -666,7 +667,6 @@ mod tests {
     use crate::rtc::protocol::CaptureSettingsWire;
 
     fn test_ctx() -> SessionContext {
-        let (serial_tx, _serial_rx) = mpsc::channel(1);
         let (capture_settings_tx, capture_settings_rx) =
             watch::channel(CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5 });
         let (mouse_mode_tx, mouse_mode_rx) = watch::channel(MouseMode::Absolute);
@@ -679,7 +679,10 @@ mod tests {
         let capture_device = CaptureDevice::spawn_at("/nonexistent-simple-kvm-test-device");
         SessionContext {
             capture_engine: Arc::new(CaptureEngine::new(capture_device)),
-            serial_tx,
+            // Its settle delay outlasts the test, so no CH9329 device is
+            // ever spawned - these tests only reach
+            // `handle_control_message`.
+            hid: Hid::spawn_for_test(),
             capture_settings_tx,
             capture_settings_rx,
             mouse_mode_tx,

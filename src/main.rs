@@ -7,17 +7,16 @@ mod web;
 
 use std::env;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Result;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
 use capture::engine::CaptureEngine;
 use config::MouseMode;
-use device::{CaptureDevice, CaptureSettings, Ch9329Device, DeviceStatus, Resolution};
-use hid::writer::{self, SerialCommand};
+use device::{CaptureDevice, CaptureSettings, Resolution};
+use hid::Hid;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -26,7 +25,6 @@ async fn main() -> Result<()> {
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "simple_kvm starting");
 
     let http_port: u16 = env_parsed("HTTP_PORT").unwrap_or(3000);
-    let serial_open_delay_secs: u64 = env_parsed("SERIAL_OPEN_DELAY_SECS").unwrap_or(30);
 
     // --- Capture: the card is never opened automatically right here at
     // startup. Opening it unprompted has reliably crashed the real hardware
@@ -41,7 +39,6 @@ async fn main() -> Result<()> {
 
     let (capture_settings_tx, capture_settings_rx) = watch::channel(default_capture_settings);
     let (mouse_mode_tx, _mouse_mode_rx) = watch::channel(default_mouse_mode);
-    let (hid_connected_tx, hid_connected_rx) = watch::channel(false);
 
     // Two independent handles to the same underlying presence task (see
     // `Device::clone`) - one feeds `CaptureEngine`'s own presence-driven
@@ -53,13 +50,13 @@ async fn main() -> Result<()> {
     let device_state_rx = capture::watch_device_state(capture_device.clone(), capture_settings_rx.clone());
     let capture_engine = Arc::new(CaptureEngine::new(capture_device));
 
-    // --- Serial: same soft-unavailable treatment as capture. Commands sent
-    // to `serial_tx` before the port is open just queue up in the channel,
-    // so this delay doesn't hold up the HTTP page starting. ---
-    let (serial_tx, serial_rx) = mpsc::channel::<SerialCommand>(256);
-    tokio::spawn(open_serial_after_delay(serial_open_delay_secs, serial_tx.clone(), serial_rx, hid_connected_tx));
+    // --- Serial: same soft-unavailable treatment as capture. `Hid` owns
+    // its own device, queue, drain worker and enumeration-settle delay;
+    // commands sent before its port is open queue up rather than being
+    // lost, so nothing here holds up the HTTP page starting. ---
+    let hid = Hid::spawn();
 
-    let channels = rtc::SharedChannels { capture_engine, serial_tx, capture_settings_tx, mouse_mode_tx, device_state_rx, hid_connected_rx };
+    let channels = rtc::SharedChannels::new(capture_engine, hid, capture_settings_tx, mouse_mode_tx, device_state_rx);
     let http_addr = std::net::SocketAddr::from(([0, 0, 0, 0], http_port));
     tracing::info!(port = http_port, "page and WebRTC signaling server listening");
     let http_handle = tokio::spawn(async move {
@@ -81,43 +78,6 @@ async fn main() -> Result<()> {
 
 fn env_parsed<T: std::str::FromStr>(key: &str) -> Option<T> {
     env::var(key).ok().and_then(|v| v.parse().ok())
-}
-
-/// Waits `delay_secs` (giving the CH9329's USB enumeration time to settle,
-/// the same crash-avoidance reasoning as the capture card's boot delay —
-/// see `deploy/install.sh`), then starts `Ch9329Device`'s presence
-/// detection and runs the writer loop. Presence detection itself is
-/// harmless (a filesystem check plus a kernel uevent listener, no device
-/// I/O), but it's still started only after the delay so the browser learns
-/// about CH9329 connectivity at the same point in time it always has —
-/// this refactor changes how presence is detected, not when it's first
-/// reported. The writer itself checks whether the CH9329 is actually
-/// plugged in before every command, so it's a no-op whenever the device
-/// isn't there and picks back up on its own once it is — no need to decide
-/// that once, up front, here.
-async fn open_serial_after_delay(
-    delay_secs: u64,
-    serial_tx: mpsc::Sender<SerialCommand>,
-    serial_rx: mpsc::Receiver<SerialCommand>,
-    hid_connected_tx: watch::Sender<bool>,
-) {
-    if delay_secs > 0 {
-        tracing::info!(seconds = delay_secs, "waiting before opening CH9329 serial port");
-        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-    }
-
-    let ch9329_device = Ch9329Device::spawn();
-    let hid_connected_tx_for_device = hid_connected_tx.clone();
-    let _presence_sub = ch9329_device.add_event_listener(move |status| {
-        let hid_connected_tx = hid_connected_tx_for_device.clone();
-        async move {
-            let _ = hid_connected_tx.send(matches!(status, DeviceStatus::Present(_)));
-        }
-    });
-
-    tokio::spawn(writer::watch_connection(hid_connected_tx.subscribe(), serial_tx));
-    let writer = writer::SerialWriter::new(hid_connected_tx.subscribe());
-    let _ = tokio::task::spawn_blocking(move || writer.run(serial_rx)).await;
 }
 
 /// Used only when `RUST_LOG` isn't set. Everything else stays at `info`,

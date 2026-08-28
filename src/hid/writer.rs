@@ -1,14 +1,10 @@
 //! Owns the single open connection to the CH9329's serial port and
 //! serializes all writes onto it. Runs as a dedicated blocking loop (driven
-//! by `run`), fed by a channel so every input source shares one writer.
+//! by `run`), fed by `Hid`'s queue so every input source shares one writer.
 //!
-//! It still opens that port itself rather than through
-//! `device::Ch9329Device` - #016 rewires it. Until then it reads
-//! `SERIAL_PATH` here, which is the one deliberate exception to
-//! `ARCHITECTURE.md` I3 (paths live only in `device`): the composition
-//! root no longer has a path to hand it (#015), and `device` handing one
-//! back out would be a worse leak than this temporary duplicate read.
-//! `device::ch9329_driver` reads the same variable with the same default.
+//! The port is opened through `device::Ch9329Device` (`Device::open`), the
+//! module's only open path - this writer never sees or holds the device
+//! path (`ARCHITECTURE.md` I3).
 //!
 //! Absolute mouse mode on this hardware only conveys X/Y — confirmed by an
 //! end-to-end loopback test against the real chip (see the plan doc).
@@ -22,17 +18,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serialport::SerialPort;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 use super::{paste, protocol};
+use crate::device::Ch9329Device;
 
-const BAUD_RATE: u32 = 9600;
-const OPEN_TIMEOUT: Duration = Duration::from_millis(500);
 const KEY_HOLD_DELAY: Duration = Duration::from_millis(20);
-/// Temporary duplicate of `device::ch9329_driver`'s own values - see the
-/// module docs; #016 deletes both of these along with the local `open`.
-const SERIAL_PATH_ENV_VAR: &str = "SERIAL_PATH";
-const DEFAULT_SERIAL_PATH: &str = "/dev/ttyUSB0";
 /// Above this, `handle` logs at `warn` instead of `debug` — visible in the
 /// log at the default level, so a slow CH9329 write shows up without
 /// needing `RUST_LOG=debug` turned on first.
@@ -55,9 +46,9 @@ pub enum SerialCommand {
     MouseRelativeMove { buttons: u8, dx: i8, dy: i8, wheel: i8 },
     /// Types `text` out as a sequence of keystrokes (US QWERTY only).
     PasteText(String),
-    /// Sent by `watch_connection` whenever the kernel reports a `tty`
-    /// device change — carries no data of its own, just prompts `handle`
-    /// to re-run `sync_connection_state` so a reconnect is noticed
+    /// Sent by `Hid`'s presence listener whenever the CH9329 appears or
+    /// disappears — carries no data of its own, just prompts `handle` to
+    /// re-run `sync_connection_state` so a reconnect is noticed
     /// immediately instead of waiting for the next real keystroke or
     /// click.
     CheckConnection,
@@ -76,60 +67,35 @@ impl SerialCommand {
     }
 }
 
-/// Opens the CH9329's serial port. Returns `Ok(None)` (not an error) if no
-/// device is present at `path` — callers should run in a soft
-/// "no CH9329 attached" state rather than failing to start.
-fn open(path: &str) -> Result<Option<Box<dyn SerialPort>>> {
-    match serialport::new(path, BAUD_RATE).timeout(OPEN_TIMEOUT).open() {
-        Ok(port) => Ok(Some(port)),
-        Err(err)
-            if matches!(
-                err.kind(),
-                serialport::ErrorKind::NoDevice | serialport::ErrorKind::Io(std::io::ErrorKind::NotFound)
-            ) =>
-        {
-            Ok(None)
-        }
-        Err(err) => Err(err).with_context(|| format!("opening CH9329 serial port at {path}")),
-    }
-}
-
 pub struct SerialWriter {
-    path: String,
+    device: Ch9329Device,
     port: Option<Box<dyn SerialPort>>,
-    present_rx: watch::Receiver<bool>,
 }
 
 impl SerialWriter {
-    /// `present_rx` reports whether the CH9329 is plugged in right now,
-    /// sourced from `Ch9329Device`'s shared presence detection (see
-    /// `device::ch9329_driver`) rather than this struct checking `Path::exists`
-    /// itself — the same channel the WebRTC session layer reads from to
-    /// tell the browser (the HID counterpart of the capture card's
-    /// `DeviceState` — see `rtc::session`), so both sides agree on presence
-    /// by construction.
-    pub fn new(present_rx: watch::Receiver<bool>) -> Self {
-        let path = std::env::var(SERIAL_PATH_ENV_VAR).unwrap_or_else(|_| DEFAULT_SERIAL_PATH.to_string());
-        Self { path, port: None, present_rx }
+    pub(super) fn new(device: Ch9329Device) -> Self {
+        Self { device, port: None }
     }
 
-    /// Opens or drops `self.port` to match the shared presence signal — so
-    /// a write is only attempted while the device is actually present, and
-    /// a stale handle from a device that vanished mid-session gets dropped
-    /// instead of erroring on every command after it.
+    /// Opens or drops `self.port` to match the device's presence — so a
+    /// write is only attempted while the device is actually present, and a
+    /// stale handle from a device that vanished mid-session gets dropped
+    /// instead of erroring on every command after it. Asking `is_present`
+    /// first keeps the common unplugged case quiet, rather than logging a
+    /// failed open per command.
     fn sync_connection_state(&mut self) {
-        let present = *self.present_rx.borrow();
-        match (&self.port, present) {
-            (None, true) => match open(&self.path) {
-                Ok(Some(port)) => {
-                    tracing::info!(path = %self.path, "CH9329 connected");
+        match (&self.port, self.device.is_present()) {
+            (None, true) => match self.device.open(&()) {
+                Ok(port) => {
+                    tracing::info!("CH9329 connected");
                     self.port = Some(port);
                 }
-                Ok(None) => {} // vanished again between the presence signal and opening it
-                Err(err) => tracing::error!(%err, path = %self.path, "failed to open CH9329 serial port"),
+                // Includes vanishing again between the presence check and
+                // the open itself.
+                Err(err) => tracing::warn!(%err, "failed to open CH9329 serial port"),
             },
             (Some(_), false) => {
-                tracing::warn!(path = %self.path, "CH9329 disconnected, pausing writes until it reconnects");
+                tracing::warn!("CH9329 disconnected, pausing writes until it reconnects");
                 self.port = None;
             }
             _ => {}
@@ -189,30 +155,34 @@ impl SerialWriter {
 
     /// Blocking consumer loop — run this on a dedicated thread
     /// (`tokio::task::spawn_blocking`), never on an async task directly.
-    pub fn run(mut self, mut commands: mpsc::Receiver<SerialCommand>) {
+    /// Returns once the queue closes, which happens when the `Hid` that
+    /// owns it is dropped.
+    pub(super) fn run(mut self, mut commands: mpsc::Receiver<SerialCommand>) {
         while let Some(cmd) = commands.blocking_recv() {
             self.handle(cmd);
         }
     }
 }
 
-/// Runs forever, prompting `SerialWriter::run` (via `commands`) to re-check
-/// connection state (open or drop its port) as soon as `present_rx`
-/// reports a presence change — so a reconnect is noticed immediately
-/// instead of waiting for the next real keystroke or click. `present_rx`
-/// is sourced from `Ch9329Device`'s shared presence detection (see
-/// `device::ch9329_driver`), which already does the kernel `tty` uevent
-/// listening this function used to do itself — the same immediate-
-/// detection treatment `device::CaptureDevice` gives the capture card,
-/// both built on the generic `device::Device<D>` core instead of each
-/// reimplementing it.
-pub async fn watch_connection(mut present_rx: watch::Receiver<bool>, commands: mpsc::Sender<SerialCommand>) {
-    loop {
-        if present_rx.changed().await.is_err() {
-            return; // presence sender dropped, nothing left to watch for
-        }
-        if commands.send(SerialCommand::CheckConnection).await.is_err() {
-            return; // writer loop exited, nothing left to watch for
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole drop-ends-the-worker chain, minus the hardware: closing
+    /// the queue must end `run`, which is what lets `Hid`'s destructor
+    /// stop its worker.
+    #[tokio::test]
+    async fn the_worker_ends_when_its_queue_closes() {
+        let device = Ch9329Device::spawn_at("/nonexistent-simple-kvm-test-ch9329");
+        let (commands_tx, commands_rx) = mpsc::channel(4);
+        let worker = tokio::task::spawn_blocking(move || SerialWriter::new(device).run(commands_rx));
+
+        // Queued while the device is absent: handled (as no-ops) in order,
+        // then the closed queue ends the loop.
+        commands_tx.send(SerialCommand::MouseButtons { buttons: 1, wheel: 0 }).await.unwrap();
+        commands_tx.send(SerialCommand::CheckConnection).await.unwrap();
+        drop(commands_tx);
+
+        tokio::time::timeout(Duration::from_secs(5), worker).await.expect("the worker must end once its queue closes").expect("the worker must not panic");
     }
 }

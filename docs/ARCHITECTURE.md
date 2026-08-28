@@ -67,11 +67,13 @@ Each module lists what it is **responsible for**, **owns exclusively**, **may de
 
 ### 3.3 `hid` — CH9329 keyboard/mouse bridge
 
-- **Responsible for:** sending HID messages to the CH9329 in the order received.
-- **How it works:** holds a `Ch9329Device`, opens its channel through the Device API, and drains an internal **queue** to the CH9329 FIFO via one worker (spawned internally when the channel opens — not by `main`).
-- **Owns exclusively:** the CH9329 wire protocol/framing, the message queue, and the drain worker.
+- **Responsible for:** sending HID messages to the CH9329 in the order received, and reporting whether the CH9329 is there.
+- **How it works:** `Hid` spawns its own `Ch9329Device` and drain worker once its **enumeration-settle delay** has passed (`SERIAL_OPEN_DELAY_SECS`, its own config — opening the chip before USB enumeration finishes has crashed the real hardware at boot). Commands submitted during the wait queue rather than fail, so nothing else's startup waits on it. The worker opens the port through the Device API (`Device::open`, the module's only open path) and drains the internal **queue** to the CH9329 FIFO, re-checking presence per command so an unplug pauses writes and a replug resumes them.
+- **Public surface:** `send(msg)` and `add_event_listener(cb)` (presence, forwarded from its `Ch9329Device`) — nothing else. No channel sender, no serial handle, no path escapes it.
+- **Owns exclusively:** the CH9329 wire protocol/framing, the message queue, the drain worker, and the settle delay.
+- **Lifetime by ownership:** `Hid` holds the only strong queue sender, so dropping it closes the queue, which ends the worker.
 - **May depend on:** `device` (holds a `Ch9329Device`: subscribe + `open`).
-- **Must not:** know the device path; expose the raw serial channel; talk to `rtc`/`web`/`capture`.
+- **Must not:** know the device path; expose the raw serial channel or its queue; talk to `rtc`/`web`/`capture`.
 
 ### 3.4 `rtc` — peer session manager
 
@@ -94,9 +96,9 @@ depends on.
 
 ### 3.6 `main.rs` — composition root
 
-- **Constructs:** the two `Device` instances, `CaptureEngine`, `hid`, `rtc`, `web`.
-- **Wires:** `CaptureEngine(capture_device)`, `hid(ch9329_device)`, `rtc(capture_engine, hid)`, `web(rtc)`.
-- **Starts:** the device presence tasks (via `spawn`), `rtc`, `web`. `CaptureEngine` is a passive factory; `hid` spawns its own worker when its channel opens.
+- **Constructs:** the `CaptureDevice`, `CaptureEngine`, `Hid`, `rtc`, `web`.
+- **Wires:** `CaptureEngine(capture_device)`, `rtc(capture_engine, hid)`, `web(rtc)`.
+- **Starts:** the capture card's presence task (via `CaptureDevice::spawn`), `rtc`, `web`. `CaptureEngine` is a passive factory; `Hid` spawns its own `Ch9329Device` and worker after its settle delay, so `main` starts no HID task.
 - **Must not:** configure any module, pass any device path (each `Device` reads its own), or contain domain logic.
 
 ---
@@ -122,7 +124,7 @@ graph TD
     rtc -->|send| hid
     web -->|signaling command| rtc
 
-    main -. spawn/start .-> device
+    main -. spawn CaptureDevice .-> device
     main -. construct + start .-> rtc
     main -. construct + start .-> web
     main -. construct only .-> capture
@@ -134,16 +136,17 @@ graph TD
 | `capture` | `device` | holds `CaptureDevice` — subscribe + `open` |
 | `hid` | `device` | holds `Ch9329Device` — subscribe + `open` |
 | `rtc` | `capture` | command (`request_stream`) + subscribe presence |
-| `rtc` | `hid` | command (send) |
+| `rtc` | `hid` | command (`send`) + subscribe presence |
 | `web` | `rtc` | command (signaling) |
 | `main` | all | construct/wire/start only |
 
 **There is no `rtc → device` edge.** Sessions learn about the capture card through
-`CaptureEngine::add_event_listener`, which forwards the `Device<CaptureDriver>` events of the device
-the engine already holds. One module owning the device handle and re-exposing its events is one edge
-fewer than `rtc` holding a second handle, so `rtc` must not grow one. `rtc` does name
-`device::DeviceStatus` and `device::Subscription`, but those are type-only imports — the payload
-type and the handle type of the subscription it gets from `capture` — not a dependency edge.
+`CaptureEngine::add_event_listener` and about the CH9329 through `Hid::add_event_listener`, each
+forwarding the `Device<D>` events of the device that module already holds. One module owning the
+device handle and re-exposing its events is one edge fewer than `rtc` holding a second handle, so
+`rtc` must not grow one. `rtc` does name `device::DeviceStatus` and `device::Subscription`, but
+those are type-only imports — the payload type and the handle type of the subscriptions `capture`
+and `hid` hand it — not a dependency edge.
 
 Anything not in this table is a violation — including `web → device/capture/hid`, `capture → rtc`,
 `hid → rtc`, and any edge into `device` other than subscribe/open.
@@ -154,7 +157,7 @@ Anything not in this table is a violation — including `web → device/capture/
 
 ### 5.1 Events — callback subscriptions (`EventTarget`-style) **[decided]**
 
-- One `EventEmitter<T>` per event kind (typed payload; a mismatch is a compile error, not a silent no-op). Publishers include `Device` (`devicechange`) and `CaptureStream` (`ended`).
+- One `EventEmitter<T>` per event kind (typed payload; a mismatch is a compile error, not a silent no-op). Publishers include `Device` (`devicechange`), `CaptureStream` (`ended`), and `Hid` (its device's `devicechange`, forwarded).
 - The emitter is **not** a shared utility module: it lives in `device` (§3.1), whose `devicechange` events are its reason to exist, and is re-exported from there. `capture` and `rtc` reach it over the `capture → device` / type-only-`device` imports they already have, so it costs no extra edge.
 - `add_event_listener(cb) -> Subscription`. The `Subscription` **auto-deregisters on drop** (mirrors `removeEventListener`) — no manual cleanup to forget, no listener left calling into dropped state.
 - `dispatch` fires each listener via its own `tokio::spawn`, **fire-and-forget, no join**, so one slow or broken listener can't stall another listener or the caller.
@@ -168,7 +171,7 @@ Anything not in this table is a violation — including `web → device/capture/
 
 ## 6. Lifecycle
 
-1. `main` spawns both `Device`s (each reads its own path, begins its presence task), constructs and wires the rest, and starts `rtc` and `web`.
+1. `main` spawns the `CaptureDevice` (which reads its own path and begins its presence task), constructs and wires the rest, and starts `rtc` and `web`. `Hid` accepts commands immediately; it spawns its own `Ch9329Device` and drain worker once its settle delay has passed.
 2. Capture card plugged → `CaptureDevice` probes → dispatches `devicechange`, which `CaptureEngine` forwards to its own subscribers. For each `Connected` session, `rtc` calls `capture.request_stream`, `add_track`s, and renegotiates; the encode pass starts, and *that* is what opens the card (`Device::open` → `CaptureHandle`).
 3. Browser hits the `web` signaling endpoint → `web` calls `rtc.handle_offer` → returns the answer.
 4. Peer input arrives → `rtc` calls `hid.send` → HID's queue drains in order.
@@ -193,8 +196,7 @@ single-file spelling (`src/device.rs`) so it keeps working either way. The same 
 other module named below.
 
 1. **Path secrecy (I3):** `rg '/dev/' src --glob '!src/device.rs' --glob '!src/device/**'` returns nothing, and so does the same search for device `*_PATH` env reads (`rg '_PATH' src --glob '!src/device.rs' --glob '!src/device/**'`).
-   *One known exception, until #016:* `hid/writer.rs` still opens the CH9329 itself, so it reads `SERIAL_PATH` (same variable, same default as `device::ch9329_driver`). #016 rewires it through `Ch9329Device::open` and both hits go away.
-2. **Dependency edges (I5):** each module's cross-module `use crate::` matches only §4. `web` imports only `rtc`; `capture`/`hid` import only `device`; `rtc` imports only `capture` and `hid` (plus `device::DeviceStatus` and `device::Subscription`, the type-only payload and handle of the subscription `capture` hands it — see §4); `device` imports no sibling.
+2. **Dependency edges (I5):** each module's cross-module `use crate::` matches only §4. `web` imports only `rtc`; `capture`/`hid` import only `device`; `rtc` imports only `capture` and `hid` (plus `device::DeviceStatus` and `device::Subscription`, the type-only payload and handle of the subscriptions `capture` and `hid` hand it — see §4); `device` imports no sibling.
 3. **Config locality (I2):** module config, paths included, is defined and read inside that module; `main.rs` has no config literals or path strings — `rg 'env::var|/dev/' src/main.rs` returns nothing.
 4. **Composition root (I1):** `main.rs` is construct/wire/start only.
 5. **Web is thin (I6):** no SDP/media/HID logic in `web`; every handler ends in an `rtc` call. The HTTP server itself lives in `web` — `rg 'axum|TcpListener' src --glob '!src/web/**'` returns nothing.
