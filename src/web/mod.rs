@@ -28,13 +28,13 @@ const SERVER_CONFIG_PLACEHOLDER: &str = "<!--SERVER_CONFIG-->";
 /// features).
 const NO_CACHE: (header::HeaderName, &str) = (header::CACHE_CONTROL, "no-store");
 
-pub fn router(channels: rtc::SharedChannels) -> Router {
+pub fn router(rtc_state: rtc::Rtc) -> Router {
     Router::new()
         .route("/", get(index_handler))
         .route("/app.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript"), NO_CACHE], APP_JS) }))
         .route("/style.css", get(|| async { ([(header::CONTENT_TYPE, "text/css"), NO_CACHE], STYLE_CSS) }))
         .route("/rtc/offer", post(rtc::offer_handler))
-        .with_state(channels)
+        .with_state(rtc_state)
 }
 
 async fn index_handler() -> ([(header::HeaderName, &'static str); 1], Html<String>) {

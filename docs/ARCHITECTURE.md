@@ -71,7 +71,7 @@ Each module lists what it is **responsible for**, **owns exclusively**, **may de
 
 - **Responsible for:** turning input — a key going down or up, the pointer moving, buttons held, the wheel moved, text to type — into CH9329 reports, sending them in the order received, and reporting whether the CH9329 is there.
 - **How it works:** `Hid` spawns its own `Ch9329Device` and drain worker once its **enumeration-settle delay** has passed (`SERIAL_OPEN_DELAY_SECS`, its own config — opening the chip before USB enumeration finishes has crashed the real hardware at boot). Commands submitted during the wait queue rather than fail, so nothing else's startup waits on it. The worker opens the port through the Device API (`Device::open`, the module's only open path) and drains the internal **queue** to the CH9329 FIFO, re-checking presence per command so an unplug pauses writes and a replug resumes them.
-- **Public surface:** `send(InputCommand)`, `add_event_listener(cb)` (presence, forwarded from its `Ch9329Device`), and `mouse_mode()`/`set_mouse_mode()`/`add_mouse_mode_listener(cb)` — nothing else. No channel sender, no serial handle, no path escapes it. `InputCommand` names a browser `KeyboardEvent.code` or a pointer position; the translation into reports (keymap lookup, held-key tracking, report assembly, framing) happens on the way to the port.
+- **Public surface:** `send(InputCommand)`, `is_present()`/`add_event_listener(cb)` (presence, forwarded from its `Ch9329Device`), and `mouse_mode()`/`set_mouse_mode()`/`add_mouse_mode_listener(cb)` — nothing else. `is_present()` is the read counterpart of the presence event, for the same reason `Device` has one: an event only fires on a transition, so a subscriber that starts later needs a way to learn where it is starting from. It answers from the last presence this module saw, so it works during the settle delay, before a `Ch9329Device` exists at all. No channel sender, no serial handle, no path escapes it. `InputCommand` names a browser `KeyboardEvent.code` or a pointer position; the translation into reports (keymap lookup, held-key tracking, report assembly, framing) happens on the way to the port.
 - **Owns exclusively:** the CH9329 wire protocol/framing, the browser-code→HID-usage keymap, the held-key state and the six-key rollover it implies, the mouse mode (in memory, with a change event), the message queue, the drain worker, and the settle delay.
 - **Lifetime by ownership:** `Hid` holds the only strong queue sender, so dropping it closes the queue, which ends the worker.
 - **May depend on:** `device` (holds a `Ch9329Device`: subscribe + `open`).
@@ -86,8 +86,10 @@ depends on.
 
 - **Responsible for:** managing peer sessions, producing an answer from an offer, and controlling **when** media is negotiated.
 - **How it works:** exposes a signaling API (offer → answer) that `web` calls. It attaches a video track **only after** a session is `Connected` **and** the capture device is available (subscribes to presence through `CaptureEngine::add_event_listener`, calls `capture.request_stream`, renegotiates), and removes it on that stream's `ended` event. Peer input goes straight to the `hid` API, described in input terms (`InputCommand`) — no keymap lookup, no modifier bitmask, no report shape. Capture settings and `DeviceState` are read from and (for settings) written to `capture`, mouse mode from and to `hid`; the page's Save button becomes a `CaptureEngine::update_settings` call, and the state pushed down a session's `control` channel is whatever those two modules report.
-- **Owns exclusively:** peer session state, signaling/renegotiation logic, and media-negotiation timing.
-- **May depend on:** `capture` (`request_stream`, settings, device state, presence subscription), `hid` (send, mouse mode, presence).
+- **Events and commands, per session, nothing pre-wired.** `Rtc` — the object `main` builds and `web` holds as router state — is just the `CaptureEngine` and the `Hid` handle. There is no shared bundle of channels between it and a session: each session **subscribes for itself** to capture settings, capture device state, HID presence and mouse mode when it starts, reads the current value of all four straight from the owning module when its `control` channel opens (an event only fires on a change, so it says nothing about what was already true), and calls a command to apply one. The subscriptions are **owned by the session**, so they deregister when it ends (see §5.1).
+- **Every outbound `control` message goes through the session's own queue.** One task writes to `control`; the event callbacks enqueue onto it rather than writing to `control` themselves, so two producers can never reorder same-type updates on the wire. Because listeners are dispatched fire-and-forget on their own tasks, two changes in quick succession can run in either order, so a callback re-reads the current value from the owning module instead of trusting the payload it was handed — the worst case is then a duplicate of the current value rather than a tab stuck on a stale one.
+- **Owns exclusively:** peer session state, signaling/renegotiation logic, media-negotiation timing, and each session's outbound `control` queue.
+- **May depend on:** `capture` (`request_stream`, settings, device state, and their subscriptions), `hid` (send, mouse mode, presence, and their subscriptions).
 - **Must not:** run the HTTP server, touch device paths, hold a `Device` handle, hold the capture settings or `DeviceState` itself, or implement capture/HID logic — including translating keys or assembling reports.
 
 ### 3.5 `web` — HTTP transport & signaling front door
@@ -140,7 +142,7 @@ graph TD
 | `capture` | `device` | holds `CaptureDevice` — subscribe + `open` |
 | `hid` | `device` | holds `Ch9329Device` — subscribe + `open` |
 | `rtc` | `capture` | command (`request_stream`, `settings`/`update_settings`, `device_state`) + subscribe presence/settings/device state |
-| `rtc` | `hid` | command (`send`, mouse mode) + subscribe presence/mouse mode |
+| `rtc` | `hid` | command (`send`, `is_present`, mouse mode) + subscribe presence/mouse mode |
 | `web` | `rtc` | command (signaling) |
 | `main` | all | construct/wire/start only |
 
@@ -169,7 +171,7 @@ Anything not in this table is a violation — including `web → device/capture/
 
 ### 5.2 Commands — direct API
 
-- A caller invokes a callee's public async API (expressed as a **trait/port**) and awaits a typed result or error: `device.open(settings)` / `device.is_present()`, `capture.request_stream()` / `capture.update_settings(new)`, `hid.send(input)` / `hid.set_mouse_mode(mode)`, `rtc.handle_offer(offer)`.
+- A caller invokes a callee's public async API (expressed as a **trait/port**) and awaits a typed result or error: `device.open(settings)` / `device.is_present()`, `capture.request_stream()` / `capture.update_settings(new)`, `hid.send(input)` / `hid.is_present()` / `hid.set_mouse_mode(mode)`, `rtc.handle_offer(offer)`.
 
 ---
 
@@ -178,9 +180,10 @@ Anything not in this table is a violation — including `web → device/capture/
 1. `main` spawns the `CaptureDevice` (which reads its own path and begins its presence task), constructs and wires the rest, and starts `rtc` and `web`. `Hid` accepts commands immediately; it spawns its own `Ch9329Device` and drain worker once its settle delay has passed.
 2. Capture card plugged → `CaptureDevice` probes → dispatches `devicechange`, which `CaptureEngine` forwards to its own subscribers. For each `Connected` session, `rtc` calls `capture.request_stream`, `add_track`s, and renegotiates; the encode pass starts, and *that* is what opens the card (`Device::open` → `CaptureHandle`).
 3. Browser hits the `web` signaling endpoint → `web` calls `rtc.handle_offer` → returns the answer.
-4. Peer input arrives → `rtc` calls `hid.send` with what the peer did → the drain worker translates it into a CH9329 report and writes it, in order.
-5. Card unplugged → every live `CaptureStream` fires `ended` → each session `remove_track`s + renegotiates → the encoder stops.
-6. **Shutdown needs no special path.** Runtime shutdown drops each session task, whose destructors drop the peer connection, video track, and `CaptureStream` together — the same **ownership cascade** as one browser disconnecting. `CaptureEngine` does keep a live count (`LiveCount { count, pass_running }`), but it is decremented from `LiveMarker`'s `Drop`, so it is driven by ownership rather than by callers remembering to decrement. The encoder stops when that count reaches zero, which happens as part of the cascade.
+4. The session's `control` channel opens → it reads the current capture settings, capture device state, HID presence and mouse mode from `capture` and `hid` and pushes them to that tab, once. From then on its own subscriptions push every change, so an already-open tab follows a hot-plug or another tab's Save with no reload. The Save button itself is a command back the other way (`capture.update_settings` / `hid.set_mouse_mode`), and the change event that follows is what echoes it to every tab, including the one that saved.
+5. Peer input arrives → `rtc` calls `hid.send` with what the peer did → the drain worker translates it into a CH9329 report and writes it, in order.
+6. Card unplugged → every live `CaptureStream` fires `ended` → each session `remove_track`s + renegotiates → the encoder stops.
+7. **Shutdown needs no special path.** Runtime shutdown drops each session task, whose destructors drop the peer connection, video track, `CaptureStream` and that session's four state subscriptions together — the same **ownership cascade** as one browser disconnecting. Dropping the subscriptions deregisters their listeners, which drops the last senders on that session's outbound queue, which ends its relay task. `CaptureEngine` does keep a live count (`LiveCount { count, pass_running }`), but it is decremented from `LiveMarker`'s `Drop`, so it is driven by ownership rather than by callers remembering to decrement. The encoder stops when that count reaches zero, which happens as part of the cascade.
 
 ---
 

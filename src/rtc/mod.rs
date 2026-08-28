@@ -21,103 +21,34 @@ use webrtc::peer_connection::{
 };
 
 use crate::capture::engine::CaptureEngine;
-use crate::capture::{CaptureSettings, DeviceState};
-use crate::device::{DeviceStatus, Subscription};
-use crate::hid::{Hid, MouseMode};
+use crate::hid::Hid;
 use session::SessionContext;
 
-/// Everything a new WebRTC session needs, shared across every browser tab
-/// that connects. Mirrors what `webtransport::serve` used to be handed
-/// directly — now it's router state instead, since signaling rides plain
-/// HTTP requests rather than a long-lived server loop.
+/// The WebRTC module itself, and the router state `web` hands back to
+/// `offer_handler` on every signaling request. Just the two modules a
+/// session talks to — there is no shared state here beyond them, and no
+/// channel: everything a session needs to know it either asks for
+/// (`CaptureEngine::settings`, `Hid::mouse_mode`, …) or subscribes to for
+/// itself (see `session::handle`), so nothing has to be pre-wired per
+/// process and cloned into every tab.
 #[derive(Clone)]
-pub struct SharedChannels {
+pub struct Rtc {
     /// Shared across every session - `session::handle` calls
     /// `request_stream()` on this once its connection is stable, and again
     /// any time a device-availability event says it's worth retrying (see
     /// `CaptureEngine::add_event_listener`). The encode pass this wraps
     /// starts/stops as a direct consequence of how many sessions currently
     /// hold a live `CaptureStream` - nothing here counts that by hand.
-    pub capture_engine: Arc<CaptureEngine>,
+    capture_engine: Arc<CaptureEngine>,
     /// Shared across every session - `session` calls `send` on this for
     /// every key/mouse event. The queue, the port and the drain worker
     /// live behind it; nothing here holds any of them.
-    pub hid: Arc<Hid>,
-    /// Temporary, with the same fate under #019 as the two below:
-    /// `capture` owns the settings themselves, and `new` bridges its
-    /// change event into this `watch` so a session's `select!` can wait on
-    /// it. A session applies a change by calling
-    /// `CaptureEngine::update_settings`, never through this.
-    pub capture_settings_rx: watch::Receiver<CaptureSettings>,
-    /// Temporary, same reason and same fate: `capture` computes and owns
-    /// `DeviceState`, and `new` bridges its change event into this
-    /// `watch`.
-    pub device_state_rx: watch::Receiver<DeviceState>,
-    /// Temporary: `session` still *polls* HID presence, so `new` bridges
-    /// `Hid`'s presence events into this `watch`. #019 replaces it with a
-    /// per-session `hid.add_event_listener` subscription and deletes both
-    /// this field and `_hid_presence_sub`.
-    pub hid_connected_rx: watch::Receiver<bool>,
-    /// Temporary, for the same reason and with the same fate under #019:
-    /// `hid` owns the mouse mode itself, and `new` bridges its change
-    /// event into this `watch` so a session's `select!` can wait on it.
-    /// Only a change *signal* - a session reads the current value straight
-    /// from `hid`.
-    pub mouse_mode_rx: watch::Receiver<MouseMode>,
-    /// Keep the bridging listeners registered for as long as any session
-    /// can still read the receivers above (see `Subscription`).
-    _capture_settings_sub: Arc<Subscription<CaptureSettings>>,
-    _device_state_sub: Arc<Subscription<DeviceState>>,
-    _hid_presence_sub: Arc<Subscription<DeviceStatus<()>>>,
-    _mouse_mode_sub: Arc<Subscription<MouseMode>>,
+    hid: Arc<Hid>,
 }
 
-impl SharedChannels {
+impl Rtc {
     pub fn new(capture_engine: Arc<CaptureEngine>, hid: Arc<Hid>) -> Self {
-        let (capture_settings_tx, capture_settings_rx) = watch::channel(capture_engine.settings());
-        let capture_settings_sub = capture_engine.add_settings_listener(move |settings| {
-            let capture_settings_tx = capture_settings_tx.clone();
-            async move {
-                let _ = capture_settings_tx.send(settings);
-            }
-        });
-
-        let (device_state_tx, device_state_rx) = watch::channel(capture_engine.device_state());
-        let device_state_sub = capture_engine.add_device_state_listener(move |state| {
-            let device_state_tx = device_state_tx.clone();
-            async move {
-                let _ = device_state_tx.send(state);
-            }
-        });
-
-        let (hid_connected_tx, hid_connected_rx) = watch::channel(false);
-        let hid_presence_sub = hid.add_event_listener(move |status| {
-            let hid_connected_tx = hid_connected_tx.clone();
-            async move {
-                let _ = hid_connected_tx.send(matches!(status, DeviceStatus::Present(_)));
-            }
-        });
-
-        let (mouse_mode_tx, mouse_mode_rx) = watch::channel(hid.mouse_mode());
-        let mouse_mode_sub = hid.add_mouse_mode_listener(move |mode| {
-            let mouse_mode_tx = mouse_mode_tx.clone();
-            async move {
-                let _ = mouse_mode_tx.send(mode);
-            }
-        });
-
-        Self {
-            capture_engine,
-            hid,
-            capture_settings_rx,
-            device_state_rx,
-            hid_connected_rx,
-            mouse_mode_rx,
-            _capture_settings_sub: Arc::new(capture_settings_sub),
-            _device_state_sub: Arc::new(device_state_sub),
-            _hid_presence_sub: Arc::new(hid_presence_sub),
-            _mouse_mode_sub: Arc::new(mouse_mode_sub),
-        }
+        Self { capture_engine, hid }
     }
 }
 
@@ -136,8 +67,8 @@ pub struct AnswerResponse {
 /// WebSocket — the browser waits for its own ICE gathering to finish
 /// before sending the offer, and this handler waits for its own gathering
 /// to finish before responding, so one request/response is enough.
-pub async fn offer_handler(State(channels): State<SharedChannels>, Json(body): Json<OfferRequest>) -> Result<Json<AnswerResponse>, StatusCode> {
-    match negotiate(body.sdp, channels).await {
+pub async fn offer_handler(State(rtc): State<Rtc>, Json(body): Json<OfferRequest>) -> Result<Json<AnswerResponse>, StatusCode> {
+    match negotiate(body.sdp, rtc).await {
         Ok(answer_sdp) => Ok(Json(AnswerResponse { sdp: answer_sdp })),
         Err(err) => {
             tracing::warn!(%err, "failed to negotiate WebRTC session");
@@ -273,7 +204,7 @@ impl PeerConnectionEventHandler for Handler {
 /// but the session starts with nothing sending on it; `session::handle`
 /// attaches one later, once its connection is stable and a capture stream
 /// is actually available (see `Handler::on_negotiation_needed`).
-async fn negotiate(offer_sdp: String, channels: SharedChannels) -> Result<String> {
+async fn negotiate(offer_sdp: String, rtc: Rtc) -> Result<String> {
     let mut media_engine = MediaEngine::default();
     let h264_codec = RTCRtpCodecParameters {
         rtp_codec: RTCRtpCodec {
@@ -337,16 +268,7 @@ async fn negotiate(offer_sdp: String, channels: SharedChannels) -> Result<String
     // why this can't just be unconditional.
     ready.store(true, Ordering::Relaxed);
 
-    let ctx = SessionContext {
-        capture_engine: channels.capture_engine,
-        hid: channels.hid,
-        capture_settings_rx: channels.capture_settings_rx,
-        mouse_mode_rx: channels.mouse_mode_rx.clone(),
-        device_state_rx: channels.device_state_rx,
-        hid_connected_rx: channels.hid_connected_rx,
-        h264_codec: h264_codec.rtp_codec,
-        pc_state_rx,
-    };
+    let ctx = SessionContext { capture_engine: rtc.capture_engine, hid: rtc.hid, h264_codec: h264_codec.rtp_codec, pc_state_rx };
     let pc_for_session = peer_connection.clone();
     tokio::spawn(async move {
         if let Err(err) = session::handle(pc_for_session, dc_rx, renegotiation_rx, ctx).await {

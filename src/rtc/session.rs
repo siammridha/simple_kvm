@@ -31,30 +31,23 @@ use webrtc::rtp_transceiver::RtpSender;
 
 use crate::capture::FrameEnvelope;
 use crate::capture::engine::{CaptureEngine, CaptureStream, NoDevice};
-use crate::capture::{CaptureSettings, DeviceState, Resolution, SupportedFormat};
+use crate::capture::{CaptureSettings, Resolution, SupportedFormat};
 use crate::hid::{Hid, InputCommand, MouseMode};
 use crate::device::{DeviceStatus, Subscription};
 
 use super::protocol::{ControlMessage, InputEvent, MouseModeWire, ServerMessage};
 
 pub struct SessionContext {
-    /// Shared across every session on this server - see
-    /// `super::SharedChannels::capture_engine`. `handle` calls
-    /// `request_stream()` on this once the connection is stable, and again
-    /// on every later device-availability signal while this session still
-    /// has no track.
+    /// Shared across every session on this server - see `super::Rtc`.
+    /// `handle` calls `request_stream()` on this once the connection is
+    /// stable, and again on every later device-availability signal while
+    /// this session still has no track. Capture settings and the card's
+    /// UI-facing state are read from and written to it directly, and
+    /// subscribed to per session (see `handle`).
     pub capture_engine: Arc<CaptureEngine>,
-    /// The HID bridge - see `super::SharedChannels::hid`.
+    /// The HID bridge - see `super::Rtc`. Input, mouse mode and CH9329
+    /// presence all go through it, as commands and subscriptions.
     pub hid: Arc<Hid>,
-    /// Change signal only - `capture` owns the value itself, and a change
-    /// is applied by calling `CaptureEngine::update_settings`. See
-    /// `super::SharedChannels::capture_settings_rx`.
-    pub capture_settings_rx: watch::Receiver<CaptureSettings>,
-    /// Change signal only - `hid` owns the value itself. See
-    /// `super::SharedChannels::mouse_mode_rx`.
-    pub mouse_mode_rx: watch::Receiver<MouseMode>,
-    pub device_state_rx: watch::Receiver<DeviceState>,
-    pub hid_connected_rx: watch::Receiver<bool>,
     /// The H.264 codec registered on this connection's `MediaEngine` (see
     /// `negotiate()`), needed to build a fresh `TrackLocalStaticSample`
     /// whenever a live capture stream becomes available — see
@@ -275,10 +268,6 @@ pub async fn handle(
     // renegotiation rather than being present from the start.
     let mut video: Option<VideoState> = None;
 
-    let mut device_state_rx = ctx.device_state_rx.clone();
-    let mut capture_settings_rx = ctx.capture_settings_rx.clone();
-    let mut mouse_mode_rx = ctx.mouse_mode_rx.clone();
-    let mut hid_connected_rx = ctx.hid_connected_rx.clone();
     let mut pc_state_rx = ctx.pc_state_rx.clone();
 
     // Forwards `CaptureEngine`'s own device-presence events into this
@@ -321,6 +310,70 @@ pub async fn handle(
                 async move { send_server_message(&control, &msg).await }
             })
             .await;
+        }
+    });
+
+    // This session's own subscriptions to the two modules that own the
+    // state the page shows. Each one enqueues onto the outbound queue
+    // above rather than touching `control` itself, so an event landing at
+    // the same moment as a renegotiation offer or the initial push can't
+    // reorder anything on the wire.
+    //
+    // Every callback re-reads the current value from the owning module
+    // instead of using the payload it was handed: listeners are dispatched
+    // fire-and-forget on their own tasks, so two changes in quick
+    // succession can run in either order, and a payload-carrying callback
+    // that lost that race would leave the tab on the older value for good.
+    // Re-reading makes the worst case a harmless duplicate of the current
+    // value. Nothing runs before `control` is open - `relay_outbound`
+    // would fail its first send against a not-yet-open channel and stop
+    // for good - so the `control_open` guard is what the `OnOpen` arm's
+    // `push_initial_state` hands over from.
+    let _device_state_sub = ctx.capture_engine.add_device_state_listener({
+        let (capture_engine, outbound_tx, control_open) = (Arc::clone(&ctx.capture_engine), outbound_tx.clone(), Arc::clone(&control_open));
+        move |_| {
+            let (capture_engine, outbound_tx, control_open) = (Arc::clone(&capture_engine), outbound_tx.clone(), Arc::clone(&control_open));
+            async move {
+                if control_open.load(Ordering::Relaxed) {
+                    let _ = outbound_tx.send(ServerMessage::DeviceState(capture_engine.device_state()));
+                }
+            }
+        }
+    });
+    // Capture settings and mouse mode are two halves of one
+    // `ServerMessage::Settings`, so both subscriptions send the same
+    // snapshot of both values.
+    let _settings_sub = ctx.capture_engine.add_settings_listener({
+        let (capture_engine, hid, outbound_tx, control_open) = (Arc::clone(&ctx.capture_engine), Arc::clone(&ctx.hid), outbound_tx.clone(), Arc::clone(&control_open));
+        move |_| {
+            let (capture_engine, hid, outbound_tx, control_open) = (Arc::clone(&capture_engine), Arc::clone(&hid), outbound_tx.clone(), Arc::clone(&control_open));
+            async move {
+                if control_open.load(Ordering::Relaxed) {
+                    let _ = outbound_tx.send(ServerMessage::Settings { capture: capture_engine.settings(), mouse_mode: hid.mouse_mode() });
+                }
+            }
+        }
+    });
+    let _mouse_mode_sub = ctx.hid.add_mouse_mode_listener({
+        let (capture_engine, hid, outbound_tx, control_open) = (Arc::clone(&ctx.capture_engine), Arc::clone(&ctx.hid), outbound_tx.clone(), Arc::clone(&control_open));
+        move |_| {
+            let (capture_engine, hid, outbound_tx, control_open) = (Arc::clone(&capture_engine), Arc::clone(&hid), outbound_tx.clone(), Arc::clone(&control_open));
+            async move {
+                if control_open.load(Ordering::Relaxed) {
+                    let _ = outbound_tx.send(ServerMessage::Settings { capture: capture_engine.settings(), mouse_mode: hid.mouse_mode() });
+                }
+            }
+        }
+    });
+    let _hid_presence_sub = ctx.hid.add_event_listener({
+        let (hid, outbound_tx, control_open) = (Arc::clone(&ctx.hid), outbound_tx.clone(), Arc::clone(&control_open));
+        move |_| {
+            let (hid, outbound_tx, control_open) = (Arc::clone(&hid), outbound_tx.clone(), Arc::clone(&control_open));
+            async move {
+                if control_open.load(Ordering::Relaxed) {
+                    let _ = outbound_tx.send(ServerMessage::HidState { available: hid.is_present() });
+                }
+            }
         }
     });
 
@@ -392,17 +445,16 @@ pub async fn handle(
             event = control.poll() => {
                 match event {
                     Some(DataChannelEvent::OnOpen) => {
-                        // `changed()` on a freshly subscribed watch::Receiver only
-                        // fires for a change that happens *after* the subscribe -
-                        // it won't fire for state that was already current when
-                        // this tab connected. So the current state has to be
-                        // pushed explicitly here, once, rather than relying on the
-                        // `changed()` arms below (which still handle every update
-                        // from this point on). `DeviceState` here is whatever
-                        // `capture::watch_device_state` last cached from probing
-                        // the card when it was plugged in - opening this channel
-                        // doesn't trigger a fresh probe of its own.
-                        if push_initial_state(&outbound_tx, &mut device_state_rx, &mut hid_connected_rx, &mut capture_settings_rx, ctx.hid.mouse_mode()).is_ok() {
+                        // A listener only fires for a change that happens *after*
+                        // it subscribes - it says nothing about state that was
+                        // already current when this tab connected. So the current
+                        // state is read straight from the owning modules and
+                        // pushed once here; the subscriptions above cover every
+                        // update from this point on. The device state is whatever
+                        // `capture` last computed from probing the card when it
+                        // was plugged in - opening this channel doesn't trigger a
+                        // fresh probe of its own.
+                        if push_initial_state(&outbound_tx, &ctx.capture_engine, &ctx.hid).is_ok() {
                             control_open.store(true, Ordering::Relaxed);
                         }
                     }
@@ -417,30 +469,6 @@ pub async fn handle(
                     }
                     Some(DataChannelEvent::OnClose) | None => break,
                     _ => {}
-                }
-            }
-            changed = device_state_rx.changed(), if control_open.load(Ordering::Relaxed) => {
-                if changed.is_ok() {
-                    let state = device_state_rx.borrow_and_update().clone();
-                    let _ = outbound_tx.send(ServerMessage::DeviceState(state));
-                }
-            }
-            changed = capture_settings_rx.changed(), if control_open.load(Ordering::Relaxed) => {
-                if changed.is_ok() {
-                    let capture = *capture_settings_rx.borrow_and_update();
-                    let _ = outbound_tx.send(ServerMessage::Settings { capture, mouse_mode: ctx.hid.mouse_mode() });
-                }
-            }
-            changed = mouse_mode_rx.changed(), if control_open.load(Ordering::Relaxed) => {
-                if changed.is_ok() {
-                    let mouse_mode = *mouse_mode_rx.borrow_and_update();
-                    let _ = outbound_tx.send(ServerMessage::Settings { capture: *capture_settings_rx.borrow(), mouse_mode });
-                }
-            }
-            changed = hid_connected_rx.changed(), if control_open.load(Ordering::Relaxed) => {
-                if changed.is_ok() {
-                    let available = *hid_connected_rx.borrow_and_update();
-                    let _ = outbound_tx.send(ServerMessage::HidState { available });
                 }
             }
             changed = pc_state_rx.changed() => {
@@ -472,25 +500,16 @@ pub async fn handle(
 }
 
 /// Enqueues the full current state (device availability, HID connectivity,
-/// settings) onto the outbound queue for the just-opened `control` channel.
-/// Needed because `changed()` on a receiver only fires for changes from
-/// here on — it doesn't tell a freshly connected tab about state that was
-/// already current before it connected (see the call site in `handle`).
-fn push_initial_state(
-    outbound_tx: &mpsc::UnboundedSender<ServerMessage>,
-    device_state_rx: &mut watch::Receiver<DeviceState>,
-    hid_connected_rx: &mut watch::Receiver<bool>,
-    capture_settings_rx: &mut watch::Receiver<CaptureSettings>,
-    mouse_mode: MouseMode,
-) -> Result<()> {
-    let device_state = device_state_rx.borrow_and_update().clone();
-    outbound_tx.send(ServerMessage::DeviceState(device_state)).map_err(|_| anyhow::anyhow!("outbound queue closed"))?;
-    let hid_available = *hid_connected_rx.borrow_and_update();
-    outbound_tx
-        .send(ServerMessage::HidState { available: hid_available })
-        .map_err(|_| anyhow::anyhow!("outbound queue closed"))?;
-    let capture = *capture_settings_rx.borrow_and_update();
-    outbound_tx.send(ServerMessage::Settings { capture, mouse_mode }).map_err(|_| anyhow::anyhow!("outbound queue closed"))?;
+/// settings) onto the outbound queue for the just-opened `control` channel,
+/// read straight from the modules that own it. Needed because a listener
+/// only fires for changes from here on — it doesn't tell a freshly
+/// connected tab about state that was already current before it connected
+/// (see the call site in `handle`).
+fn push_initial_state(outbound_tx: &mpsc::UnboundedSender<ServerMessage>, capture_engine: &CaptureEngine, hid: &Hid) -> Result<()> {
+    let closed = || anyhow::anyhow!("outbound queue closed");
+    outbound_tx.send(ServerMessage::DeviceState(capture_engine.device_state())).map_err(|_| closed())?;
+    outbound_tx.send(ServerMessage::HidState { available: hid.is_present() }).map_err(|_| closed())?;
+    outbound_tx.send(ServerMessage::Settings { capture: capture_engine.settings(), mouse_mode: hid.mouse_mode() }).map_err(|_| closed())?;
     Ok(())
 }
 
@@ -586,14 +605,15 @@ fn handle_control_message(msg: ControlMessage, ctx: &SessionContext) {
                 // what reaches the card, and restarts a running encode
                 // pass so the new resolution/frame rate actually take
                 // effect - and its change event is what reaches every
-                // already-open tab (see `super::SharedChannels::new`).
+                // already-open tab, including this one (see the
+                // subscriptions in `handle`).
                 ctx.capture_engine.update_settings(CaptureSettings { resolution: Resolution { width: capture.width, height: capture.height }, fps: capture.fps });
                 tracing::info!(width = capture.width, height = capture.height, fps = capture.fps, "capture settings updated");
             }
             // `hid` owns the value - it's the module that decides what
             // gets written to the chip - and its change event is what
-            // reaches every already-open tab (see
-            // `super::SharedChannels::new`).
+            // reaches every already-open tab, including this one (see the
+            // subscriptions in `handle`).
             if let Some(mouse_mode) = mouse_mode {
                 let mouse_mode = match mouse_mode {
                     MouseModeWire::Absolute => MouseMode::Absolute,
@@ -626,14 +646,6 @@ mod tests {
     use crate::rtc::protocol::CaptureSettingsWire;
 
     fn test_ctx() -> SessionContext {
-        // Only a change signal in production too (see
-        // `SharedChannels::new`); the value itself comes from `capture`.
-        let (_capture_settings_tx, capture_settings_rx) = watch::channel(CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5 });
-        // Only a change signal in production too (see
-        // `SharedChannels::new`); the value itself comes from `hid`.
-        let (_mouse_mode_tx, mouse_mode_rx) = watch::channel(MouseMode::Absolute);
-        let (_device_state_tx, device_state_rx) = watch::channel(DeviceState::default());
-        let (_hid_connected_tx, hid_connected_rx) = watch::channel(false);
         let (_pc_state_tx, pc_state_rx) = watch::channel(RTCPeerConnectionState::New);
         // Points at a path that will never exist - these tests only touch
         // `handle_control_message`, which never asks the engine for a
@@ -645,10 +657,6 @@ mod tests {
             // ever spawned - these tests only reach
             // `handle_control_message`.
             hid: Hid::spawn_for_test(),
-            capture_settings_rx,
-            mouse_mode_rx,
-            device_state_rx,
-            hid_connected_rx,
             h264_codec: RTCRtpCodec::default(),
             pc_state_rx,
         }

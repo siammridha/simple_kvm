@@ -20,6 +20,7 @@ mod writer;
 
 use std::fmt;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -115,6 +116,13 @@ pub struct Hid {
     /// subscribers exist from startup, while the `Ch9329Device` itself
     /// isn't spawned until the settle delay has passed.
     events: Arc<EventEmitter<DeviceStatus<()>>>,
+    /// The latest presence this module has seen, kept alongside `events`
+    /// so `is_present` can answer without holding the `Ch9329Device` (which
+    /// doesn't exist until the settle delay has passed). Written by the
+    /// forwarding listener in `open_after_delay` *before* it dispatches, so
+    /// a subscriber that reads this in its own callback never sees a value
+    /// older than the event that woke it.
+    present: Arc<AtomicBool>,
     /// Read and written from both async tasks and the page's control
     /// channel, but never held across an `.await` - a plain `std` mutex
     /// rather than tokio's.
@@ -138,12 +146,14 @@ impl Hid {
     fn spawn_with_delay(open_delay: Duration) -> Arc<Self> {
         let (commands_tx, commands_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
         let events = Arc::new(EventEmitter::new());
+        let present = Arc::new(AtomicBool::new(false));
 
-        tokio::spawn(open_after_delay(open_delay, commands_tx.downgrade(), commands_rx, Arc::clone(&events)));
+        tokio::spawn(open_after_delay(open_delay, commands_tx.downgrade(), commands_rx, Arc::clone(&events), Arc::clone(&present)));
 
         Arc::new(Self {
             commands: commands_tx,
             events,
+            present,
             mouse_mode: Mutex::new(DEFAULT_MOUSE_MODE),
             mouse_mode_events: Arc::new(EventEmitter::new()),
         })
@@ -154,6 +164,14 @@ impl Hid {
     /// port isn't open yet.
     pub async fn send(&self, command: InputCommand) -> Result<(), QueueClosed> {
         self.commands.send(Command::Input(command)).await.map_err(|_| QueueClosed)
+    }
+
+    /// Whether the CH9329 is plugged in right now. The read counterpart of
+    /// `add_event_listener`: presence events only fire on a transition, so
+    /// a subscriber that starts after the chip was already found needs this
+    /// to learn where it's starting from.
+    pub fn is_present(&self) -> bool {
+        self.present.load(Ordering::Relaxed)
     }
 
     pub fn mouse_mode(&self) -> MouseMode {
@@ -208,6 +226,7 @@ async fn open_after_delay(
     commands_tx: mpsc::WeakSender<Command>,
     commands_rx: mpsc::Receiver<Command>,
     events: Arc<EventEmitter<DeviceStatus<()>>>,
+    present: Arc<AtomicBool>,
 ) {
     if !open_delay.is_zero() {
         tracing::info!(seconds = open_delay.as_secs(), "waiting before opening CH9329 serial port");
@@ -220,8 +239,10 @@ async fn open_after_delay(
     let device = Ch9329Device::spawn();
     let _presence_sub = device.add_event_listener(move |status| {
         let events = Arc::clone(&events);
+        let present = Arc::clone(&present);
         let commands_tx = commands_tx.clone();
         async move {
+            present.store(matches!(status, DeviceStatus::Present(_)), Ordering::Relaxed);
             events.dispatch(status);
             // Prompts the worker to open or drop its port right away,
             // rather than only on the next real keystroke or click.

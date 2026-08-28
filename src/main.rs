@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
     // than being lost, so nothing here holds up the HTTP page starting. ---
     let hid = Hid::spawn();
 
-    let channels = rtc::SharedChannels::new(capture_engine, hid);
+    let rtc = rtc::Rtc::new(capture_engine, hid);
     let http_addr = std::net::SocketAddr::from(([0, 0, 0, 0], http_port));
     tracing::info!(port = http_port, "page and WebRTC signaling server listening");
     let http_handle = tokio::spawn(async move {
@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
                 return;
             }
         };
-        if let Err(err) = axum::serve(listener, web::router(channels)).await {
+        if let Err(err) = axum::serve(listener, web::router(rtc)).await {
             tracing::error!(%err, "page server exited");
         }
     });
