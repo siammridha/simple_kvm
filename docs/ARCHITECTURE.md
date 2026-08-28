@@ -43,12 +43,18 @@ Each module lists what it is **responsible for**, **owns exclusively**, **may de
 
 > ```
 > trait DeviceDriver { type Info; type Settings; type Open;
+>     const UEVENT_SUBSYSTEM: &str;                  // "video4linux" / "tty"
+>     const PATH_ENV_VAR: &str; const DEFAULT_PATH: &str;
 >     fn probe(path: &str) -> Option<Self::Info>;
 >     fn open(path: &str, s: &Self::Settings) -> Result<Self::Open, OpenError>; }
 > type CaptureDevice = Device<CaptureDriver>;   // wraps v4l2
 > type Ch9329Device  = Device<Ch9329Driver>;    // wraps serial
 > ```
 > A new device kind is one more `DeviceDriver` impl, not another presence module.
+>
+> **Where a device lives is stated by its driver, not by its caller.** The uevent subsystem and
+> the path (env var + default) describe a device *kind*, so `Device::spawn()` takes no arguments
+> at all — which is what makes it impossible for a caller to hold a path (I2/I3).
 
 ### 3.2 `capture` — encode pipeline (mirrors `getUserMedia`)
 
@@ -187,6 +193,7 @@ single-file spelling (`src/device.rs`) so it keeps working either way. The same 
 other module named below.
 
 1. **Path secrecy (I3):** `rg '/dev/' src --glob '!src/device.rs' --glob '!src/device/**'` returns nothing, and so does the same search for device `*_PATH` env reads (`rg '_PATH' src --glob '!src/device.rs' --glob '!src/device/**'`).
+   *One known exception, until #016:* `hid/writer.rs` still opens the CH9329 itself, so it reads `SERIAL_PATH` (same variable, same default as `device::ch9329_driver`). #016 rewires it through `Ch9329Device::open` and both hits go away.
 2. **Dependency edges (I5):** each module's cross-module `use crate::` matches only §4. `web` imports only `rtc`; `capture`/`hid` import only `device`; `rtc` imports only `capture` and `hid` (plus `device::DeviceStatus` and `device::Subscription`, the type-only payload and handle of the subscription `capture` hands it — see §4); `device` imports no sibling.
 3. **Config locality (I2):** module config, paths included, is defined and read inside that module; `main.rs` has no config literals or path strings — `rg 'env::var|/dev/' src/main.rs` returns nothing.
 4. **Composition root (I1):** `main.rs` is construct/wire/start only.

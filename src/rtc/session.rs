@@ -676,7 +676,7 @@ mod tests {
         // Points at a path that will never exist - these tests only touch
         // `handle_control_message`, which never asks the engine for a
         // stream, so a real capture device is neither needed nor wanted.
-        let capture_device = CaptureDevice::spawn("/nonexistent-simple-kvm-test-device", "video4linux");
+        let capture_device = CaptureDevice::spawn_at("/nonexistent-simple-kvm-test-device");
         SessionContext {
             capture_engine: Arc::new(CaptureEngine::new(capture_device)),
             serial_tx,

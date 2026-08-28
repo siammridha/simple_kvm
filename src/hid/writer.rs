@@ -2,9 +2,13 @@
 //! serializes all writes onto it. Runs as a dedicated blocking loop (driven
 //! by `run`), fed by a channel so every input source shares one writer.
 //!
-//! It still opens that port itself, from a path handed in by the
-//! composition root, rather than through `device::Ch9329Device` - #016
-//! rewires it.
+//! It still opens that port itself rather than through
+//! `device::Ch9329Device` - #016 rewires it. Until then it reads
+//! `SERIAL_PATH` here, which is the one deliberate exception to
+//! `ARCHITECTURE.md` I3 (paths live only in `device`): the composition
+//! root no longer has a path to hand it (#015), and `device` handing one
+//! back out would be a worse leak than this temporary duplicate read.
+//! `device::ch9329_driver` reads the same variable with the same default.
 //!
 //! Absolute mouse mode on this hardware only conveys X/Y — confirmed by an
 //! end-to-end loopback test against the real chip (see the plan doc).
@@ -25,6 +29,10 @@ use super::{paste, protocol};
 const BAUD_RATE: u32 = 9600;
 const OPEN_TIMEOUT: Duration = Duration::from_millis(500);
 const KEY_HOLD_DELAY: Duration = Duration::from_millis(20);
+/// Temporary duplicate of `device::ch9329_driver`'s own values - see the
+/// module docs; #016 deletes both of these along with the local `open`.
+const SERIAL_PATH_ENV_VAR: &str = "SERIAL_PATH";
+const DEFAULT_SERIAL_PATH: &str = "/dev/ttyUSB0";
 /// Above this, `handle` logs at `warn` instead of `debug` — visible in the
 /// log at the default level, so a slow CH9329 write shows up without
 /// needing `RUST_LOG=debug` turned on first.
@@ -100,7 +108,8 @@ impl SerialWriter {
     /// tell the browser (the HID counterpart of the capture card's
     /// `DeviceState` — see `rtc::session`), so both sides agree on presence
     /// by construction.
-    pub fn new(path: String, present_rx: watch::Receiver<bool>) -> Self {
+    pub fn new(present_rx: watch::Receiver<bool>) -> Self {
+        let path = std::env::var(SERIAL_PATH_ENV_VAR).unwrap_or_else(|_| DEFAULT_SERIAL_PATH.to_string());
         Self { path, port: None, present_rx }
     }
 

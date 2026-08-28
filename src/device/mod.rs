@@ -44,13 +44,31 @@ pub use ch9329_driver::Ch9329Device;
 /// mirrors `capture::DEVICE_POLL_INTERVAL`'s role for the same case.
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// What differs between device kinds - probing and opening. Everything
-/// else (presence detection, event dispatch, path encapsulation) is
-/// shared by the generic `Device<D>` core below.
+/// What differs between device kinds - where the device lives, and how to
+/// probe and open it. Everything else (presence detection, event
+/// dispatch, path encapsulation) is shared by the generic `Device<D>`
+/// core below.
+///
+/// Where the device lives is stated here rather than passed to `spawn`
+/// because it describes the device *kind*, not one caller's wish: the
+/// CH9329 always appears under `tty`, the capture card always under
+/// `video4linux`, and each kind has exactly one environment variable
+/// naming its path. Keeping all three here is what lets `spawn` take no
+/// arguments at all, so no caller ever holds a device path
+/// (`ARCHITECTURE.md` I2/I3).
 pub trait DeviceDriver: Send + Sync + 'static {
     type Info: Clone + Send + 'static;
     type Settings: Send + 'static;
     type Open: Send + 'static;
+
+    /// Kernel subsystem name this device kind appears under on the uevent
+    /// stream (see `uevent::UeventListener::wait_for_subsystem`).
+    const UEVENT_SUBSYSTEM: &'static str;
+
+    /// Environment variable naming this device's path, and the path used
+    /// when it isn't set.
+    const PATH_ENV_VAR: &'static str;
+    const DEFAULT_PATH: &'static str;
 
     /// Probes `device_path` for its capabilities. Never errors the caller -
     /// any failure (no such device, wrong kind, an ioctl error) is reported
@@ -114,18 +132,29 @@ impl<D: DeviceDriver> Clone for Device<D> {
 
 impl<D: DeviceDriver> Device<D> {
     /// Starts the background presence task and returns a handle to it.
-    /// `uevent_subsystem` is the kernel subsystem name to listen for on
-    /// this device's uevent stream (e.g. `"video4linux"` for the capture
-    /// card, `"tty"` for the CH9329 - see `uevent::UeventListener::
-    /// wait_for_subsystem`); it isn't part of `DeviceDriver` itself since
-    /// it names where the device lives, not how to probe/open it, the
-    /// same kind of thing `device_path` already is.
-    pub fn spawn(device_path: impl Into<String>, uevent_subsystem: impl Into<String>) -> Self {
+    /// Takes nothing: the path comes from this device kind's own
+    /// environment variable (`D::PATH_ENV_VAR`, falling back to
+    /// `D::DEFAULT_PATH`) and the uevent subsystem from `D` too, so the
+    /// path is read here and never travels through a caller.
+    pub fn spawn() -> Self {
+        Self::spawn_at_path(std::env::var(D::PATH_ENV_VAR).unwrap_or_else(|_| D::DEFAULT_PATH.to_string()))
+    }
+
+    /// `spawn` against an explicit path. Test-only: the whole point of
+    /// `spawn` is that no caller supplies a path, but a test needs to
+    /// point a device at a temp file (present) or at a path that will
+    /// never exist (absent) without mutating process-wide environment.
+    #[cfg(test)]
+    pub fn spawn_at(device_path: impl Into<String>) -> Self {
+        Self::spawn_at_path(device_path)
+    }
+
+    fn spawn_at_path(device_path: impl Into<String>) -> Self {
         let device_path = device_path.into();
         let inner = Arc::new(DeviceInner { device_path, events: Arc::new(EventEmitter::new()), current: Mutex::new(DeviceStatus::Absent) });
 
         let task_inner = Arc::clone(&inner);
-        tokio::spawn(run_presence_task::<D>(task_inner, uevent_subsystem.into()));
+        tokio::spawn(run_presence_task::<D>(task_inner));
 
         Self { inner }
     }
@@ -176,7 +205,7 @@ impl<D: DeviceDriver> Device<D> {
 /// this module - the filesystem presence check and the uevent wait - so
 /// that `PresenceState` itself stays pure and unit-testable without either
 /// (see `PresenceState`'s doc comment).
-async fn run_presence_task<D: DeviceDriver>(inner: Arc<DeviceInner<D>>, uevent_subsystem: String) {
+async fn run_presence_task<D: DeviceDriver>(inner: Arc<DeviceInner<D>>) {
     let mut state = PresenceState::<D>::new();
     let mut uevents = match uevent::UeventListener::open() {
         Ok(listener) => Some(listener),
@@ -194,7 +223,7 @@ async fn run_presence_task<D: DeviceDriver>(inner: Arc<DeviceInner<D>>, uevent_s
         }
 
         match &mut uevents {
-            Some(listener) => listener.wait_for_subsystem(&uevent_subsystem).await,
+            Some(listener) => listener.wait_for_subsystem(D::UEVENT_SUBSYSTEM).await,
             None => tokio::time::sleep(DEVICE_POLL_INTERVAL).await,
         }
     }
@@ -265,6 +294,9 @@ mod tests {
         struct Fake;
         static PROBE_CALLS: AtomicUsize = AtomicUsize::new(0);
         impl DeviceDriver for Fake {
+            const UEVENT_SUBSYSTEM: &'static str = "fake";
+            const PATH_ENV_VAR: &'static str = "SIMPLE_KVM_FAKE_DEVICE";
+            const DEFAULT_PATH: &'static str = "/nonexistent/simple-kvm-fake-device";
             type Info = FakeInfo;
             type Settings = ();
             type Open = ();
@@ -289,6 +321,9 @@ mod tests {
         struct Fake;
         static PROBE_CALLS: AtomicUsize = AtomicUsize::new(0);
         impl DeviceDriver for Fake {
+            const UEVENT_SUBSYSTEM: &'static str = "fake";
+            const PATH_ENV_VAR: &'static str = "SIMPLE_KVM_FAKE_DEVICE";
+            const DEFAULT_PATH: &'static str = "/nonexistent/simple-kvm-fake-device";
             type Info = FakeInfo;
             type Settings = ();
             type Open = ();
@@ -315,6 +350,9 @@ mod tests {
     async fn device_status_change_dispatches_to_subscribers() {
         struct Fake;
         impl DeviceDriver for Fake {
+            const UEVENT_SUBSYSTEM: &'static str = "fake";
+            const PATH_ENV_VAR: &'static str = "SIMPLE_KVM_FAKE_DEVICE";
+            const DEFAULT_PATH: &'static str = "/nonexistent/simple-kvm-fake-device";
             type Info = FakeInfo;
             type Settings = ();
             type Open = ();
@@ -347,6 +385,9 @@ mod tests {
     fn open_fails_immediately_when_not_present() {
         struct Fake;
         impl DeviceDriver for Fake {
+            const UEVENT_SUBSYSTEM: &'static str = "fake";
+            const PATH_ENV_VAR: &'static str = "SIMPLE_KVM_FAKE_DEVICE";
+            const DEFAULT_PATH: &'static str = "/nonexistent/simple-kvm-fake-device";
             type Info = FakeInfo;
             type Settings = ();
             type Open = ();
@@ -366,6 +407,9 @@ mod tests {
     fn open_delegates_to_driver_when_present() {
         struct Fake;
         impl DeviceDriver for Fake {
+            const UEVENT_SUBSYSTEM: &'static str = "fake";
+            const PATH_ENV_VAR: &'static str = "SIMPLE_KVM_FAKE_DEVICE";
+            const DEFAULT_PATH: &'static str = "/nonexistent/simple-kvm-fake-device";
             type Info = FakeInfo;
             type Settings = ();
             type Open = &'static str;
@@ -385,6 +429,9 @@ mod tests {
     fn is_present_reports_the_same_gate_open_applies() {
         struct Fake;
         impl DeviceDriver for Fake {
+            const UEVENT_SUBSYSTEM: &'static str = "fake";
+            const PATH_ENV_VAR: &'static str = "SIMPLE_KVM_FAKE_DEVICE";
+            const DEFAULT_PATH: &'static str = "/nonexistent/simple-kvm-fake-device";
             type Info = FakeInfo;
             type Settings = ();
             type Open = ();

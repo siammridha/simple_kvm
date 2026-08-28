@@ -20,6 +20,10 @@ pub type Ch9329Device = Device<Ch9329Driver>;
 pub struct Ch9329Driver;
 
 impl DeviceDriver for Ch9329Driver {
+    const UEVENT_SUBSYSTEM: &'static str = "tty";
+    const PATH_ENV_VAR: &'static str = "SERIAL_PATH";
+    const DEFAULT_PATH: &'static str = "/dev/ttyUSB0";
+
     type Info = ();
     type Settings = ();
     type Open = Box<dyn SerialPort>;

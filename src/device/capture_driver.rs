@@ -80,6 +80,10 @@ impl CaptureHandle {
 }
 
 impl DeviceDriver for CaptureDriver {
+    const UEVENT_SUBSYSTEM: &'static str = "video4linux";
+    const PATH_ENV_VAR: &'static str = "VIDEO_PATH";
+    const DEFAULT_PATH: &'static str = "/dev/video0";
+
     type Info = SupportedFormat;
     type Settings = CaptureSettings;
     type Open = CaptureHandle;

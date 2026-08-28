@@ -25,8 +25,6 @@ async fn main() -> Result<()> {
     log_startup_banner(env!("CARGO_PKG_VERSION"));
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "simple_kvm starting");
 
-    let serial_path = env::var("SERIAL_PATH").unwrap_or_else(|_| "/dev/ttyUSB0".to_string());
-    let video_path = env::var("VIDEO_PATH").unwrap_or_else(|_| "/dev/video0".to_string());
     let http_port: u16 = env_parsed("HTTP_PORT").unwrap_or(3000);
     let serial_open_delay_secs: u64 = env_parsed("SERIAL_OPEN_DELAY_SECS").unwrap_or(30);
 
@@ -48,9 +46,10 @@ async fn main() -> Result<()> {
     // Two independent handles to the same underlying presence task (see
     // `Device::clone`) - one feeds `CaptureEngine`'s own presence-driven
     // `request_stream()` gating, the other publishes `DeviceState` for the
-    // web UI. Neither holds the raw device path itself past this point;
-    // everything downstream only ever sees presence/capability state.
-    let capture_device = CaptureDevice::spawn(&video_path, "video4linux");
+    // web UI. Neither ever sees the raw device path - the device reads it
+    // from its own config; everything here only ever sees
+    // presence/capability state.
+    let capture_device = CaptureDevice::spawn();
     let device_state_rx = capture::watch_device_state(capture_device.clone(), capture_settings_rx.clone());
     let capture_engine = Arc::new(CaptureEngine::new(capture_device));
 
@@ -58,7 +57,7 @@ async fn main() -> Result<()> {
     // to `serial_tx` before the port is open just queue up in the channel,
     // so this delay doesn't hold up the HTTP page starting. ---
     let (serial_tx, serial_rx) = mpsc::channel::<SerialCommand>(256);
-    tokio::spawn(open_serial_after_delay(serial_path, serial_open_delay_secs, serial_tx.clone(), serial_rx, hid_connected_tx));
+    tokio::spawn(open_serial_after_delay(serial_open_delay_secs, serial_tx.clone(), serial_rx, hid_connected_tx));
 
     let channels = rtc::SharedChannels { capture_engine, serial_tx, capture_settings_tx, mouse_mode_tx, device_state_rx, hid_connected_rx };
     let http_addr = std::net::SocketAddr::from(([0, 0, 0, 0], http_port));
@@ -97,7 +96,6 @@ fn env_parsed<T: std::str::FromStr>(key: &str) -> Option<T> {
 /// isn't there and picks back up on its own once it is — no need to decide
 /// that once, up front, here.
 async fn open_serial_after_delay(
-    serial_path: String,
     delay_secs: u64,
     serial_tx: mpsc::Sender<SerialCommand>,
     serial_rx: mpsc::Receiver<SerialCommand>,
@@ -108,7 +106,7 @@ async fn open_serial_after_delay(
         tokio::time::sleep(Duration::from_secs(delay_secs)).await;
     }
 
-    let ch9329_device = Ch9329Device::spawn(serial_path.clone(), "tty");
+    let ch9329_device = Ch9329Device::spawn();
     let hid_connected_tx_for_device = hid_connected_tx.clone();
     let _presence_sub = ch9329_device.add_event_listener(move |status| {
         let hid_connected_tx = hid_connected_tx_for_device.clone();
@@ -118,7 +116,7 @@ async fn open_serial_after_delay(
     });
 
     tokio::spawn(writer::watch_connection(hid_connected_tx.subscribe(), serial_tx));
-    let writer = writer::SerialWriter::new(serial_path, hid_connected_tx.subscribe());
+    let writer = writer::SerialWriter::new(hid_connected_tx.subscribe());
     let _ = tokio::task::spawn_blocking(move || writer.run(serial_rx)).await;
 }
 

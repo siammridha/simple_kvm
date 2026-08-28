@@ -413,7 +413,7 @@ mod tests {
     // racy ioctl failure timing. ---
 
     async fn present_device_at(path: &str) -> CaptureDevice {
-        let device = CaptureDevice::spawn(path, "video4linux");
+        let device = CaptureDevice::spawn_at(path);
         let (tx, mut rx) = mpsc::channel(1);
         let _sub = device.add_event_listener(move |status| {
             let tx = tx.clone();
@@ -428,7 +428,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_stream_fails_immediately_when_device_absent() {
-        let device = CaptureDevice::spawn("/nonexistent/simple-kvm-test-device", "video4linux");
+        let device = CaptureDevice::spawn_at("/nonexistent/simple-kvm-test-device");
         // No wait needed - `Device::open` checks presence synchronously
         // against whatever's already been observed, and a path that's
         // never existed starts (and stays) `Absent`.
