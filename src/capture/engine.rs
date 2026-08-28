@@ -4,17 +4,20 @@
 //! the real session layer by `rtc::session::handle` (issue #006): a session asks
 //! `request_stream()` for a live stream once its connection is stable, and
 //! subscribes to the returned `CaptureStream`'s `ended` event to know when
-//! to drop it.
+//! to drop it. That subscription can arrive after the stream has already
+//! ended - the session adds and negotiates a video track in between - so
+//! `ended` is published through a `StateEmitter` (issue #023), not a
+//! plain edge-triggered one.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::capture::video_bus::{self, FrameEnvelope};
 use crate::capture::{device_state_for, DeviceState};
-use crate::device::{CaptureDevice, CaptureSettings, DeviceStatus, EventEmitter, Resolution, Subscription, SupportedFormat};
+use crate::device::{CaptureDevice, CaptureSettings, DeviceStatus, EventEmitter, Resolution, StateEmitter, Subscription, SupportedFormat};
 
 /// Startup default, falling back to the device's first reported
 /// resolution/frame-rate combination if this specific one isn't
@@ -46,8 +49,10 @@ struct Shared {
     device_state_changed: Arc<EventEmitter<DeviceState>>,
     /// Keeps `Shared`'s `format`/settings cache current - see
     /// `CaptureEngine::new`. Held only for its lifetime effect; never read
-    /// directly.
-    _device_status_sub: Subscription<DeviceStatus<SupportedFormat>>,
+    /// directly. A `OnceLock` because the subscription can only be made
+    /// once this `Shared` is already inside its `Arc` (see
+    /// `CaptureEngine::new`), and is then never replaced.
+    device_status_sub: OnceLock<Subscription<DeviceStatus<SupportedFormat>>>,
 }
 
 struct State {
@@ -71,12 +76,12 @@ struct State {
     /// One entry per currently-live `CaptureStream` created against the
     /// pass that's running (or was, if this is left over from a pass that
     /// just ended) - `Weak` so a stream that's already been dropped
-    /// doesn't keep its `EventEmitter` alive just by being listed here.
+    /// doesn't keep its `StateEmitter` alive just by being listed here.
     /// Drained and dispatched to, then cleared, exactly once whenever a
     /// pass ends - whether that's this Vec's generation or a later one -
     /// so a given stream's `ended` can only ever be fired for the one
     /// pass generation it was registered against.
-    ended_emitters: Vec<Weak<EventEmitter<()>>>,
+    ended_emitters: Vec<Weak<StateEmitter<()>>>,
 }
 
 struct PassHandle {
@@ -147,67 +152,69 @@ impl CaptureEngine {
             ended_emitters: Vec::new(),
         });
 
-        // `add_event_listener` only needs `&device` (not the not-yet-built
-        // `Shared`), so it's registered before `device` moves into
-        // `Shared` below - `Arc::new_cyclic` then supplies the listener
-        // closure with a `Weak<Shared>` it can upgrade each time it fires,
-        // so the two only need to reference each other, not exist in a
-        // fixed order.
-        let shared = Arc::new_cyclic(|weak_shared: &Weak<Shared>| {
+        let shared = Arc::new(Shared {
+            device,
+            video_bus_tx,
+            video_bus_rx,
+            force_keyframe: Arc::new(AtomicBool::new(false)),
+            state,
+            settings_changed: Arc::new(EventEmitter::new()),
+            device_state_changed: Arc::new(EventEmitter::new()),
+            device_status_sub: OnceLock::new(),
+        });
+
+        // Subscribed strictly after `shared` exists, not from inside an
+        // `Arc::new_cyclic`: the device replays a status it already
+        // published to a listener that subscribes late (see
+        // `device::StateEmitter`), and that replay can be running on
+        // another worker thread the instant this call returns. A listener
+        // built against a `Weak<Shared>` that isn't inhabited yet would
+        // fail to upgrade and drop exactly the status this is here to
+        // catch.
+        let weak_shared = Arc::downgrade(&shared);
+        let subscription = shared.device.add_event_listener(move |status| {
             let weak_shared = weak_shared.clone();
-            let sub = device.add_event_listener(move |status| {
-                let weak_shared = weak_shared.clone();
-                async move {
-                    let Some(shared) = weak_shared.upgrade() else {
-                        return;
-                    };
-                    let (new_settings, new_device_state) = {
-                        let mut state = shared.state.lock().unwrap();
-                        // `Present(None)` is the boot-crash-risk "already
-                        // present, deliberately not probed" transition (see
-                        // `device::Device`'s doc comment) - `format` is left
-                        // exactly as it was, so `DeviceState` correctly stays
-                        // unavailable until a genuine transition actually
-                        // probes the card.
-                        match status {
-                            DeviceStatus::Present(Some(info)) => state.format = Some(info),
-                            DeviceStatus::Present(None) => {}
-                            DeviceStatus::Absent => state.format = None,
-                        }
-                        // The startup defaults were picked before the card
-                        // had said anything about itself; now that it has,
-                        // fall back to a combination it actually reports -
-                        // but never overwrite settings a person chose.
-                        let new_settings = if state.settings_are_defaults {
-                            let defaults = default_settings(state.format.as_ref());
-                            (defaults != state.settings).then(|| {
-                                state.settings = defaults;
-                                defaults
-                            })
-                        } else {
-                            None
-                        };
-                        (new_settings, refresh_device_state(&mut state))
-                    };
-                    if let Some(settings) = new_settings {
-                        shared.settings_changed.dispatch(settings);
+            async move {
+                let Some(shared) = weak_shared.upgrade() else {
+                    return;
+                };
+                let (new_settings, new_device_state) = {
+                    let mut state = shared.state.lock().unwrap();
+                    // `Present(None)` is the boot-crash-risk "already
+                    // present, deliberately not probed" transition (see
+                    // `device::Device`'s doc comment) - `format` is left
+                    // exactly as it was, so `DeviceState` correctly stays
+                    // unavailable until a genuine transition actually
+                    // probes the card.
+                    match status {
+                        DeviceStatus::Present(Some(info)) => state.format = Some(info),
+                        DeviceStatus::Present(None) => {}
+                        DeviceStatus::Absent => state.format = None,
                     }
-                    if let Some(device_state) = new_device_state {
-                        shared.device_state_changed.dispatch(device_state);
-                    }
+                    // The startup defaults were picked before the card
+                    // had said anything about itself; now that it has,
+                    // fall back to a combination it actually reports -
+                    // but never overwrite settings a person chose.
+                    let new_settings = if state.settings_are_defaults {
+                        let defaults = default_settings(state.format.as_ref());
+                        (defaults != state.settings).then(|| {
+                            state.settings = defaults;
+                            defaults
+                        })
+                    } else {
+                        None
+                    };
+                    (new_settings, refresh_device_state(&mut state))
+                };
+                if let Some(settings) = new_settings {
+                    shared.settings_changed.dispatch(settings);
                 }
-            });
-            Shared {
-                device,
-                video_bus_tx,
-                video_bus_rx,
-                force_keyframe: Arc::new(AtomicBool::new(false)),
-                state,
-                settings_changed: Arc::new(EventEmitter::new()),
-                device_state_changed: Arc::new(EventEmitter::new()),
-                _device_status_sub: sub,
+                if let Some(device_state) = new_device_state {
+                    shared.device_state_changed.dispatch(device_state);
+                }
             }
         });
+        let _ = shared.device_status_sub.set(subscription);
 
         Self { shared }
     }
@@ -287,7 +294,13 @@ impl CaptureEngine {
             return Err(NoDevice);
         }
 
-        let ended = Arc::new(EventEmitter::new());
+        // A `StateEmitter`: the caller gets this stream back before it can
+        // subscribe, and does await-heavy work (a WebRTC session adds and
+        // negotiates a video track) in between, so a pass that fails fast
+        // ends the stream while nobody is listening yet. Latching it means
+        // that subscriber is still told, instead of being stranded with a
+        // track for a pass that is already dead (issue #023).
+        let ended = Arc::new(StateEmitter::new());
         {
             let mut state = self.shared.state.lock().unwrap();
             let should_start = state.live.increment();
@@ -428,7 +441,7 @@ struct StreamInner {
     /// below - that's the test that would catch a regression back to
     /// `std::sync::Mutex`.
     frames: AsyncMutex<video_bus::Receiver>,
-    ended: Arc<EventEmitter<()>>,
+    ended: Arc<StateEmitter<()>>,
     _live: LiveMarker,
 }
 
@@ -439,6 +452,12 @@ impl CaptureStream {
     /// same stream (see `start_pass`'s supervisor: each stream's emitter
     /// is drained out of `ended_emitters` the one time it's dispatched
     /// to).
+    ///
+    /// Subscribing *after* that moment fires the callback straight away
+    /// rather than registering one that can never fire: whether this
+    /// stream has ended is state, not just an edge (see
+    /// `device::StateEmitter`). Still exactly one notification per
+    /// subscriber either way.
     pub fn add_event_listener<F, Fut>(&self, callback: F) -> Subscription<()>
     where
         F: Fn(()) -> Fut + Send + Sync + 'static,
@@ -677,6 +696,39 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.expect("ended should fire").expect("channel should still be open");
 
         // Never fires again for the same stream.
+        assert!(tokio::time::timeout(Duration::from_millis(200), rx.recv()).await.is_err(), "ended must not fire a second time for the same stream");
+
+        drop(stream);
+    }
+
+    #[tokio::test]
+    async fn ended_reaches_a_consumer_that_subscribes_after_the_pass_already_failed() {
+        let tmp = TempDevicePath::new();
+        let device = present_device_at(tmp.as_str()).await;
+        let engine = CaptureEngine::new(device);
+
+        let stream = engine.request_stream().await.expect("device is present");
+
+        // The window this test is about: a real consumer
+        // (`rtc::session::try_attach_video`) gets its stream, then awaits
+        // an `add_track` before it subscribes. The fake path's pass fails
+        // immediately, so waiting here puts the whole `ended` dispatch
+        // strictly before the subscription below - deterministically, not
+        // as a race.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!engine.pass_running(), "the fake device's pass should already have failed by now");
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _sub = stream.add_event_listener(move |()| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(());
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.expect("a consumer subscribing after its pass died must still be told the stream ended").expect("channel should still be open");
+
+        // Late or not, still exactly one notification.
         assert!(tokio::time::timeout(Duration::from_millis(200), rx.recv()).await.is_err(), "ended must not fire a second time for the same stream");
 
         drop(stream);

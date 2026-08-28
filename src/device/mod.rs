@@ -22,7 +22,7 @@ mod uevent;
 use std::fmt;
 use std::future::Future;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// The emitter/subscription pair is owned here because `Device`'s
@@ -30,8 +30,9 @@ use std::time::Duration;
 /// `add_event_listener` in the codebase returns a `Subscription`, so
 /// `capture` and `rtc` have to be able to name it. Re-exporting rather
 /// than duplicating keeps one implementation and adds no dependency edge:
-/// both already depend on `device`.
-pub use event::{EventEmitter, Subscription};
+/// both already depend on `device`. `StateEmitter` comes along for the
+/// same reason - `capture` needs it for a `CaptureStream`'s `ended`.
+pub use event::{EventEmitter, StateEmitter, Subscription};
 
 /// The driver types themselves stay unexported - a device kind's whole
 /// public surface is its `Device<D>` alias, the handle its `open` hands
@@ -103,8 +104,13 @@ pub enum DeviceStatus<Info> {
 
 struct DeviceInner<D: DeviceDriver> {
     device_path: String,
-    events: Arc<EventEmitter<DeviceStatus<D::Info>>>,
-    current: Mutex<DeviceStatus<D::Info>>,
+    /// A `StateEmitter`, not a plain `EventEmitter`: the presence task is
+    /// already running by the time anyone can call `add_event_listener`
+    /// (`spawn` starts it), so a subscriber can arrive after the first
+    /// status was published and must still be told what it is. It doubles
+    /// as this device's current-status store, so `is_present`/`open` can
+    /// never disagree with what subscribers were last told.
+    events: Arc<StateEmitter<DeviceStatus<D::Info>>>,
 }
 
 /// One generic presence/capability-tracking core, parameterized by a
@@ -151,7 +157,7 @@ impl<D: DeviceDriver> Device<D> {
 
     fn spawn_at_path(device_path: impl Into<String>) -> Self {
         let device_path = device_path.into();
-        let inner = Arc::new(DeviceInner { device_path, events: Arc::new(EventEmitter::new()), current: Mutex::new(DeviceStatus::Absent) });
+        let inner = Arc::new(DeviceInner { device_path, events: Arc::new(StateEmitter::new()) });
 
         let task_inner = Arc::clone(&inner);
         tokio::spawn(run_presence_task::<D>(task_inner));
@@ -159,7 +165,11 @@ impl<D: DeviceDriver> Device<D> {
         Self { inner }
     }
 
-    /// Mirrors `addEventListener('devicechange', cb)`.
+    /// Mirrors `addEventListener('devicechange', cb)`. A listener that
+    /// subscribes after the presence task has already published a status
+    /// is called once with that status straight away, so it can't be left
+    /// waiting for a transition that already happened (see
+    /// `StateEmitter`).
     pub fn add_event_listener<F, Fut>(&self, callback: F) -> Subscription<DeviceStatus<D::Info>>
     where
         F: Fn(DeviceStatus<D::Info>) -> Fut + Send + Sync + 'static,
@@ -174,9 +184,10 @@ impl<D: DeviceDriver> Device<D> {
     /// itself - the path stays private to this module (see the module
     /// doc comment).
     pub fn open(&self, settings: &D::Settings) -> Result<D::Open, OpenError> {
-        match &*self.inner.current.lock().unwrap() {
-            DeviceStatus::Present(_) => D::open(&self.inner.device_path, settings),
-            DeviceStatus::Absent => Err(OpenError("device is not currently present".to_string())),
+        if self.is_present() {
+            D::open(&self.inner.device_path, settings)
+        } else {
+            Err(OpenError("device is not currently present".to_string()))
         }
     }
 
@@ -188,7 +199,7 @@ impl<D: DeviceDriver> Device<D> {
     /// while nothing else is already streaming from it, so `capture`
     /// checks presence per consumer but opens once per encode pass.
     pub fn is_present(&self) -> bool {
-        matches!(&*self.inner.current.lock().unwrap(), DeviceStatus::Present(_))
+        matches!(self.inner.events.latest(), Some(DeviceStatus::Present(_)))
     }
 
     /// Test-only: builds a `Device` in a given status without spawning
@@ -196,7 +207,11 @@ impl<D: DeviceDriver> Device<D> {
     /// tested without real hardware, a real device path, or real timing.
     #[cfg(test)]
     fn from_status(device_path: impl Into<String>, status: DeviceStatus<D::Info>) -> Self {
-        Self { inner: Arc::new(DeviceInner { device_path: device_path.into(), events: Arc::new(EventEmitter::new()), current: Mutex::new(status) }) }
+        let events = Arc::new(StateEmitter::new());
+        // No listener exists yet, so this only records the status - it
+        // spawns nothing and needs no runtime.
+        events.dispatch(status);
+        Self { inner: Arc::new(DeviceInner { device_path: device_path.into(), events }) }
     }
 }
 
@@ -218,7 +233,6 @@ async fn run_presence_task<D: DeviceDriver>(inner: Arc<DeviceInner<D>>) {
     loop {
         let device_present = Path::new(&inner.device_path).exists();
         if let Some(status) = state.observe(&inner.device_path, device_present) {
-            *inner.current.lock().unwrap() = status.clone();
             inner.events.dispatch(status);
         }
 
@@ -423,6 +437,40 @@ mod tests {
 
         let device = Device::<Fake>::from_status("dummy", DeviceStatus::Present(Some(FakeInfo(1))));
         assert_eq!(device.open(&()).unwrap(), "opened");
+    }
+
+    #[tokio::test]
+    async fn a_late_subscriber_is_told_the_status_it_missed() {
+        struct Fake;
+        impl DeviceDriver for Fake {
+            const UEVENT_SUBSYSTEM: &'static str = "fake";
+            const PATH_ENV_VAR: &'static str = "SIMPLE_KVM_FAKE_DEVICE";
+            const DEFAULT_PATH: &'static str = "/nonexistent/simple-kvm-fake-device";
+            type Info = FakeInfo;
+            type Settings = ();
+            type Open = ();
+            fn probe(_device_path: &str) -> Option<Self::Info> {
+                Some(FakeInfo(4))
+            }
+            fn open(_device_path: &str, _settings: &Self::Settings) -> Result<Self::Open, OpenError> {
+                Ok(())
+            }
+        }
+
+        // `spawn` starts the presence task before its caller can possibly
+        // subscribe, so the first status can be published with nobody
+        // listening - a subscriber arriving afterwards must still be told.
+        let device = Device::<Fake>::from_status("dummy", DeviceStatus::Present(Some(FakeInfo(4))));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _sub = device.add_event_listener(move |status| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(status);
+            }
+        });
+
+        let received = tokio::time::timeout(StdDuration::from_secs(1), rx.recv()).await.expect("a listener subscribing after the first status must still be told").expect("channel should still be open");
+        assert_eq!(received, DeviceStatus::Present(Some(FakeInfo(4))));
     }
 
     #[test]
