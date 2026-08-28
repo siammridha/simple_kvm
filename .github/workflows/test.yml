@@ -26,6 +26,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Runs before the build because it needs no toolchain and no
+      # dependencies - a boundary violation is reported in seconds instead of
+      # after a full compile. See docs/ARCHITECTURE.md section 8.
+      - name: Architecture boundary check
+        run: ./check-architecture.sh
+
       - name: Install build dependencies
         run: |
           sudo apt-get update

@@ -201,6 +201,22 @@ Anything not in this table is a violation — including `web → device/capture/
 
 ## 8. Enforcement
 
+**`./check-architecture.sh` runs these checks**, and CI runs it on every push and pull request
+(`.github/workflows/test.yml`), before the build, so a violation fails the job. It exits non-zero
+naming the file, the line and the invariant that broke.
+
+Checks 1–3 it decides entirely. Checks 4 and 5 are partly a judgement call, so it proves only the
+mechanical half of each and prints, on every run, which half that is — **a green run is not proof
+that all five hold**. What it does not decide: that the body of `main` only constructs, wires and
+starts, and that every `web` handler body is free of SDP/media/HID logic and ends in an `rtc` call.
+Those still need a reviewer.
+
+The script encodes the exceptions recorded above — `main.rs` is exempt from check 2 entirely (§7:
+naming a concrete type to construct it is not a dependency edge), and `rtc` may name
+`device::DeviceStatus` and `device::Subscription` and nothing else out of `device` (§4). `main.rs`'s
+logging setup and startup banner (§7) are the only functions check 4 permits there besides `main`.
+When one of those exceptions changes here, change it in the script too.
+
 The `device` module is a directory (`src/device/`); check 1 excludes both that and the older
 single-file spelling (`src/device.rs`) so it keeps working either way. The same applies to any
 other module named below.

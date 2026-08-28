@@ -186,8 +186,9 @@ for why this replaced an earlier WebTransport-based design.
   the release binary in a native x86_64 Alpine container (matching the
   Wyse 3040 exactly, so it's a normal build, not a cross-compile) and
   publishes it as a GitHub Release.
-- `.github/workflows/test.yml` - on every push and pull request, builds
-  the crate and runs the full `cargo nextest run` suite. It runs on a
+- `.github/workflows/test.yml` - on every push and pull request, runs
+  `./check-architecture.sh` (first, since it needs no toolchain), then
+  builds the crate and runs the full `cargo nextest run` suite. It runs on a
   plain `ubuntu-latest` runner rather than the release job's Alpine
   container, because it only has to compile and run tests - it has no
   reason to match the device's musl libc, and apt already has the
@@ -339,7 +340,15 @@ open in a firewall today, since `deploy/install.sh` doesn't set one up.
 ```sh
 cargo build
 cargo nextest run
+./check-architecture.sh
 ```
+
+`check-architecture.sh` checks the module boundaries listed in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) section 8: no device path
+outside `device/`, no import edge that isn't in the allowed table, and no
+config or extra code in `main.rs`. It needs no toolchain and prints, every
+run, which of the five checks it decides on its own and which still need a
+human reading the code.
 
 `e2e/browser-test.sh` drives the actual page with `agent-browser` against
 the container's system Chromium. No real capture card or CH9329 is
