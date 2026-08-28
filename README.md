@@ -352,6 +352,6 @@ linked PTY pair - the app just needs something to open at `SERIAL_PATH`,
 real hardware or not), which is enough to exercise the mouse-mode half of
 Save. A genuine mid-session replug can't be simulated this way (it needs
 a real kernel uevent this container has no privileged way to generate) -
-that half is covered by Rust tests in `src/device.rs` and
+that half is covered by Rust tests in `src/device/mod.rs` and
 `src/capture/engine.rs` instead. This script needs `socat` installed;
 it's a layer on top of the Rust tests, not a replacement for them.

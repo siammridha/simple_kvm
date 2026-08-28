@@ -14,10 +14,9 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::capture::driver::CaptureDevice;
 use crate::capture::v4l2::{Resolution, SupportedFormat};
+use crate::capture::video_bus::{self, FrameEnvelope};
 use crate::config::CaptureSettings;
-use crate::device::DeviceStatus;
-use crate::event::{EventEmitter, Subscription};
-use crate::video_bus::{self, FrameEnvelope};
+use crate::device::{DeviceStatus, EventEmitter, Subscription};
 
 /// Startup default, falling back to the device's first reported
 /// resolution/frame-rate combination if this specific one isn't

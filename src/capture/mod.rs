@@ -2,6 +2,7 @@ pub mod driver;
 pub mod engine;
 pub mod h264;
 pub mod v4l2;
+mod video_bus;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -11,9 +12,13 @@ use tokio::sync::watch;
 
 use crate::config::{CaptureSettings, DeviceState, ResolutionFrameRates};
 use crate::device::DeviceStatus;
-use crate::video_bus::{self, FrameEnvelope};
 use driver::CaptureDevice;
 use v4l2::SupportedFormat;
+
+/// The frame bus itself stays private to `capture`, but the frame it
+/// carries is what a session pulls off a `CaptureStream`, so the type has
+/// to cross this module's boundary.
+pub use video_bus::FrameEnvelope;
 
 /// Publishes `DeviceState` for the web UI from the capture device's own
 /// presence/capability stream (`Device<CaptureDriver>`, via `device`) and

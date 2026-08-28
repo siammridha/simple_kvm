@@ -11,7 +11,7 @@ The expensive part - reading frames off the capture card and encoding them
 to H.264 on the GPU - already happens exactly once, no matter how many
 browser tabs are connected. `CaptureManager::run` (`src/capture/mod.rs`)
 runs one capture+encode pass, and its output goes onto `video_bus`
-(`src/video_bus.rs`), a `tokio::sync::watch` channel carrying the latest
+(`src/capture/video_bus.rs`), a `tokio::sync::watch` channel carrying the latest
 encoded frame. Every session's `session::handle` (`src/rtc/session.rs`)
 clones its own `Receiver` of that same channel and reads the same encoded
 bytes.

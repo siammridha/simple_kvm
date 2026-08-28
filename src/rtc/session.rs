@@ -32,12 +32,11 @@ use webrtc::rtp_transceiver::RtpSender;
 
 use crate::capture::engine::{CaptureEngine, CaptureStream, NoDevice};
 use crate::capture::v4l2::{Resolution, SupportedFormat};
+use crate::capture::FrameEnvelope;
 use crate::hid::keymap::{self, KeyCode};
 use crate::hid::writer::SerialCommand;
 use crate::config::{CaptureSettings, DeviceState, MouseMode};
-use crate::device::DeviceStatus;
-use crate::event::Subscription;
-use crate::video_bus::FrameEnvelope;
+use crate::device::{DeviceStatus, Subscription};
 
 use super::protocol::{ControlMessage, InputEvent, MouseModeWire, ServerMessage};
 

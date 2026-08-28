@@ -1,11 +1,8 @@
 mod capture;
 mod config;
 mod device;
-mod event;
 mod hid;
 mod rtc;
-mod uevent;
-mod video_bus;
 mod web;
 
 use std::env;

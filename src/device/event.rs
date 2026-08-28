@@ -8,8 +8,10 @@
 //!
 //! Used by `Device<D>` for its `devicechange` events and by
 //! `CaptureEngine` for a `CaptureStream`'s `ended` event; `rtc::session`
-//! holds the `Subscription`s those hand back.
-#![allow(dead_code)]
+//! holds the `Subscription`s those hand back. It lives inside `device`
+//! rather than at the top level so it isn't a shared utility module
+//! outside the dependency graph; `device` re-exports both types for the
+//! other two.
 
 use std::collections::HashMap;
 use std::future::Future;

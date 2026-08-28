@@ -35,7 +35,7 @@ Each module lists what it is **responsible for**, **owns exclusively**, **may de
 
 - **Responsible for:** detecting plug/unplug, probing a device's capabilities when it appears, and notifying subscribers. **Sole owner of every OS device path.**
 - **How it works:** a generic `Device<D: DeviceDriver>` core (presence task + event dispatch + path encapsulation) plus per-kind **drivers** (`CaptureDriver`, `Ch9329Driver`, future UART). One instance per physical device; each reads its own path from its own config. `Device::open()` is the only path-touching call and hands back an OS handle, never the path.
-- **Owns exclusively:** all device paths and path→device mapping; the generic core **and** the drivers (their `probe`/`open` is the only code that touches a path or does a raw OS open); the `devicechange` events; `open()`.
+- **Owns exclusively:** all device paths and path→device mapping; the generic core **and** the drivers (their `probe`/`open` is the only code that touches a path or does a raw OS open); the `devicechange` events; `open()`; the kernel uevent listener; and the `EventEmitter`/`Subscription` pair (§5.1), which it **re-exports** publicly because every `add_event_listener` in the codebase hands back a `Subscription`.
 - **May depend on:** the OS/kernel only. Leaf of the graph.
 - **Must not:** encode, negotiate, speak the CH9329 protocol, or run HTTP.
 
@@ -52,7 +52,7 @@ Each module lists what it is **responsible for**, **owns exclusively**, **may de
 
 - **Responsible for:** turning capture settings into a per-consumer video stream.
 - **How it works:** `CaptureEngine` holds a `CaptureDevice`. `request_stream(settings) -> CaptureStream` opens via the Device API and returns a per-consumer stream (= `MediaStreamTrack`) carrying an `ended` event; it fails the same way `open()` does when the device is absent.
-- **Owns exclusively:** the encode loop, the `CaptureStream` type and its `ended` signal, and the current capture settings (held in memory).
+- **Owns exclusively:** the encode loop, the frame bus the encode pass publishes to, the `CaptureStream` type and its `ended` signal, and the current capture settings (held in memory). The bus stays private; only `FrameEnvelope`, the frame a session pulls off a stream, is re-exported.
 - **May depend on:** `device` (holds a `CaptureDevice`: subscribe + `open`).
 - **Must not:** know the device path; talk to `rtc`/`hid`/`web`; own peer sessions.
 
@@ -133,8 +133,8 @@ graph TD
 `CaptureEngine::add_event_listener`, which forwards the `Device<CaptureDriver>` events of the device
 the engine already holds. One module owning the device handle and re-exposing its events is one edge
 fewer than `rtc` holding a second handle, so `rtc` must not grow one. `rtc` does name
-`device::DeviceStatus`, but that is a type-only import — it is the payload type of the subscription
-it gets from `capture` — not a dependency edge.
+`device::DeviceStatus` and `device::Subscription`, but those are type-only imports — the payload
+type and the handle type of the subscription it gets from `capture` — not a dependency edge.
 
 Anything not in this table is a violation — including `web → device/capture/hid`, `capture → rtc`,
 `hid → rtc`, and any edge into `device` other than subscribe/open.
@@ -146,6 +146,7 @@ Anything not in this table is a violation — including `web → device/capture/
 ### 5.1 Events — callback subscriptions (`EventTarget`-style) **[decided]**
 
 - One `EventEmitter<T>` per event kind (typed payload; a mismatch is a compile error, not a silent no-op). Publishers include `Device` (`devicechange`) and `CaptureStream` (`ended`).
+- The emitter is **not** a shared utility module: it lives in `device` (§3.1), whose `devicechange` events are its reason to exist, and is re-exported from there. `capture` and `rtc` reach it over the `capture → device` / type-only-`device` imports they already have, so it costs no extra edge.
 - `add_event_listener(cb) -> Subscription`. The `Subscription` **auto-deregisters on drop** (mirrors `removeEventListener`) — no manual cleanup to forget, no listener left calling into dropped state.
 - `dispatch` fires each listener via its own `tokio::spawn`, **fire-and-forget, no join**, so one slow or broken listener can't stall another listener or the caller.
 - **Not** a pull-based `watch` channel, and **not** Rayon/OS-thread dispatch — that path (see `docs/parallel-event-callbacks-rust.md`) was evaluated and rejected because these callbacks are async I/O, not CPU-heavy. If a specific listener body *is* CPU-heavy, wrap it in `spawn_blocking`/Rayon rather than changing the dispatch model.
@@ -178,12 +179,12 @@ Anything not in this table is a violation — including `web → device/capture/
 
 ## 8. Enforcement
 
-The `device` module is a single file (`src/device.rs`) today and may become a directory
-(`src/device/`) later; check 1 excludes both spellings so it keeps working either way. The same
-applies to any other module named below.
+The `device` module is a directory (`src/device/`); check 1 excludes both that and the older
+single-file spelling (`src/device.rs`) so it keeps working either way. The same applies to any
+other module named below.
 
 1. **Path secrecy (I3):** `rg '/dev/' src --glob '!src/device.rs' --glob '!src/device/**'` returns nothing, and so does the same search for device `*_PATH` env reads (`rg '_PATH' src --glob '!src/device.rs' --glob '!src/device/**'`).
-2. **Dependency edges (I5):** each module's cross-module `use crate::` matches only §4. `web` imports only `rtc`; `capture`/`hid` import only `device`; `rtc` imports only `capture` and `hid` (plus `device::DeviceStatus`, the type-only payload of the subscription `capture` hands it — see §4); `device` imports no sibling.
+2. **Dependency edges (I5):** each module's cross-module `use crate::` matches only §4. `web` imports only `rtc`; `capture`/`hid` import only `device`; `rtc` imports only `capture` and `hid` (plus `device::DeviceStatus` and `device::Subscription`, the type-only payload and handle of the subscription `capture` hands it — see §4); `device` imports no sibling.
 3. **Config locality (I2):** module config, paths included, is defined and read inside that module; `main.rs` has no config literals or path strings — `rg 'env::var|/dev/' src/main.rs` returns nothing.
 4. **Composition root (I1):** `main.rs` is construct/wire/start only.
 5. **Web is thin (I6):** no SDP/media/HID logic in `web`; every handler ends in an `rtc` call. The HTTP server itself lives in `web` — `rg 'axum|TcpListener' src --glob '!src/web/**'` returns nothing.

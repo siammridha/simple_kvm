@@ -7,7 +7,10 @@
 //! (`hid::device::Ch9329Driver`) each plug in their own `DeviceDriver`
 //! impl for *how* to probe/open; this module owns everything
 //! device-kind-independent: presence detection, event dispatch (via
-//! `crate::event`), and encapsulating the raw device path.
+//! `event`), and encapsulating the raw device path.
+
+mod event;
+mod uevent;
 
 use std::fmt;
 use std::future::Future;
@@ -15,8 +18,13 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::event::{EventEmitter, Subscription};
-use crate::uevent;
+/// The emitter/subscription pair is owned here because `Device`'s
+/// `devicechange` events are its original reason to exist, but every
+/// `add_event_listener` in the codebase returns a `Subscription`, so
+/// `capture` and `rtc` have to be able to name it. Re-exporting rather
+/// than duplicating keeps one implementation and adds no dependency edge:
+/// both already depend on `device`.
+pub use event::{EventEmitter, Subscription};
 
 /// Backoff-free fallback poll interval, used only when the kernel uevent
 /// listener itself failed to open (see `uevent::UeventListener::open`) -
