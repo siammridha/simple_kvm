@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputEvent {
     /// A physical key's press/release state changed. `code` is a
-    /// `KeyboardEvent.code` value (e.g. `"KeyA"`); translated via
-    /// `hid::keymap`.
+    /// `KeyboardEvent.code` value (e.g. `"KeyA"`); `hid` is what turns it
+    /// into a HID report.
     KeyEvent { pressed: bool, code: String },
     /// Absolute cursor position as a fraction of the video frame.
     MouseAbsoluteMove { x_frac: f32, y_frac: f32 },
@@ -93,7 +93,7 @@ pub enum ServerMessage {
     /// Whether the CH9329 is plugged in right now — the HID counterpart of
     /// `DeviceState` (which only covers the capture card).
     HidState { available: bool },
-    Settings { capture: crate::capture::CaptureSettings, mouse_mode: crate::config::MouseMode },
+    Settings { capture: crate::capture::CaptureSettings, mouse_mode: crate::hid::MouseMode },
     /// A fresh SDP offer starting a second (or later) round of
     /// negotiation, pushed whenever `rtc::Handler::on_negotiation_needed`
     /// fires after the initial connection is already up — e.g. the

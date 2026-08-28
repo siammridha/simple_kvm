@@ -1,15 +1,14 @@
 //! Per-connection handling: one task juggling video, input, and control
 //! over `tokio::select!` — sending video frames from this session's own
 //! `CaptureStream` once one is attached (see `CaptureEngine::
-//! request_stream`), translating `input` data channel messages into
-//! `SerialCommand`s, and reading `control` data channel JSON (the Save
+//! request_stream`), forwarding `input` data channel messages to `hid` as
+//! `InputCommand`s, and reading `control` data channel JSON (the Save
 //! button's settings update, paste, SDP renegotiation answers). Settings
-//! changes only touch the shared `watch<Settings>` — in memory only, the
-//! connection itself is never disturbed, so applying new settings never
-//! drops the session.
+//! changes only touch in-memory state — the shared `watch<Settings>` for
+//! capture, `hid` itself for mouse mode; the connection is never
+//! disturbed, so applying new settings never drops the session.
 
 use anyhow::{Context, Result};
-use std::collections::HashSet;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -33,9 +32,8 @@ use webrtc::rtp_transceiver::RtpSender;
 use crate::capture::FrameEnvelope;
 use crate::capture::engine::{CaptureEngine, CaptureStream, NoDevice};
 use crate::capture::{CaptureSettings, Resolution, SupportedFormat};
-use crate::config::{DeviceState, MouseMode};
-use crate::hid::keymap::{self, KeyCode};
-use crate::hid::{Hid, SerialCommand};
+use crate::config::DeviceState;
+use crate::hid::{Hid, InputCommand, MouseMode};
 use crate::device::{DeviceStatus, Subscription};
 
 use super::protocol::{ControlMessage, InputEvent, MouseModeWire, ServerMessage};
@@ -51,7 +49,8 @@ pub struct SessionContext {
     pub hid: Arc<Hid>,
     pub capture_settings_tx: watch::Sender<CaptureSettings>,
     pub capture_settings_rx: watch::Receiver<CaptureSettings>,
-    pub mouse_mode_tx: watch::Sender<MouseMode>,
+    /// Change signal only - `hid` owns the value itself. See
+    /// `super::SharedChannels::mouse_mode_rx`.
     pub mouse_mode_rx: watch::Receiver<MouseMode>,
     pub device_state_rx: watch::Receiver<DeviceState>,
     pub hid_connected_rx: watch::Receiver<bool>,
@@ -286,7 +285,6 @@ pub async fn handle(
     let mut mouse_mode_rx = ctx.mouse_mode_rx.clone();
     let mut hid_connected_rx = ctx.hid_connected_rx.clone();
     let mut pc_state_rx = ctx.pc_state_rx.clone();
-    let mut keyboard = KeyboardState::default();
 
     // Forwards `CaptureEngine`'s own device-presence events into this
     // session's `select!` loop - what drives retrying `request_stream()`
@@ -390,7 +388,7 @@ pub async fn handle(
                 match event {
                     Some(DataChannelEvent::OnMessage(msg)) => {
                         if let Some(event) = InputEvent::parse(&msg.data) {
-                            handle_input_event(event, &mut keyboard, &ctx).await;
+                            handle_input_event(event, &ctx).await;
                         }
                     }
                     Some(DataChannelEvent::OnClose) | None => input_active = false,
@@ -410,7 +408,7 @@ pub async fn handle(
                         // `capture::watch_device_state` last cached from probing
                         // the card when it was plugged in - opening this channel
                         // doesn't trigger a fresh probe of its own.
-                        if push_initial_state(&outbound_tx, &mut device_state_rx, &mut hid_connected_rx, &mut capture_settings_rx, &mut mouse_mode_rx).is_ok() {
+                        if push_initial_state(&outbound_tx, &mut device_state_rx, &mut hid_connected_rx, &mut capture_settings_rx, ctx.hid.mouse_mode()).is_ok() {
                             control_open.store(true, Ordering::Relaxed);
                         }
                     }
@@ -436,7 +434,7 @@ pub async fn handle(
             changed = capture_settings_rx.changed(), if control_open.load(Ordering::Relaxed) => {
                 if changed.is_ok() {
                     let capture = *capture_settings_rx.borrow_and_update();
-                    let _ = outbound_tx.send(ServerMessage::Settings { capture, mouse_mode: *mouse_mode_rx.borrow() });
+                    let _ = outbound_tx.send(ServerMessage::Settings { capture, mouse_mode: ctx.hid.mouse_mode() });
                 }
             }
             changed = mouse_mode_rx.changed(), if control_open.load(Ordering::Relaxed) => {
@@ -480,39 +478,6 @@ pub async fn handle(
     Ok(())
 }
 
-#[derive(Default)]
-struct KeyboardState {
-    held: HashSet<String>,
-}
-
-impl KeyboardState {
-    /// Updates held-key state and returns the full report to send, unless
-    /// `code` isn't a key we recognize.
-    fn apply(&mut self, code: &str, pressed: bool) -> Option<(u8, [u8; 6])> {
-        keymap::lookup(code)?;
-        if pressed {
-            self.held.insert(code.to_string());
-        } else {
-            self.held.remove(code);
-        }
-
-        let mut modifiers = 0u8;
-        let mut keys = [0u8; 6];
-        let mut slot = 0;
-        for held_code in &self.held {
-            match keymap::lookup(held_code) {
-                Some(KeyCode::Modifier(bit)) => modifiers |= bit,
-                Some(KeyCode::Usage(usage)) if slot < keys.len() => {
-                    keys[slot] = usage;
-                    slot += 1;
-                }
-                _ => {}
-            }
-        }
-        Some((modifiers, keys))
-    }
-}
-
 /// Enqueues the full current state (device availability, HID connectivity,
 /// settings) onto the outbound queue for the just-opened `control` channel.
 /// Needed because `changed()` on a receiver only fires for changes from
@@ -523,7 +488,7 @@ fn push_initial_state(
     device_state_rx: &mut watch::Receiver<DeviceState>,
     hid_connected_rx: &mut watch::Receiver<bool>,
     capture_settings_rx: &mut watch::Receiver<CaptureSettings>,
-    mouse_mode_rx: &mut watch::Receiver<MouseMode>,
+    mouse_mode: MouseMode,
 ) -> Result<()> {
     let device_state = device_state_rx.borrow_and_update().clone();
     outbound_tx.send(ServerMessage::DeviceState(device_state)).map_err(|_| anyhow::anyhow!("outbound queue closed"))?;
@@ -532,7 +497,6 @@ fn push_initial_state(
         .send(ServerMessage::HidState { available: hid_available })
         .map_err(|_| anyhow::anyhow!("outbound queue closed"))?;
     let capture = *capture_settings_rx.borrow_and_update();
-    let mouse_mode = *mouse_mode_rx.borrow_and_update();
     outbound_tx.send(ServerMessage::Settings { capture, mouse_mode }).map_err(|_| anyhow::anyhow!("outbound queue closed"))?;
     Ok(())
 }
@@ -590,19 +554,19 @@ fn is_keyframe_request(packet: &dyn Packet) -> bool {
 /// is exactly what shows up as "typing/clicking lags".
 const SLOW_ENQUEUE_THRESHOLD: Duration = Duration::from_millis(50);
 
-async fn handle_input_event(event: InputEvent, keyboard: &mut KeyboardState, ctx: &SessionContext) {
+/// Says what the peer did and hands it to `hid`. Nothing here knows how a
+/// key or a click reaches the CH9329 - which keys are held, what a usage
+/// code is and what a report looks like all live behind `hid::send`.
+async fn handle_input_event(event: InputEvent, ctx: &SessionContext) {
     let start = Instant::now();
     let cmd = match event {
         InputEvent::KeyEvent { pressed, code } => {
-            let Some((modifiers, keys)) = keyboard.apply(&code, pressed) else {
-                return;
-            };
             tracing::debug!(code = %code, pressed, "typing: key event received from browser");
-            SerialCommand::KeyReport { modifiers, keys }
+            InputCommand::Key { code, pressed }
         }
-        InputEvent::MouseAbsoluteMove { x_frac, y_frac } => SerialCommand::MouseAbsoluteMove { x_frac, y_frac },
-        InputEvent::MouseRelativeMove { buttons, dx, dy, wheel } => SerialCommand::MouseRelativeMove { buttons, dx, dy, wheel },
-        InputEvent::MouseButtons { buttons, wheel } => SerialCommand::MouseButtons { buttons, wheel },
+        InputEvent::MouseAbsoluteMove { x_frac, y_frac } => InputCommand::PointerMoveAbsolute { x_frac, y_frac },
+        InputEvent::MouseRelativeMove { buttons, dx, dy, wheel } => InputCommand::PointerMoveRelative { buttons, dx, dy, wheel },
+        InputEvent::MouseButtons { buttons, wheel } => InputCommand::PointerButtons { buttons, wheel },
     };
     let kind = cmd.kind();
     let sent = ctx.hid.send(cmd).await.is_ok();
@@ -631,23 +595,23 @@ fn handle_control_message(msg: ControlMessage, ctx: &SessionContext) {
                 });
                 tracing::info!(width = capture.width, height = capture.height, fps = capture.fps, "capture settings updated");
             }
-            // The server doesn't need mouse mode to translate input events —
-            // that's purely which message variant the client sends (see
-            // `InputEvent`) — but it's tracked here anyway so it can be
-            // reported back as the default for the life of this run.
+            // `hid` owns the value - it's the module that decides what
+            // gets written to the chip - and its change event is what
+            // reaches every already-open tab (see
+            // `super::SharedChannels::new`).
             if let Some(mouse_mode) = mouse_mode {
                 let mouse_mode = match mouse_mode {
                     MouseModeWire::Absolute => MouseMode::Absolute,
                     MouseModeWire::Relative => MouseMode::Relative,
                 };
-                ctx.mouse_mode_tx.send_replace(mouse_mode);
+                ctx.hid.set_mouse_mode(mouse_mode);
                 tracing::info!(?mouse_mode, "mouse mode updated");
             }
         }
         ControlMessage::Paste { text } => {
             let hid = Arc::clone(&ctx.hid);
             tokio::spawn(async move {
-                let _ = hid.send(SerialCommand::PasteText(text)).await;
+                let _ = hid.send(InputCommand::PasteText(text)).await;
             });
         }
         // Matched directly in `handle`'s `control.poll()` arm, before it
@@ -669,7 +633,9 @@ mod tests {
     fn test_ctx() -> SessionContext {
         let (capture_settings_tx, capture_settings_rx) =
             watch::channel(CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5 });
-        let (mouse_mode_tx, mouse_mode_rx) = watch::channel(MouseMode::Absolute);
+        // Only a change signal in production too (see
+        // `SharedChannels::new`); the value itself comes from `hid`.
+        let (_mouse_mode_tx, mouse_mode_rx) = watch::channel(MouseMode::Absolute);
         let (_device_state_tx, device_state_rx) = watch::channel(DeviceState::default());
         let (_hid_connected_tx, hid_connected_rx) = watch::channel(false);
         let (_pc_state_tx, pc_state_rx) = watch::channel(RTCPeerConnectionState::New);
@@ -685,7 +651,6 @@ mod tests {
             hid: Hid::spawn_for_test(),
             capture_settings_tx,
             capture_settings_rx,
-            mouse_mode_tx,
             mouse_mode_rx,
             device_state_rx,
             hid_connected_rx,
@@ -704,7 +669,7 @@ mod tests {
         );
 
         assert_eq!(*ctx.capture_settings_rx.borrow(), CaptureSettings { resolution: Resolution { width: 1920, height: 1080 }, fps: 25 });
-        assert_eq!(*ctx.mouse_mode_rx.borrow(), MouseMode::Absolute);
+        assert_eq!(ctx.hid.mouse_mode(), MouseMode::Absolute);
     }
 
     #[tokio::test]
@@ -717,7 +682,7 @@ mod tests {
             *ctx.capture_settings_rx.borrow(),
             CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5 }
         );
-        assert_eq!(*ctx.mouse_mode_rx.borrow(), MouseMode::Relative);
+        assert_eq!(ctx.hid.mouse_mode(), MouseMode::Relative);
     }
 
     #[tokio::test]
@@ -730,7 +695,7 @@ mod tests {
             *ctx.capture_settings_rx.borrow(),
             CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5 }
         );
-        assert_eq!(*ctx.mouse_mode_rx.borrow(), MouseMode::Absolute);
+        assert_eq!(ctx.hid.mouse_mode(), MouseMode::Absolute);
     }
 
     #[tokio::test]

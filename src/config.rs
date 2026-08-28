@@ -3,12 +3,12 @@
 //! `tokio::sync::watch`, so a change never has to touch the connection
 //! itself. In-memory only: nothing here is ever persisted to disk.
 //!
-//! The capture settings type itself now lives with the driver that
-//! consumes it (`device::capture_driver`, re-exported as
-//! `capture::CaptureSettings`); this module is what's left, and #018
-//! removes it entirely.
+//! The capture settings type now lives with the driver that consumes it
+//! (`device::capture_driver`, re-exported as `capture::CaptureSettings`),
+//! and mouse mode with the module that acts on it (`hid::MouseMode`);
+//! `DeviceState` is what's left, and #018 removes it entirely.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::capture::Resolution;
 
@@ -33,15 +33,4 @@ pub struct DeviceState {
 pub struct ResolutionFrameRates {
     pub resolution: Resolution,
     pub rates: Vec<u32>,
-}
-
-/// Mouse mode doesn't affect the capture pipeline — it's purely which
-/// datagram shape the browser sends — so it's tracked separately from
-/// `CaptureSettings` rather than folded into the capture task's watch
-/// channel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MouseMode {
-    Absolute,
-    Relative,
 }

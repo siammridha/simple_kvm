@@ -22,9 +22,9 @@ use webrtc::peer_connection::{
 
 use crate::capture::CaptureSettings;
 use crate::capture::engine::CaptureEngine;
-use crate::config::{DeviceState, MouseMode};
+use crate::config::DeviceState;
 use crate::device::{DeviceStatus, Subscription};
-use crate::hid::Hid;
+use crate::hid::{Hid, MouseMode};
 use session::SessionContext;
 
 /// Everything a new WebRTC session needs, shared across every browser tab
@@ -45,16 +45,22 @@ pub struct SharedChannels {
     /// live behind it; nothing here holds any of them.
     pub hid: Arc<Hid>,
     pub capture_settings_tx: watch::Sender<CaptureSettings>,
-    pub mouse_mode_tx: watch::Sender<MouseMode>,
     pub device_state_rx: watch::Receiver<DeviceState>,
     /// Temporary: `session` still *polls* HID presence, so `new` bridges
     /// `Hid`'s presence events into this `watch`. #019 replaces it with a
     /// per-session `hid.add_event_listener` subscription and deletes both
     /// this field and `_hid_presence_sub`.
     pub hid_connected_rx: watch::Receiver<bool>,
-    /// Keeps the bridging listener registered for as long as any session
-    /// can still read `hid_connected_rx` (see `Subscription`).
+    /// Temporary, for the same reason and with the same fate under #019:
+    /// `hid` owns the mouse mode itself, and `new` bridges its change
+    /// event into this `watch` so a session's `select!` can wait on it.
+    /// Only a change *signal* - a session reads the current value straight
+    /// from `hid`.
+    pub mouse_mode_rx: watch::Receiver<MouseMode>,
+    /// Keep the bridging listeners registered for as long as any session
+    /// can still read the receivers above (see `Subscription`).
     _hid_presence_sub: Arc<Subscription<DeviceStatus<()>>>,
+    _mouse_mode_sub: Arc<Subscription<MouseMode>>,
 }
 
 impl SharedChannels {
@@ -62,7 +68,6 @@ impl SharedChannels {
         capture_engine: Arc<CaptureEngine>,
         hid: Arc<Hid>,
         capture_settings_tx: watch::Sender<CaptureSettings>,
-        mouse_mode_tx: watch::Sender<MouseMode>,
         device_state_rx: watch::Receiver<DeviceState>,
     ) -> Self {
         let (hid_connected_tx, hid_connected_rx) = watch::channel(false);
@@ -73,7 +78,24 @@ impl SharedChannels {
             }
         });
 
-        Self { capture_engine, hid, capture_settings_tx, mouse_mode_tx, device_state_rx, hid_connected_rx, _hid_presence_sub: Arc::new(hid_presence_sub) }
+        let (mouse_mode_tx, mouse_mode_rx) = watch::channel(hid.mouse_mode());
+        let mouse_mode_sub = hid.add_mouse_mode_listener(move |mode| {
+            let mouse_mode_tx = mouse_mode_tx.clone();
+            async move {
+                let _ = mouse_mode_tx.send(mode);
+            }
+        });
+
+        Self {
+            capture_engine,
+            hid,
+            capture_settings_tx,
+            device_state_rx,
+            hid_connected_rx,
+            mouse_mode_rx,
+            _hid_presence_sub: Arc::new(hid_presence_sub),
+            _mouse_mode_sub: Arc::new(mouse_mode_sub),
+        }
     }
 }
 
@@ -298,8 +320,7 @@ async fn negotiate(offer_sdp: String, channels: SharedChannels) -> Result<String
         hid: channels.hid,
         capture_settings_tx: channels.capture_settings_tx.clone(),
         capture_settings_rx: channels.capture_settings_tx.subscribe(),
-        mouse_mode_tx: channels.mouse_mode_tx.clone(),
-        mouse_mode_rx: channels.mouse_mode_tx.subscribe(),
+        mouse_mode_rx: channels.mouse_mode_rx.clone(),
         device_state_rx: channels.device_state_rx,
         hid_connected_rx: channels.hid_connected_rx,
         h264_codec: h264_codec.rtp_codec,

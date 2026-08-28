@@ -14,7 +14,6 @@ use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
 use capture::engine::CaptureEngine;
-use config::MouseMode;
 use device::{CaptureDevice, CaptureSettings, Resolution};
 use hid::Hid;
 
@@ -35,10 +34,8 @@ async fn main() -> Result<()> {
     // in-memory only - every start uses a fixed default; nothing here is
     // ever read from or written to disk. ---
     let default_capture_settings = CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5 };
-    let default_mouse_mode = MouseMode::Absolute;
 
     let (capture_settings_tx, capture_settings_rx) = watch::channel(default_capture_settings);
-    let (mouse_mode_tx, _mouse_mode_rx) = watch::channel(default_mouse_mode);
 
     // Two independent handles to the same underlying presence task (see
     // `Device::clone`) - one feeds `CaptureEngine`'s own presence-driven
@@ -51,12 +48,12 @@ async fn main() -> Result<()> {
     let capture_engine = Arc::new(CaptureEngine::new(capture_device));
 
     // --- Serial: same soft-unavailable treatment as capture. `Hid` owns
-    // its own device, queue, drain worker and enumeration-settle delay;
-    // commands sent before its port is open queue up rather than being
-    // lost, so nothing here holds up the HTTP page starting. ---
+    // its own device, queue, drain worker, enumeration-settle delay and
+    // mouse mode; commands sent before its port is open queue up rather
+    // than being lost, so nothing here holds up the HTTP page starting. ---
     let hid = Hid::spawn();
 
-    let channels = rtc::SharedChannels::new(capture_engine, hid, capture_settings_tx, mouse_mode_tx, device_state_rx);
+    let channels = rtc::SharedChannels::new(capture_engine, hid, capture_settings_tx, device_state_rx);
     let http_addr = std::net::SocketAddr::from(([0, 0, 0, 0], http_port));
     tracing::info!(port = http_port, "page and WebRTC signaling server listening");
     let http_handle = tokio::spawn(async move {
