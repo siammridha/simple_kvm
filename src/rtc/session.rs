@@ -1,6 +1,6 @@
 //! Per-connection handling: one task juggling video, input, and control
 //! over `tokio::select!` — sending video frames from this session's own
-//! `CaptureStream` once one is attached (see `CaptureEngine::
+//! `CaptureStream` once one is attached (see `CaptureCard::
 //! request_stream`), forwarding `input` data channel messages to `hid` as
 //! `InputCommand`s, and reading `control` data channel JSON (the Save
 //! button's settings update, paste, SDP renegotiation answers). Settings
@@ -30,7 +30,7 @@ use webrtc::peer_connection::{PeerConnection, RTCPeerConnectionState, RTCSession
 use webrtc::rtp_transceiver::RtpSender;
 
 use crate::capture::FrameEnvelope;
-use crate::capture::engine::{CaptureEngine, CaptureStream, NoDevice};
+use crate::capture::engine::{CaptureCard, CaptureStream, NoDevice};
 use crate::capture::{CaptureSettings, Resolution, SupportedFormat};
 use crate::hid::{Hid, InputCommand, MouseMode};
 use crate::device::{DeviceStatus, Subscription};
@@ -44,7 +44,7 @@ pub struct SessionContext {
     /// this session still has no track. Capture settings and the card's
     /// UI-facing state are read from and written to it directly, and
     /// subscribed to per session (see `handle`).
-    pub capture_engine: Arc<CaptureEngine>,
+    pub capture_card: Arc<CaptureCard>,
     /// The HID bridge - see `super::Rtc`. Input, mouse mode and CH9329
     /// presence all go through it, as commands and subscriptions.
     pub hid: Arc<Hid>,
@@ -109,7 +109,7 @@ async fn video_target(video_track: &TrackLocalStaticSample, video_sender: &Arc<d
 /// time (see `docs/video-track-per-session.md`). Holding the
 /// `CaptureStream` here for exactly as long as this session has a track is
 /// what ties the shared encode pass's own start/stop to real consumers
-/// existing (see `CaptureEngine`'s own live-stream count) - dropping
+/// existing (see `CaptureCard`'s own live-stream count) - dropping
 /// `VideoState`, however that happens (deliberate removal or the whole
 /// session ending), releases this session's hold on it.
 struct VideoState {
@@ -162,15 +162,15 @@ async fn add_video_track(pc: &Arc<dyn PeerConnection>, codec: &RTCRtpCodec) -> R
     Ok(RawVideoTrack { track, sender })
 }
 
-/// Asks the capture engine for a live stream (`CaptureEngine::
+/// Asks the capture card for a live stream (`CaptureCard::
 /// request_stream`, mirroring `getUserMedia`) and, on success, builds and
 /// attaches a fresh RTP track for it. Returns `None` if the device isn't
 /// currently available (`NoDevice`) or attaching the track itself failed -
 /// either way the caller just leaves the session without video, ready to
 /// try again the next time `handle`'s `presence_rx` reports the device is
 /// available.
-async fn try_attach_video(pc: &Arc<dyn PeerConnection>, capture_engine: &CaptureEngine, codec: &RTCRtpCodec, video_ended_tx: &mpsc::UnboundedSender<()>) -> Option<VideoState> {
-    let stream = match capture_engine.request_stream().await {
+async fn try_attach_video(pc: &Arc<dyn PeerConnection>, capture_card: &CaptureCard, codec: &RTCRtpCodec, video_ended_tx: &mpsc::UnboundedSender<()>) -> Option<VideoState> {
+    let stream = match capture_card.request_stream().await {
         Ok(stream) => stream,
         Err(NoDevice) => return None,
     };
@@ -270,13 +270,13 @@ pub async fn handle(
 
     let mut pc_state_rx = ctx.pc_state_rx.clone();
 
-    // Forwards `CaptureEngine`'s own device-presence events into this
+    // Forwards `CaptureCard`'s own device-presence events into this
     // session's `select!` loop - what drives retrying `request_stream()`
     // once a previously-unavailable device becomes present again, without
     // needing a new browser connection. Kept alive for the life of this
     // session via `_presence_sub`.
     let (presence_tx, mut presence_rx) = mpsc::unbounded_channel::<DeviceStatus<SupportedFormat>>();
-    let _presence_sub = ctx.capture_engine.add_event_listener(move |status| {
+    let _presence_sub = ctx.capture_card.add_event_listener(move |status| {
         let presence_tx = presence_tx.clone();
         async move {
             let _ = presence_tx.send(status);
@@ -329,13 +329,13 @@ pub async fn handle(
     // would fail its first send against a not-yet-open channel and stop
     // for good - so the `control_open` guard is what the `OnOpen` arm's
     // `push_initial_state` hands over from.
-    let _device_state_sub = ctx.capture_engine.add_device_state_listener({
-        let (capture_engine, outbound_tx, control_open) = (Arc::clone(&ctx.capture_engine), outbound_tx.clone(), Arc::clone(&control_open));
+    let _device_state_sub = ctx.capture_card.add_device_state_listener({
+        let (capture_card, outbound_tx, control_open) = (Arc::clone(&ctx.capture_card), outbound_tx.clone(), Arc::clone(&control_open));
         move |_| {
-            let (capture_engine, outbound_tx, control_open) = (Arc::clone(&capture_engine), outbound_tx.clone(), Arc::clone(&control_open));
+            let (capture_card, outbound_tx, control_open) = (Arc::clone(&capture_card), outbound_tx.clone(), Arc::clone(&control_open));
             async move {
                 if control_open.load(Ordering::Relaxed) {
-                    let _ = outbound_tx.send(ServerMessage::DeviceState(capture_engine.device_state()));
+                    let _ = outbound_tx.send(ServerMessage::DeviceState(capture_card.device_state()));
                 }
             }
         }
@@ -343,24 +343,24 @@ pub async fn handle(
     // Capture settings and mouse mode are two halves of one
     // `ServerMessage::Settings`, so both subscriptions send the same
     // snapshot of both values.
-    let _settings_sub = ctx.capture_engine.add_settings_listener({
-        let (capture_engine, hid, outbound_tx, control_open) = (Arc::clone(&ctx.capture_engine), Arc::clone(&ctx.hid), outbound_tx.clone(), Arc::clone(&control_open));
+    let _settings_sub = ctx.capture_card.add_settings_listener({
+        let (capture_card, hid, outbound_tx, control_open) = (Arc::clone(&ctx.capture_card), Arc::clone(&ctx.hid), outbound_tx.clone(), Arc::clone(&control_open));
         move |_| {
-            let (capture_engine, hid, outbound_tx, control_open) = (Arc::clone(&capture_engine), Arc::clone(&hid), outbound_tx.clone(), Arc::clone(&control_open));
+            let (capture_card, hid, outbound_tx, control_open) = (Arc::clone(&capture_card), Arc::clone(&hid), outbound_tx.clone(), Arc::clone(&control_open));
             async move {
                 if control_open.load(Ordering::Relaxed) {
-                    let _ = outbound_tx.send(ServerMessage::Settings { capture: capture_engine.settings(), mouse_mode: hid.mouse_mode() });
+                    let _ = outbound_tx.send(ServerMessage::Settings { capture: capture_card.settings(), mouse_mode: hid.mouse_mode() });
                 }
             }
         }
     });
     let _mouse_mode_sub = ctx.hid.add_mouse_mode_listener({
-        let (capture_engine, hid, outbound_tx, control_open) = (Arc::clone(&ctx.capture_engine), Arc::clone(&ctx.hid), outbound_tx.clone(), Arc::clone(&control_open));
+        let (capture_card, hid, outbound_tx, control_open) = (Arc::clone(&ctx.capture_card), Arc::clone(&ctx.hid), outbound_tx.clone(), Arc::clone(&control_open));
         move |_| {
-            let (capture_engine, hid, outbound_tx, control_open) = (Arc::clone(&capture_engine), Arc::clone(&hid), outbound_tx.clone(), Arc::clone(&control_open));
+            let (capture_card, hid, outbound_tx, control_open) = (Arc::clone(&capture_card), Arc::clone(&hid), outbound_tx.clone(), Arc::clone(&control_open));
             async move {
                 if control_open.load(Ordering::Relaxed) {
-                    let _ = outbound_tx.send(ServerMessage::Settings { capture: capture_engine.settings(), mouse_mode: hid.mouse_mode() });
+                    let _ = outbound_tx.send(ServerMessage::Settings { capture: capture_card.settings(), mouse_mode: hid.mouse_mode() });
                 }
             }
         }
@@ -420,7 +420,7 @@ pub async fn handle(
             }
             Some(status) = presence_rx.recv() => {
                 if connected && video.is_none() && matches!(status, DeviceStatus::Present(_))
-                    && let Some(v) = try_attach_video(&pc, &ctx.capture_engine, &ctx.h264_codec, &video_ended_tx).await
+                    && let Some(v) = try_attach_video(&pc, &ctx.capture_card, &ctx.h264_codec, &video_ended_tx).await
                 {
                     last_captured_at = None;
                     video = Some(v);
@@ -454,7 +454,7 @@ pub async fn handle(
                         // `capture` last computed from probing the card when it
                         // was plugged in - opening this channel doesn't trigger a
                         // fresh probe of its own.
-                        if push_initial_state(&outbound_tx, &ctx.capture_engine, &ctx.hid).is_ok() {
+                        if push_initial_state(&outbound_tx, &ctx.capture_card, &ctx.hid).is_ok() {
                             control_open.store(true, Ordering::Relaxed);
                         }
                     }
@@ -486,7 +486,7 @@ pub async fn handle(
                     // device is already available; if not, `presence_rx`
                     // above retries later.
                     connected = true;
-                    if let Some(v) = try_attach_video(&pc, &ctx.capture_engine, &ctx.h264_codec, &video_ended_tx).await {
+                    if let Some(v) = try_attach_video(&pc, &ctx.capture_card, &ctx.h264_codec, &video_ended_tx).await {
                         last_captured_at = None;
                         video = Some(v);
                     }
@@ -505,11 +505,11 @@ pub async fn handle(
 /// only fires for changes from here on — it doesn't tell a freshly
 /// connected tab about state that was already current before it connected
 /// (see the call site in `handle`).
-fn push_initial_state(outbound_tx: &mpsc::UnboundedSender<ServerMessage>, capture_engine: &CaptureEngine, hid: &Hid) -> Result<()> {
+fn push_initial_state(outbound_tx: &mpsc::UnboundedSender<ServerMessage>, capture_card: &CaptureCard, hid: &Hid) -> Result<()> {
     let closed = || anyhow::anyhow!("outbound queue closed");
-    outbound_tx.send(ServerMessage::DeviceState(capture_engine.device_state())).map_err(|_| closed())?;
+    outbound_tx.send(ServerMessage::DeviceState(capture_card.device_state())).map_err(|_| closed())?;
     outbound_tx.send(ServerMessage::HidState { available: hid.is_present() }).map_err(|_| closed())?;
-    outbound_tx.send(ServerMessage::Settings { capture: capture_engine.settings(), mouse_mode: hid.mouse_mode() }).map_err(|_| closed())?;
+    outbound_tx.send(ServerMessage::Settings { capture: capture_card.settings(), mouse_mode: hid.mouse_mode() }).map_err(|_| closed())?;
     Ok(())
 }
 
@@ -607,7 +607,7 @@ fn handle_control_message(msg: ControlMessage, ctx: &SessionContext) {
                 // effect - and its change event is what reaches every
                 // already-open tab, including this one (see the
                 // subscriptions in `handle`).
-                ctx.capture_engine.update_settings(CaptureSettings { resolution: Resolution { width: capture.width, height: capture.height }, fps: capture.fps });
+                ctx.capture_card.update_settings(CaptureSettings { resolution: Resolution { width: capture.width, height: capture.height }, fps: capture.fps });
                 tracing::info!(width = capture.width, height = capture.height, fps = capture.fps, "capture settings updated");
             }
             // `hid` owns the value - it's the module that decides what
@@ -652,9 +652,9 @@ mod tests {
         // stream, so a real capture device is neither needed nor wanted.
         let capture_device = CaptureDevice::spawn_at("/nonexistent-simple-kvm-test-device");
         SessionContext {
-            capture_engine: Arc::new(CaptureEngine::new(capture_device)),
-            // Its settle delay outlasts the test, so no CH9329 device is
-            // ever spawned - these tests only reach
+            capture_card: Arc::new(CaptureCard::new(capture_device)),
+            // Points at a path that will never exist, same reasoning as
+            // `capture_device` above - these tests only reach
             // `handle_control_message`.
             hid: Hid::spawn_for_test(),
             h264_codec: RTCRtpCodec::default(),
@@ -671,7 +671,7 @@ mod tests {
             &ctx,
         );
 
-        assert_eq!(ctx.capture_engine.settings(), CaptureSettings { resolution: Resolution { width: 1920, height: 1080 }, fps: 25 });
+        assert_eq!(ctx.capture_card.settings(), CaptureSettings { resolution: Resolution { width: 1920, height: 1080 }, fps: 25 });
         assert_eq!(ctx.hid.mouse_mode(), MouseMode::Absolute);
     }
 
@@ -681,7 +681,7 @@ mod tests {
 
         handle_control_message(ControlMessage::UpdateSettings { capture: None, mouse_mode: Some(MouseModeWire::Relative) }, &ctx);
 
-        assert_eq!(ctx.capture_engine.settings(), CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5 });
+        assert_eq!(ctx.capture_card.settings(), CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5 });
         assert_eq!(ctx.hid.mouse_mode(), MouseMode::Relative);
     }
 
@@ -691,7 +691,7 @@ mod tests {
 
         handle_control_message(ControlMessage::UpdateSettings { capture: None, mouse_mode: None }, &ctx);
 
-        assert_eq!(ctx.capture_engine.settings(), CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5 });
+        assert_eq!(ctx.capture_card.settings(), CaptureSettings { resolution: Resolution { width: 1280, height: 720 }, fps: 5 });
         assert_eq!(ctx.hid.mouse_mode(), MouseMode::Absolute);
     }
 

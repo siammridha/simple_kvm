@@ -17,13 +17,13 @@ pub use video_bus::FrameEnvelope;
 /// The capture card's own types come from `device`, which owns the driver
 /// that produces them (its `Info`, its `Settings`, and the resolution it
 /// negotiates). They're re-exported here because they're part of what
-/// `CaptureEngine`'s API takes and reports, so callers never have to reach
+/// `CaptureCard`'s API takes and reports, so callers never have to reach
 /// past `capture` into `device` for them.
 pub use crate::device::{CaptureDevice, CaptureSettings, Resolution, SupportedFormat};
 
 /// Live state of the capture card itself — whether it's plugged in right
 /// now, and what resolutions/frame rates it supports. Computed and
-/// published by `CaptureEngine`, which is the only thing holding both the
+/// published by `CaptureCard`, which is the only thing holding both the
 /// card's reported capabilities and the currently-applied settings, and
 /// pushed to the web page over the `control` data channel (see
 /// `rtc::session::handle`) so an already-open tab reflects a
@@ -45,7 +45,7 @@ pub struct ResolutionFrameRates {
     pub rates: Vec<u32>,
 }
 
-/// `pub(crate)` (rather than private) so `capture::engine`'s `CaptureEngine`
+/// `pub(crate)` (rather than private) so `capture::engine`'s `CaptureCard`
 /// can reuse this exact function for its own encode pass - see issue #004,
 /// which is required to reuse this machinery rather than reinvent it.
 ///
@@ -103,7 +103,7 @@ pub(crate) fn run_one_pass(device: &CaptureDevice, format: &Option<SupportedForm
     }
 }
 
-/// Called by `CaptureEngine` every time either half of what it depends on
+/// Called by `CaptureCard` every time either half of what it depends on
 /// moves - the card's reported capabilities or the applied settings. Cheap
 /// and ioctl-free, so it's safe to run on every presence event or settings
 /// change, unlike an actual probe. Kept as a free function over

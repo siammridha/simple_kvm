@@ -5,7 +5,7 @@
     "tasks": [
         {
             "label": "start-server",
-            "detail": "Kill any running simple_kvm, then cargo run",
+            "detail": "Deploy simple_kvm on device to test",
             "type": "shell",
             "command": "./test-on-device.sh",
             "presentation": {

@@ -16,7 +16,7 @@ use webrtc::peer_connection::{
     RTCIceGatheringState, RTCPeerConnectionState, RTCSessionDescription, Registry,
 };
 
-use crate::capture::engine::CaptureEngine;
+use crate::capture::engine::CaptureCard;
 use crate::hid::Hid;
 use session::SessionContext;
 
@@ -24,7 +24,7 @@ use session::SessionContext;
 /// `web` calls on every signaling request. Just the two modules a session
 /// talks to — there is no shared state here beyond them, and no channel:
 /// everything a session needs to know it either asks for
-/// (`CaptureEngine::settings`, `Hid::mouse_mode`, …) or subscribes to for
+/// (`CaptureCard::settings`, `Hid::mouse_mode`, …) or subscribes to for
 /// itself (see `session::handle`), so nothing has to be pre-wired per
 /// process and cloned into every tab.
 ///
@@ -36,10 +36,10 @@ pub struct Rtc {
     /// Shared across every session - `session::handle` calls
     /// `request_stream()` on this once its connection is stable, and again
     /// any time a device-availability event says it's worth retrying (see
-    /// `CaptureEngine::add_event_listener`). The encode pass this wraps
+    /// `CaptureCard::add_event_listener`). The encode pass this wraps
     /// starts/stops as a direct consequence of how many sessions currently
     /// hold a live `CaptureStream` - nothing here counts that by hand.
-    capture_engine: Arc<CaptureEngine>,
+    capture_card: Arc<CaptureCard>,
     /// Shared across every session - `session` calls `send` on this for
     /// every key/mouse event. The queue, the port and the drain worker
     /// live behind it; nothing here holds any of them.
@@ -47,8 +47,8 @@ pub struct Rtc {
 }
 
 impl Rtc {
-    pub fn new(capture_engine: Arc<CaptureEngine>, hid: Arc<Hid>) -> Self {
-        Self { capture_engine, hid }
+    pub fn new(capture_card: Arc<CaptureCard>, hid: Arc<Hid>) -> Self {
+        Self { capture_card, hid }
     }
 
     /// The whole signaling surface: hand it the browser's offer SDP, get
@@ -160,7 +160,7 @@ impl PeerConnectionEventHandler for Handler {
     /// Fires whenever this connection has something new to negotiate
     /// after its initial offer/answer exchange — e.g. `session::handle`
     /// added or removed the video track in response to real
-    /// capture-device availability (`CaptureEngine::request_stream`/
+    /// capture-device availability (`CaptureCard::request_stream`/
     /// `CaptureStream`'s `ended` event). Builds a fresh offer and hands
     /// its SDP to `session::handle` to forward over `control`; the crate's
     /// own
@@ -268,7 +268,7 @@ async fn negotiate(offer_sdp: String, rtc: Rtc) -> Result<String> {
     // why this can't just be unconditional.
     ready.store(true, Ordering::Relaxed);
 
-    let ctx = SessionContext { capture_engine: rtc.capture_engine, hid: rtc.hid, h264_codec: h264_codec.rtp_codec, pc_state_rx };
+    let ctx = SessionContext { capture_card: rtc.capture_card, hid: rtc.hid, h264_codec: h264_codec.rtp_codec, pc_state_rx };
     let pc_for_session = peer_connection.clone();
     tokio::spawn(async move {
         if let Err(err) = session::handle(pc_for_session, dc_rx, renegotiation_rx, ctx).await {

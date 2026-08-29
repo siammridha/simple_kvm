@@ -11,6 +11,12 @@
 //! Lifetimes follow ownership: `Hid` holds the only strong queue sender,
 //! so dropping it closes the queue, which ends the blocking drain worker,
 //! which ends the task awaiting it.
+//!
+//! No settle delay lives here any more - `Hid::spawn` holds its
+//! `Ch9329Device` from the start, the same way `CaptureCard` holds its
+//! `CaptureDevice`. The boot-crash mitigation that used to be this
+//! module's own flat wait is now `device`'s detect-to-probe delay,
+//! applied generically to every device kind.
 
 mod keyboard;
 mod keymap;
@@ -20,9 +26,7 @@ mod writer;
 
 use std::fmt;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -35,14 +39,6 @@ use writer::Command;
 /// session task, and shallow enough that a stalled CH9329 doesn't build up
 /// seconds of stale input to replay.
 const COMMAND_QUEUE_CAPACITY: usize = 256;
-
-/// How long to wait before first opening the CH9329, giving its USB
-/// enumeration time to settle - the same crash-avoidance reasoning as the
-/// capture card's boot delay (see `deploy/install.sh`). Commands sent
-/// during the wait queue up rather than being lost, so this never holds up
-/// the HTTP page starting.
-const OPEN_DELAY_ENV_VAR: &str = "SERIAL_OPEN_DELAY_SECS";
-const DEFAULT_OPEN_DELAY_SECS: u64 = 30;
 
 /// Every run starts here; mouse mode is never read from or written to disk.
 const DEFAULT_MOUSE_MODE: MouseMode = MouseMode::Absolute;
@@ -112,17 +108,17 @@ impl std::error::Error for QueueClosed {}
 pub struct Hid {
     /// The only strong sender - see the module docs on lifetimes.
     commands: mpsc::Sender<Command>,
-    /// This module's own `devicechange` emitter rather than the device's:
-    /// subscribers exist from startup, while the `Ch9329Device` itself
-    /// isn't spawned until the settle delay has passed.
-    events: Arc<EventEmitter<DeviceStatus<()>>>,
-    /// The latest presence this module has seen, kept alongside `events`
-    /// so `is_present` can answer without holding the `Ch9329Device` (which
-    /// doesn't exist until the settle delay has passed). Written by the
-    /// forwarding listener in `open_after_delay` *before* it dispatches, so
-    /// a subscriber that reads this in its own callback never sees a value
-    /// older than the event that woke it.
-    present: Arc<AtomicBool>,
+    /// `is_present`/`add_event_listener` delegate straight to this -
+    /// there's no settle delay of this module's own any more, so the
+    /// `Ch9329Device` exists for `Hid`'s whole lifetime (the boot-crash
+    /// mitigation now lives once, generically, in `device`'s own
+    /// detect-to-probe delay).
+    device: Ch9329Device,
+    /// Kept alive only so its callback keeps firing - it prompts the
+    /// worker to open or drop its port the instant presence changes,
+    /// rather than waiting for the next command. Dropped, like everything
+    /// else here, when `Hid` is.
+    _presence_forward: Subscription<DeviceStatus<()>>,
     /// Read and written from both async tasks and the page's control
     /// channel, but never held across an `.await` - a plain `std` mutex
     /// rather than tokio's.
@@ -132,31 +128,38 @@ pub struct Hid {
 
 impl Hid {
     pub fn spawn() -> Arc<Self> {
-        Self::spawn_with_delay(Duration::from_secs(configured_open_delay_secs()))
+        Self::new(Ch9329Device::spawn())
     }
 
-    /// Test-only: a `Hid` whose settle delay outlasts any test, so no
-    /// `Ch9329Device` is ever spawned and no port is ever opened - the
-    /// queue still accepts commands, exactly as it does at startup.
+    /// Test-only: a `Hid` whose `Ch9329Device` points at a path that will
+    /// never exist, so no port is ever opened - the queue still accepts
+    /// commands, exactly as it does before the real chip is found.
     #[cfg(test)]
     pub fn spawn_for_test() -> Arc<Self> {
-        Self::spawn_with_delay(Duration::from_secs(3600))
+        Self::new(Ch9329Device::spawn_at("/nonexistent-simple-kvm-test-ch9329"))
     }
 
-    fn spawn_with_delay(open_delay: Duration) -> Arc<Self> {
+    fn new(device: Ch9329Device) -> Arc<Self> {
         let (commands_tx, commands_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
-        let events = Arc::new(EventEmitter::new());
-        let present = Arc::new(AtomicBool::new(false));
 
-        tokio::spawn(open_after_delay(open_delay, commands_tx.downgrade(), commands_rx, Arc::clone(&events), Arc::clone(&present)));
+        let forward_tx = commands_tx.downgrade();
+        let presence_forward = device.add_event_listener(move |_status| {
+            let forward_tx = forward_tx.clone();
+            async move {
+                // Prompts the worker to open or drop its port right away,
+                // rather than only on the next real keystroke or click.
+                if let Some(commands_tx) = forward_tx.upgrade() {
+                    let _ = commands_tx.send(Command::CheckConnection).await;
+                }
+            }
+        });
 
-        Arc::new(Self {
-            commands: commands_tx,
-            events,
-            present,
-            mouse_mode: Mutex::new(DEFAULT_MOUSE_MODE),
-            mouse_mode_events: Arc::new(EventEmitter::new()),
-        })
+        let writer = writer::SerialWriter::new(device.clone());
+        tokio::spawn(async move {
+            let _ = tokio::task::spawn_blocking(move || writer.run(commands_rx)).await;
+        });
+
+        Arc::new(Self { commands: commands_tx, device, _presence_forward: presence_forward, mouse_mode: Mutex::new(DEFAULT_MOUSE_MODE), mouse_mode_events: Arc::new(EventEmitter::new()) })
     }
 
     /// Queues `command` for the CH9329. Commands reach the hardware in the
@@ -171,7 +174,7 @@ impl Hid {
     /// a subscriber that starts after the chip was already found needs this
     /// to learn where it's starting from.
     pub fn is_present(&self) -> bool {
-        self.present.load(Ordering::Relaxed)
+        self.device.is_present()
     }
 
     pub fn mouse_mode(&self) -> MouseMode {
@@ -197,73 +200,24 @@ impl Hid {
 
     /// Mirrors `addEventListener('devicechange', cb)` for the CH9329 -
     /// forwards presence exactly as `Device<Ch9329Driver>` reports it,
-    /// the HID counterpart of `CaptureEngine::add_event_listener`.
+    /// the HID counterpart of `CaptureCard::add_event_listener`.
     pub fn add_event_listener<F, Fut>(&self, callback: F) -> Subscription<DeviceStatus<()>>
     where
         F: Fn(DeviceStatus<()>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        self.events.add_event_listener(callback)
+        self.device.add_event_listener(callback)
     }
-}
-
-fn configured_open_delay_secs() -> u64 {
-    std::env::var(OPEN_DELAY_ENV_VAR).ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_OPEN_DELAY_SECS)
-}
-
-/// Waits out the settle delay, then starts presence detection and the
-/// drain worker. Holds only a `WeakSender`, so a `Hid` dropped either
-/// during the delay or while the worker is running still closes the
-/// queue and ends everything here.
-///
-/// Presence detection itself is harmless (a filesystem check plus a kernel
-/// uevent listener, no device I/O), but it's still started only after the
-/// delay so the browser learns about CH9329 connectivity at the same point
-/// in time it always has. The worker re-checks presence before every
-/// command, so there's nothing to decide up front here.
-async fn open_after_delay(
-    open_delay: Duration,
-    commands_tx: mpsc::WeakSender<Command>,
-    commands_rx: mpsc::Receiver<Command>,
-    events: Arc<EventEmitter<DeviceStatus<()>>>,
-    present: Arc<AtomicBool>,
-) {
-    if !open_delay.is_zero() {
-        tracing::info!(seconds = open_delay.as_secs(), "waiting before opening CH9329 serial port");
-        tokio::time::sleep(open_delay).await;
-    }
-    if commands_tx.upgrade().is_none() {
-        return; // dropped during the delay - nothing left to serve
-    }
-
-    let device = Ch9329Device::spawn();
-    let _presence_sub = device.add_event_listener(move |status| {
-        let events = Arc::clone(&events);
-        let present = Arc::clone(&present);
-        let commands_tx = commands_tx.clone();
-        async move {
-            present.store(matches!(status, DeviceStatus::Present(_)), Ordering::Relaxed);
-            events.dispatch(status);
-            // Prompts the worker to open or drop its port right away,
-            // rather than only on the next real keystroke or click.
-            if let Some(commands_tx) = commands_tx.upgrade() {
-                let _ = commands_tx.send(Command::CheckConnection).await;
-            }
-        }
-    });
-
-    let writer = writer::SerialWriter::new(device);
-    let _ = tokio::task::spawn_blocking(move || writer.run(commands_rx)).await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn commands_queue_while_the_port_is_not_open_yet() {
-        // Long enough that the settle delay is still running throughout.
-        let hid = Hid::spawn_with_delay(Duration::from_secs(600));
+        let hid = Hid::spawn_for_test();
 
         for _ in 0..8 {
             hid.send(InputCommand::PointerButtons { buttons: 0, wheel: 0 }).await.expect("commands must queue, not fail, before the port opens");
@@ -272,7 +226,7 @@ mod tests {
 
     #[tokio::test]
     async fn changing_mouse_mode_updates_the_current_value_and_tells_listeners() {
-        let hid = Hid::spawn_with_delay(Duration::from_secs(600));
+        let hid = Hid::spawn_for_test();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let _sub = hid.add_mouse_mode_listener(move |mode| {
             let tx = tx.clone();

@@ -140,14 +140,14 @@ udev's own notifications never fire there. Listening straight to the
 kernel works regardless of what (if anything) is managing devices. If the
 listener can't be opened, both the capture card's and the CH9329's
 presence detection fall back to polling every 2 seconds instead. Every
-time the capture card
-goes from unplugged to plugged in - a genuine replug while the service is
-running, or simply being plugged in for the first time after the service
-started without it - triggers one fresh capabilities probe, cached in
-memory until it's unplugged again (see above). The one exception is the
-card already being plugged in at the moment the service itself starts -
-that specific transition is never auto-probed, since it's the
-boot-crash-risk moment described below.
+time the capture card goes from unplugged to plugged in - a genuine
+replug while the service is running, being plugged in for the first time
+after the service started without it, or already being plugged in at the
+moment the service itself starts - triggers one fresh capabilities probe,
+cached in memory until it's unplugged again (see above). Every one of
+those probes, including the boot-time one, waits 3 seconds after presence
+is first noticed before actually running - see the "Known issue" note
+further down, under Installation, for why.
 
 **Dropdown changes only take effect when you click Save settings, and
 nothing is ever saved to disk.** Changing frame rate, resolution, or
@@ -300,10 +300,16 @@ verified against the real hardware yet - treat it as unconfirmed rather
 than fixed until it's been tested on the Wyse 3040 through a real boot
 cycle.
 
-The CH9329 has shown the same crash-on-connect behavior, so the binary
-itself waits before opening the serial port (`SERIAL_OPEN_DELAY_SECS`,
-default 30 seconds) - this one still applies, since it lives in the
-binary itself rather than the removed OpenRC delay.
+Separately, both the capture card and the CH9329 wait 3 seconds after
+presence is first noticed before actually being *probed* - noticing
+itself (the log line, and `is_present()`) is immediate, only the probe
+waits. This is a fixed, uniform delay applied to every device kind, not
+configurable per device. For the CH9329, which has shown the same
+crash-on-connect behavior as the capture card, this 3-second wait is also
+what stands between boot and the binary actually opening its serial
+port - previously a dedicated `SERIAL_OPEN_DELAY_SECS` (default 30
+seconds) guarded that. Whether 3 seconds is actually enough margin for
+the CH9329 on real hardware hasn't been tested yet.
 
 ### Configuration
 
@@ -313,7 +319,6 @@ if you need to change one):
 | Variable | Default | Meaning |
 |---|---|---|
 | `SERIAL_PATH` | `/dev/ttyUSB0` | CH9329/CH340 serial device |
-| `SERIAL_OPEN_DELAY_SECS` | `30` | How long to wait before opening the CH9329 serial port, for the same reason as the capture card's boot delay below — set to `0` to disable. |
 | `VIDEO_PATH` | `/dev/video0` | Capture card device |
 | `HTTP_PORT` | `3000` | Port for the page and WebRTC signaling (`POST /rtc/offer`) |
 | `RUST_LOG` | `info,simple_kvm::rtc::session=debug,simple_kvm::hid::writer=debug` | Standard `tracing` log filter. By default, every keystroke/click is already logged at `debug` - no configuration needed first - since each log line includes how long that event took to queue/write, which is useful for tracking down input lag. A command that takes more than 50ms logs at `warn` regardless. Setting `RUST_LOG` yourself (e.g. `RUST_LOG=debug` for everything, or `RUST_LOG=warn` to quiet the per-keystroke lines) fully overrides the default above. |

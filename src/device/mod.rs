@@ -45,6 +45,16 @@ pub use ch9329_driver::Ch9329Device;
 /// mirrors `capture::DEVICE_POLL_INTERVAL`'s role for the same case.
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How long to wait after presence is first detected before actually
+/// probing the device - real hardware (the capture card and the CH9329
+/// alike) has crashed when opened/probed too soon after USB enumeration,
+/// including right at boot if the device was already plugged in. Applies
+/// uniformly to every `DeviceDriver`, and to every absent->present
+/// transition, not just the very first one: presence itself is reported
+/// (logged) the instant it's seen, since noticing is harmless; only the
+/// probe - which does touch the hardware - waits.
+const DETECT_TO_PROBE_DELAY: Duration = Duration::from_secs(3);
+
 /// What differs between device kinds - where the device lives, and how to
 /// probe and open it. Everything else (presence detection, event
 /// dispatch, path encapsulation) is shared by the generic `Device<D>`
@@ -92,10 +102,10 @@ impl fmt::Display for OpenError {
 impl std::error::Error for OpenError {}
 
 /// Whether a device is currently plugged in and, once probed, what it
-/// reports about its own capabilities. `Present(None)` covers the
-/// boot-time "already present, deliberately not probed" case (see
-/// `PresenceState::observe`) - it persists until a genuine absent->present
-/// transition actually probes the device.
+/// reports about its own capabilities. `Present(None)` means the device
+/// was found but `D::probe` itself failed (no such device, wrong kind, an
+/// ioctl error) - the same "never errors the caller" contract `probe`
+/// documents.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeviceStatus<Info> {
     Absent,
@@ -127,7 +137,7 @@ pub struct Device<D: DeviceDriver> {
 /// require `D: Clone` itself - no `DeviceDriver` impl needs that) - every
 /// field this actually clones is already `Arc`-backed. Lets a caller (e.g.
 /// `main.rs`) hold two independent handles to the same underlying presence
-/// task/device path - one to build a `CaptureEngine` from, one to
+/// task/device path - one to build a `CaptureCard` from, one to
 /// subscribe to directly for `DeviceState` publishing - without the
 /// presence task itself being duplicated.
 impl<D: DeviceDriver> Clone for Device<D> {
@@ -143,7 +153,7 @@ impl<D: DeviceDriver> Device<D> {
     /// `D::DEFAULT_PATH`) and the uevent subsystem from `D` too, so the
     /// path is read here and never travels through a caller.
     pub fn spawn() -> Self {
-        Self::spawn_at_path(std::env::var(D::PATH_ENV_VAR).unwrap_or_else(|_| D::DEFAULT_PATH.to_string()))
+        Self::spawn_at_path(std::env::var(D::PATH_ENV_VAR).unwrap_or_else(|_| D::DEFAULT_PATH.to_string()), DETECT_TO_PROBE_DELAY)
     }
 
     /// `spawn` against an explicit path. Test-only: the whole point of
@@ -152,15 +162,24 @@ impl<D: DeviceDriver> Device<D> {
     /// never exist (absent) without mutating process-wide environment.
     #[cfg(test)]
     pub fn spawn_at(device_path: impl Into<String>) -> Self {
-        Self::spawn_at_path(device_path)
+        Self::spawn_at_path(device_path, DETECT_TO_PROBE_DELAY)
     }
 
-    fn spawn_at_path(device_path: impl Into<String>) -> Self {
+    /// `spawn_at` with no detect-to-probe delay. Test-only: for a test
+    /// that needs a fast, deterministic `Present` dispatch against a real
+    /// (fake) path and isn't testing the delay itself - the delay is
+    /// covered on its own by `PresenceState`'s tests.
+    #[cfg(test)]
+    pub fn spawn_at_immediate(device_path: impl Into<String>) -> Self {
+        Self::spawn_at_path(device_path, Duration::ZERO)
+    }
+
+    fn spawn_at_path(device_path: impl Into<String>, probe_delay: Duration) -> Self {
         let device_path = device_path.into();
         let inner = Arc::new(DeviceInner { device_path, events: Arc::new(StateEmitter::new()) });
 
         let task_inner = Arc::clone(&inner);
-        tokio::spawn(run_presence_task::<D>(task_inner));
+        tokio::spawn(run_presence_task::<D>(task_inner, probe_delay));
 
         Self { inner }
     }
@@ -191,6 +210,17 @@ impl<D: DeviceDriver> Device<D> {
         }
     }
 
+    /// Probes the device directly, on the caller's own schedule - the same
+    /// call the presence task itself makes after its detect-to-probe
+    /// delay, exposed here so a module that needs capabilities (`capture`,
+    /// or `rtc` if it ever needs to) can ask again without waiting for
+    /// another presence transition. Not every device kind needs this -
+    /// the CH9329's `probe` is a no-op - so calling it is left to whoever
+    /// actually wants the result.
+    pub fn probe(&self) -> Option<D::Info> {
+        D::probe(&self.inner.device_path)
+    }
+
     /// Whether the device is plugged in right now - exactly the gate
     /// `open` applies, exposed on its own so a caller can reject early
     /// (the way `getUserMedia` rejects with no matching device) without
@@ -217,11 +247,12 @@ impl<D: DeviceDriver> Device<D> {
 
 /// Runs forever, dispatching a `DeviceStatus` change through `inner.events`
 /// each time `PresenceState::observe` reports one. Owns the only I/O in
-/// this module - the filesystem presence check and the uevent wait - so
-/// that `PresenceState` itself stays pure and unit-testable without either
-/// (see `PresenceState`'s doc comment).
-async fn run_presence_task<D: DeviceDriver>(inner: Arc<DeviceInner<D>>) {
-    let mut state = PresenceState::<D>::new();
+/// this module - the filesystem presence check, the detect-to-probe delay,
+/// the probe call itself, and the uevent wait - so that `PresenceState`
+/// itself stays pure and unit-testable without any of that (see
+/// `PresenceState`'s doc comment).
+async fn run_presence_task<D: DeviceDriver>(inner: Arc<DeviceInner<D>>, probe_delay: Duration) {
+    let mut state = PresenceState::new();
     let mut uevents = match uevent::UeventListener::open() {
         Ok(listener) => Some(listener),
         Err(err) => {
@@ -232,8 +263,20 @@ async fn run_presence_task<D: DeviceDriver>(inner: Arc<DeviceInner<D>>) {
 
     loop {
         let device_present = Path::new(&inner.device_path).exists();
-        if let Some(status) = state.observe(&inner.device_path, device_present) {
-            inner.events.dispatch(status);
+        match state.observe(device_present) {
+            Some(PresenceTransition::Lost) => {
+                tracing::info!(device_path = %inner.device_path, "device disconnected");
+                inner.events.dispatch(DeviceStatus::Absent);
+            }
+            Some(PresenceTransition::Detected) => {
+                tracing::info!(device_path = %inner.device_path, "device connected");
+                if !probe_delay.is_zero() {
+                    tokio::time::sleep(probe_delay).await;
+                }
+                let info = D::probe(&inner.device_path);
+                inner.events.dispatch(DeviceStatus::Present(info));
+            }
+            None => {}
         }
 
         match &mut uevents {
@@ -243,40 +286,43 @@ async fn run_presence_task<D: DeviceDriver>(inner: Arc<DeviceInner<D>>) {
     }
 }
 
-/// The present/absent/first-check-skips-probe decision logic, factored out
-/// of `run_presence_task` so it's testable against a fake `DeviceDriver`
-/// with no real filesystem path or uevent socket involved - `observe`
-/// takes "is the device present right now" as a plain `bool` from its
-/// caller rather than checking `Path::exists` itself. Moved and
-/// generalized from the `device_present`/`known_present`/`first_check`
-/// variables and loop structure the capture card's presence handling used
-/// before this module existed, not reinvented.
-struct PresenceState<D: DeviceDriver> {
-    known_present: bool,
-    first_check: bool,
-    current_info: Option<D::Info>,
+/// A genuine presence transition, with the actual probing left to the
+/// caller (see `run_presence_task`) - `Detected` fires before the
+/// detect-to-probe delay, `Lost` needs no delay at all.
+#[derive(Debug, PartialEq, Eq)]
+enum PresenceTransition {
+    Detected,
+    Lost,
 }
 
-impl<D: DeviceDriver> PresenceState<D> {
+/// The present/absent transition-detection logic, factored out of
+/// `run_presence_task` so it's testable with no real filesystem path,
+/// uevent socket, or timer involved - `observe` takes "is the device
+/// present right now" as a plain `bool` from its caller rather than
+/// checking `Path::exists` itself, and reports only *that a transition
+/// happened*, never touching `D::probe`. Moved and generalized from the
+/// `device_present`/`known_present` variables and loop structure the
+/// capture card's presence handling used before this module existed, not
+/// reinvented.
+struct PresenceState {
+    known_present: bool,
+}
+
+impl PresenceState {
     fn new() -> Self {
-        Self { known_present: false, first_check: true, current_info: None }
+        Self { known_present: false }
     }
 
-    /// Returns the new status to publish if this call caused a
-    /// transition, or `None` if presence didn't change. The very first
-    /// call ever made, if `device_present` is already `true`, is the
-    /// boot-crash-risk moment (real hardware, right after USB enumeration
-    /// finishes at startup) and deliberately never calls `D::probe`;
-    /// every later genuine absent->present transition does.
-    fn observe(&mut self, device_path: &str, device_present: bool) -> Option<DeviceStatus<D::Info>> {
-        let skip_probe_this_transition = self.first_check && device_present;
-        self.first_check = false;
-
+    /// Returns the transition this call caused, or `None` if presence
+    /// didn't change. Every absent->present transition is reported the
+    /// same way, including the very first call ever made if the device is
+    /// already present then - the caller decides how long to wait before
+    /// actually probing.
+    fn observe(&mut self, device_present: bool) -> Option<PresenceTransition> {
         if !device_present {
             if self.known_present {
                 self.known_present = false;
-                self.current_info = None;
-                return Some(DeviceStatus::Absent);
+                return Some(PresenceTransition::Lost);
             }
             return None;
         }
@@ -286,10 +332,7 @@ impl<D: DeviceDriver> PresenceState<D> {
         }
 
         self.known_present = true;
-        if !skip_probe_this_transition {
-            self.current_info = D::probe(device_path);
-        }
-        Some(DeviceStatus::Present(self.current_info.clone()))
+        Some(PresenceTransition::Detected)
     }
 }
 
@@ -304,95 +347,92 @@ mod tests {
     struct FakeInfo(u32);
 
     #[test]
-    fn boot_time_already_present_does_not_probe() {
-        struct Fake;
-        static PROBE_CALLS: AtomicUsize = AtomicUsize::new(0);
-        impl DeviceDriver for Fake {
-            const UEVENT_SUBSYSTEM: &'static str = "fake";
-            const PATH_ENV_VAR: &'static str = "SIMPLE_KVM_FAKE_DEVICE";
-            const DEFAULT_PATH: &'static str = "/nonexistent/simple-kvm-fake-device";
-            type Info = FakeInfo;
-            type Settings = ();
-            type Open = ();
-            fn probe(_device_path: &str) -> Option<Self::Info> {
-                PROBE_CALLS.fetch_add(1, Ordering::SeqCst);
-                Some(FakeInfo(1))
-            }
-            fn open(_device_path: &str, _settings: &Self::Settings) -> Result<Self::Open, OpenError> {
-                Ok(())
-            }
-        }
-
-        let mut state = PresenceState::<Fake>::new();
-        let status = state.observe("dummy", true);
-
-        assert_eq!(PROBE_CALLS.load(Ordering::SeqCst), 0, "the very first check must never probe when already present");
-        assert!(matches!(status, Some(DeviceStatus::Present(None))));
+    fn boot_time_already_present_is_still_a_detected_transition() {
+        let mut state = PresenceState::new();
+        assert_eq!(state.observe(true), Some(PresenceTransition::Detected), "the very first check, if already present, is still a transition - the caller decides how long to wait before probing");
+        assert_eq!(state.observe(true), None, "no change while still present");
     }
 
     #[test]
-    fn genuine_absent_to_present_transition_probes() {
+    fn genuine_absent_to_present_transition_is_detected() {
+        let mut state = PresenceState::new();
+        assert_eq!(state.observe(false), None, "starting absent is not itself a transition");
+        assert_eq!(state.observe(true), Some(PresenceTransition::Detected));
+    }
+
+    #[test]
+    fn present_to_absent_transition_is_lost() {
+        let mut state = PresenceState::new();
+        state.observe(true);
+        assert_eq!(state.observe(false), Some(PresenceTransition::Lost));
+        assert_eq!(state.observe(false), None, "no change while still absent");
+    }
+
+    #[tokio::test]
+    async fn probe_is_deferred_until_the_detect_to_probe_delay_elapses() {
         struct Fake;
         static PROBE_CALLS: AtomicUsize = AtomicUsize::new(0);
         impl DeviceDriver for Fake {
             const UEVENT_SUBSYSTEM: &'static str = "fake";
-            const PATH_ENV_VAR: &'static str = "SIMPLE_KVM_FAKE_DEVICE";
+            const PATH_ENV_VAR: &'static str = "SIMPLE_KVM_FAKE_DEVICE_PROBE_DELAY";
             const DEFAULT_PATH: &'static str = "/nonexistent/simple-kvm-fake-device";
             type Info = FakeInfo;
             type Settings = ();
             type Open = ();
             fn probe(_device_path: &str) -> Option<Self::Info> {
                 PROBE_CALLS.fetch_add(1, Ordering::SeqCst);
-                Some(FakeInfo(2))
+                Some(FakeInfo(7))
             }
             fn open(_device_path: &str, _settings: &Self::Settings) -> Result<Self::Open, OpenError> {
                 Ok(())
             }
         }
 
-        let mut state = PresenceState::<Fake>::new();
-        let first = state.observe("dummy", false);
-        assert!(first.is_none(), "starting absent is not itself a transition");
-        assert_eq!(PROBE_CALLS.load(Ordering::SeqCst), 0);
+        let tmp = TempDevicePath::new();
+        let probe_delay = StdDuration::from_millis(200);
+        let device = Device::<Fake>::spawn_at_path(tmp.as_str().to_string(), probe_delay);
 
-        let second = state.observe("dummy", true);
-        assert_eq!(PROBE_CALLS.load(Ordering::SeqCst), 1, "a genuine absent->present transition must probe");
-        assert!(matches!(second, Some(DeviceStatus::Present(Some(FakeInfo(2))))));
-    }
-
-    #[tokio::test]
-    async fn device_status_change_dispatches_to_subscribers() {
-        struct Fake;
-        impl DeviceDriver for Fake {
-            const UEVENT_SUBSYSTEM: &'static str = "fake";
-            const PATH_ENV_VAR: &'static str = "SIMPLE_KVM_FAKE_DEVICE";
-            const DEFAULT_PATH: &'static str = "/nonexistent/simple-kvm-fake-device";
-            type Info = FakeInfo;
-            type Settings = ();
-            type Open = ();
-            fn probe(_device_path: &str) -> Option<Self::Info> {
-                Some(FakeInfo(9))
-            }
-            fn open(_device_path: &str, _settings: &Self::Settings) -> Result<Self::Open, OpenError> {
-                Ok(())
-            }
-        }
-
-        let events = Arc::new(EventEmitter::<DeviceStatus<FakeInfo>>::new());
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let _sub = events.add_event_listener(move |status| {
+        let _sub = device.add_event_listener(move |status| {
             let tx = tx.clone();
             async move {
                 let _ = tx.send(status);
             }
         });
 
-        let mut state = PresenceState::<Fake>::new();
-        let status = state.observe("dummy", true).expect("boot-time present is a transition");
-        events.dispatch(status);
+        tokio::time::sleep(probe_delay / 2).await;
+        assert_eq!(PROBE_CALLS.load(Ordering::SeqCst), 0, "still inside the delay window - must not have probed yet");
 
-        let received = tokio::time::timeout(StdDuration::from_secs(1), rx.recv()).await.expect("subscriber should have been notified").expect("channel should still be open");
-        assert!(matches!(received, DeviceStatus::Present(None)));
+        let received = tokio::time::timeout(StdDuration::from_secs(2), rx.recv()).await.expect("subscriber should have been notified once the delay elapses").expect("channel should still be open");
+        assert!(matches!(received, DeviceStatus::Present(Some(FakeInfo(7)))));
+        assert_eq!(PROBE_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    struct TempDevicePath(std::path::PathBuf);
+
+    impl TempDevicePath {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("simple-kvm-device-test-{}", unique_suffix()));
+            std::fs::write(&path, b"not a real device").unwrap();
+            Self(path)
+        }
+
+        fn as_str(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+    }
+
+    impl Drop for TempDevicePath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn unique_suffix() -> u128 {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        now ^ (counter as u128)
     }
 
     #[test]

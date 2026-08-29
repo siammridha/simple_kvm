@@ -14,12 +14,15 @@
 # uevent rather than falling back to polling: creating/deleting a plain
 # file generates no such uevent, so a live plug/unplug can't be simulated
 # from userspace here. Being present at process start, though, is a
-# transition the presence task always observes synchronously on its very
+# transition the presence task always detects synchronously on its very
 # first check, with no uevent needed (see PresenceState::observe and
-# device::tests::boot_time_already_present_does_not_probe) - enough to
-# drive a real CaptureEngine::request_stream() success and prove the
-# session's add-track + renegotiation path end to end. The fake file also
-# isn't a real V4L2 device, so the capture pass started for it fails
+# device::tests::boot_time_already_present_is_still_a_detected_transition)
+# - it still waits out device's 3-second detect-to-probe delay before the
+# actual probe/dispatch, which this script's generous log-wait timeouts
+# below already accommodate. Once dispatched, this is enough to drive a
+# real CaptureCard::request_stream() success and prove the session's
+# add-track + renegotiation path end to end. The fake file also isn't a
+# real V4L2 device, so the capture pass started for it fails
 # immediately once it runs (CaptureDriver::probe never reports a
 # supported format) - CaptureStream's `ended` event fires from that as it
 # would from a genuine mid-session unplug, proving the remove-track half
@@ -29,9 +32,9 @@
 # needs a real "video4linux" uevent this container has no privileged way
 # to synthesize). That path shares the exact same `try_attach_video`
 # function already proven above by the initial attach, triggered by
-# `CaptureEngine::add_event_listener`'s presence forwarding - covered at
+# `CaptureCard::add_event_listener`'s presence forwarding - covered at
 # the Rust level instead by device::tests::
-# genuine_absent_to_present_transition_probes (the presence edge itself)
+# genuine_absent_to_present_transition_is_detected (the presence edge itself)
 # and capture::engine::tests::
 # live_count_restarts_after_pass_stopped_on_its_own_even_if_still_live
 # (a fresh request_stream() restarting the pass).
@@ -59,7 +62,6 @@ socat -d -d pty,raw,echo=0,link="$TEST_DIR/ch9329" pty,raw,echo=0 >"$TEST_DIR/so
 SOCAT_PID=$!
 for _ in $(seq 1 50); do [ -e "$TEST_DIR/ch9329" ] && break; sleep 0.1; done
 export SERIAL_PATH="$TEST_DIR/ch9329"
-export SERIAL_OPEN_DELAY_SECS=0
 
 export AGENT_BROWSER_EXECUTABLE_PATH="/usr/bin/chromium"
 export AGENT_BROWSER_ARGS="--no-sandbox"
@@ -100,10 +102,13 @@ fi
 
 echo "Waiting for the WebRTC connection..."
 # "no video device found" is the correct status here, not a failure - the
-# fake device being present at boot deliberately skips being *probed* (see
-# the header comment above), so DeviceState.available stays false for this
-# whole run even though the presence-gated video-track path below still
-# fires. Either string proves the WebRTC connection itself succeeded
+# fake file at VIDEO_PATH isn't a real V4L2 device, so once device's
+# detect-to-probe delay elapses and CaptureDriver::probe actually runs
+# against it (see the header comment above), the probe itself fails and
+# DeviceState.available stays false for this whole run - even though the
+# presence-gated video-track path below still fires, since that only
+# needs the device to be *present*, not probed successfully. Either
+# string proves the WebRTC connection itself succeeded
 # (offer/answer exchanged, data channels open), which is what this step is
 # actually checking - negotiate() no longer attaches a video track up
 # front either way (see src/rtc/mod.rs).

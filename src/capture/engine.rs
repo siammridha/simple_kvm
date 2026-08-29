@@ -1,4 +1,4 @@
-//! `CaptureEngine`/`CaptureStream` - the `getUserMedia`/`MediaStreamTrack`
+//! `CaptureCard`/`CaptureStream` - the `getUserMedia`/`MediaStreamTrack`
 //! equivalent described in `docs/capture-redesign-ideas.md`, built on top
 //! of `Device<CaptureDriver>` (see `device::capture_driver`). Wired into
 //! the real session layer by `rtc::session::handle` (issue #006): a session asks
@@ -29,7 +29,7 @@ const DEFAULT_FPS: u32 = 5;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NoDevice;
 
-pub struct CaptureEngine {
+pub struct CaptureCard {
     shared: Arc<Shared>,
 }
 
@@ -48,10 +48,10 @@ struct Shared {
     /// settings) can move it.
     device_state_changed: Arc<EventEmitter<DeviceState>>,
     /// Keeps `Shared`'s `format`/settings cache current - see
-    /// `CaptureEngine::new`. Held only for its lifetime effect; never read
+    /// `CaptureCard::new`. Held only for its lifetime effect; never read
     /// directly. A `OnceLock` because the subscription can only be made
     /// once this `Shared` is already inside its `Arc` (see
-    /// `CaptureEngine::new`), and is then never replaced.
+    /// `CaptureCard::new`), and is then never replaced.
     device_status_sub: OnceLock<Subscription<DeviceStatus<SupportedFormat>>>,
 }
 
@@ -138,7 +138,7 @@ impl LiveCount {
     }
 }
 
-impl CaptureEngine {
+impl CaptureCard {
     pub fn new(device: CaptureDevice) -> Self {
         let (video_bus_tx, video_bus_rx) = video_bus::channel();
         let state = Mutex::new(State {
@@ -180,12 +180,11 @@ impl CaptureEngine {
                 };
                 let (new_settings, new_device_state) = {
                     let mut state = shared.state.lock().unwrap();
-                    // `Present(None)` is the boot-crash-risk "already
-                    // present, deliberately not probed" transition (see
-                    // `device::Device`'s doc comment) - `format` is left
-                    // exactly as it was, so `DeviceState` correctly stays
-                    // unavailable until a genuine transition actually
-                    // probes the card.
+                    // `Present(None)` means `CaptureDriver::probe` itself
+                    // failed (see `device::DeviceStatus`'s doc comment) -
+                    // `format` is left exactly as it was, so `DeviceState`
+                    // stays whatever it last knew rather than being wiped
+                    // by a probe that told us nothing new.
                     match status {
                         DeviceStatus::Present(Some(info)) => state.format = Some(info),
                         DeviceStatus::Present(None) => {}
@@ -282,7 +281,7 @@ impl CaptureEngine {
     /// device isn't currently present; otherwise (re)uses the shared
     /// encode pass, starting it if it isn't already running, and hands
     /// back a new per-consumer `CaptureStream`. Takes no settings: the
-    /// engine owns them, and a pass is shared by every consumer, so there
+    /// card owns them, and a pass is shared by every consumer, so there
     /// is only ever one set in play (see `update_settings`).
     ///
     /// Presence is checked per consumer, but the device is opened only by
@@ -314,7 +313,7 @@ impl CaptureEngine {
     }
 
     /// Mirrors `navigator.mediaDevices.ondevicechange` for the specific
-    /// device this engine wraps - forwards presence/capability transitions
+    /// device this card wraps - forwards presence/capability transitions
     /// exactly as `Device<CaptureDriver>` reports them. What
     /// `rtc::session::handle` subscribes to in order to retry
     /// `request_stream()` once a previously-unavailable device becomes
@@ -406,7 +405,7 @@ fn start_pass(shared: &Arc<Shared>, state: &mut State) {
     state.pass = Some(PassHandle { stop });
 }
 
-/// Decrements `CaptureEngine`'s live-stream count on drop - this *is* the
+/// Decrements `CaptureCard`'s live-stream count on drop - this *is* the
 /// guard from `docs/capture-redesign-ideas.md`'s idea 4, tied to
 /// `CaptureStream`'s own lifetime by construction rather than a
 /// separately-maintained counter.
@@ -587,7 +586,7 @@ mod tests {
         assert_eq!(default_settings(Some(&format)), CaptureSettings { resolution: first, fps: 15 });
     }
 
-    // --- `CaptureEngine`-level tests, against a real `CaptureDriver`
+    // --- `CaptureCard`-level tests, against a real `CaptureDriver`
     // pointed at a plain temp file standing in for the device path - see
     // issue #004's acceptance criteria: "no real hardware needed if
     // CaptureDriver's open is exercised against a fake/mock path in
@@ -600,7 +599,11 @@ mod tests {
     // racy ioctl failure timing. ---
 
     async fn present_device_at(path: &str) -> CaptureDevice {
-        let device = CaptureDevice::spawn_at(path);
+        // The zero-delay spawn path: this helper is about proving a
+        // present device drives `request_stream`/`pass_running`, not
+        // about `device`'s detect-to-probe delay (covered by its own
+        // tests), so it doesn't need to wait the real 3 seconds out.
+        let device = CaptureDevice::spawn_at_immediate(path);
         let (tx, mut rx) = mpsc::channel(1);
         let _sub = device.add_event_listener(move |status| {
             let tx = tx.clone();
@@ -621,8 +624,8 @@ mod tests {
         // never existed starts (and stays) `Absent`.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let engine = CaptureEngine::new(device);
-        let result = engine.request_stream().await;
+        let card = CaptureCard::new(device);
+        let result = card.request_stream().await;
         assert_eq!(result.err(), Some(NoDevice));
     }
 
@@ -630,9 +633,9 @@ mod tests {
     async fn request_stream_succeeds_when_device_present() {
         let tmp = TempDevicePath::new();
         let device = present_device_at(tmp.as_str()).await;
-        let engine = CaptureEngine::new(device);
+        let card = CaptureCard::new(device);
 
-        let result = engine.request_stream().await;
+        let result = card.request_stream().await;
         assert!(result.is_ok());
     }
 
@@ -640,25 +643,25 @@ mod tests {
     async fn pass_starts_on_first_stream_and_stops_when_last_one_drops() {
         let tmp = TempDevicePath::new();
         let device = present_device_at(tmp.as_str()).await;
-        let engine = CaptureEngine::new(device);
+        let card = CaptureCard::new(device);
 
-        let stream = engine.request_stream().await.expect("device is present");
-        assert!(engine.pass_running(), "requesting a stream while none was running must start the pass");
+        let stream = card.request_stream().await.expect("device is present");
+        assert!(card.pass_running(), "requesting a stream while none was running must start the pass");
 
         drop(stream);
         // `LiveMarker::drop` updates `state.live`/signals `stop`
         // synchronously - no need to wait for the (nonexistent, since
         // `format` is `None` for this fake path) blocking OS thread.
-        assert!(!engine.pass_running(), "dropping the last live stream must stop the pass");
+        assert!(!card.pass_running(), "dropping the last live stream must stop the pass");
     }
 
     #[tokio::test]
     async fn update_settings_changes_the_current_value_and_tells_listeners() {
-        let engine = CaptureEngine::new(CaptureDevice::spawn_at("/nonexistent/simple-kvm-test-device"));
-        assert_eq!(engine.settings(), CaptureSettings { resolution: DEFAULT_RESOLUTION, fps: DEFAULT_FPS }, "a card that never appears leaves the startup defaults in place");
+        let card = CaptureCard::new(CaptureDevice::spawn_at("/nonexistent/simple-kvm-test-device"));
+        assert_eq!(card.settings(), CaptureSettings { resolution: DEFAULT_RESOLUTION, fps: DEFAULT_FPS }, "a card that never appears leaves the startup defaults in place");
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let _sub = engine.add_settings_listener(move |settings| {
+        let _sub = card.add_settings_listener(move |settings| {
             let tx = tx.clone();
             async move {
                 let _ = tx.send(settings);
@@ -666,9 +669,9 @@ mod tests {
         });
 
         let wanted = CaptureSettings { resolution: Resolution { width: 1920, height: 1080 }, fps: 30 };
-        engine.update_settings(wanted);
+        card.update_settings(wanted);
 
-        assert_eq!(engine.settings(), wanted);
+        assert_eq!(card.settings(), wanted);
         let seen = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.expect("settings listener should fire").expect("channel should still be open");
         assert_eq!(seen, wanted);
     }
@@ -677,9 +680,9 @@ mod tests {
     async fn ended_fires_exactly_once_on_unrecoverable_pass_failure() {
         let tmp = TempDevicePath::new();
         let device = present_device_at(tmp.as_str()).await;
-        let engine = CaptureEngine::new(device);
+        let card = CaptureCard::new(device);
 
-        let stream = engine.request_stream().await.expect("device is present");
+        let stream = card.request_stream().await.expect("device is present");
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let _sub = stream.add_event_listener(move |()| {
@@ -705,9 +708,9 @@ mod tests {
     async fn ended_reaches_a_consumer_that_subscribes_after_the_pass_already_failed() {
         let tmp = TempDevicePath::new();
         let device = present_device_at(tmp.as_str()).await;
-        let engine = CaptureEngine::new(device);
+        let card = CaptureCard::new(device);
 
-        let stream = engine.request_stream().await.expect("device is present");
+        let stream = card.request_stream().await.expect("device is present");
 
         // The window this test is about: a real consumer
         // (`rtc::session::try_attach_video`) gets its stream, then awaits
@@ -716,7 +719,7 @@ mod tests {
         // strictly before the subscription below - deterministically, not
         // as a race.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(!engine.pass_running(), "the fake device's pass should already have failed by now");
+        assert!(!card.pass_running(), "the fake device's pass should already have failed by now");
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let _sub = stream.add_event_listener(move |()| {
@@ -738,8 +741,8 @@ mod tests {
     async fn next_frame_can_be_polled_from_a_spawned_task() {
         let tmp = TempDevicePath::new();
         let device = present_device_at(tmp.as_str()).await;
-        let engine = CaptureEngine::new(device);
-        let stream = engine.request_stream().await.expect("device is present");
+        let card = CaptureCard::new(device);
+        let stream = card.request_stream().await.expect("device is present");
 
         // This is the actual regression-catching mechanism for
         // `StreamInner::frames` needing `tokio::sync::Mutex`: spawning a
@@ -747,7 +750,7 @@ mod tests {
         // would (`tokio::spawn`) simply fails to compile if `frames` were
         // a `std::sync::Mutex`, because its `MutexGuard` held across
         // `.changed().await` isn't `Send`.
-        let video_bus_tx = engine.shared.video_bus_tx.clone();
+        let video_bus_tx = card.shared.video_bus_tx.clone();
         let handle = tokio::spawn(async move { stream.next_frame().await });
 
         // Give the spawned task a moment to start waiting on `.changed()`
@@ -761,7 +764,7 @@ mod tests {
     }
 
     /// A plain regular file standing in for a device path in tests (see
-    /// the module doc comment above the `CaptureEngine`-level tests) -
+    /// the module doc comment above the `CaptureCard`-level tests) -
     /// deleted on drop so repeated test runs don't litter the system temp
     /// directory.
     struct TempDevicePath(std::path::PathBuf);
