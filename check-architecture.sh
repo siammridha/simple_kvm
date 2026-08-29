@@ -30,18 +30,12 @@ allowed_edges_for() {
 	case "$1" in
 	capture) echo "device" ;;
 	hid) echo "device" ;;
-	rtc) echo "capture hid" ;;
+	rtc) echo "capture hid device" ;;
 	web) echo "rtc" ;;
 	device) echo "" ;;
 	*) echo "" ;;
 	esac
 }
-
-# Section 4's one type-only exemption: `rtc` names these two `device` types
-# because they are the payload type and the handle type of the subscriptions
-# `capture` and `hid` hand it. Anything else out of `device` is an edge, and an
-# edge that isn't in the table.
-RTC_DEVICE_TYPE_ONLY="DeviceStatus Subscription"
 
 # Section 7: `main.rs` initialises tracing and prints the startup banner. That
 # is process-level observability, not domain logic, so these two are the only
@@ -95,27 +89,6 @@ check_dependency_edges() {
 
 				for target in $(printf '%s' "$text" | grep -o 'crate::[a-z_][a-z_0-9]*' | sed 's/crate:://' | sort -u); do
 					[ "$target" = "$mod" ] && continue
-
-					# The type-only device imports rtc is allowed (section 4).
-					if [ "$mod" = "rtc" ] && [ "$target" = "device" ]; then
-						symbols=$(printf '%s' "$text" | grep -o 'crate::device::[A-Za-z_0-9{}, ]*' |
-							sed 's/crate::device:://' | tr -d '{} ' | tr ',' '\n' | grep -v '^$')
-						if [ -z "$symbols" ]; then
-							record "check 2 (dependency edges, I5): $file:$lineno: rtc imports the device module itself - only the type-only $RTC_DEVICE_TYPE_ONLY are allowed
-    $text"
-							continue
-						fi
-						for sym in $symbols; do
-							case " $RTC_DEVICE_TYPE_ONLY " in
-							*" $sym "*) ;;
-							*)
-								record "check 2 (dependency edges, I5): $file:$lineno: rtc -> device::$sym is not an allowed edge - only the type-only $RTC_DEVICE_TYPE_ONLY are exempt
-    $text"
-								;;
-							esac
-						done
-						continue
-					fi
 
 					case " $MODULES " in
 					*" $target "*) ;;

@@ -224,10 +224,10 @@ Those still need a reviewer.
 The script encodes the exceptions recorded above — `main.rs` is exempt from check 2 entirely (§7:
 naming a concrete type to construct it is not a dependency edge). `rtc → device` is a fully allowed
 edge now (§4), not a type-only exemption, since `rtc` constructs its own `capture`/`hid`
-dependencies. `main.rs`'s logging setup and startup banner (§7) are the only functions check 4
-permits there besides `main`. When one of those exceptions changes here, change it in the script
-too — **the script below still encodes the old, narrower rule (`rtc` limited to type-only
-`device::DeviceStatus`/`device::Subscription`) and needs updating to match before it will pass.**
+dependencies — the script's allowed-edges table for `rtc` includes `device` like any other row,
+with no type-only carve-out (issue #031). `main.rs`'s logging setup and startup banner (§7) are the
+only functions check 4 permits there besides `main`. When one of those exceptions changes here,
+change it in the script too.
 
 The `device` module is a directory (`src/device/`); check 1 excludes both that and the older
 single-file spelling (`src/device.rs`) so it keeps working either way. The same applies to any
