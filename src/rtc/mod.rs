@@ -21,7 +21,7 @@ use webrtc::peer_connection::{
 
 use crate::capture::engine::CaptureCard;
 use crate::capture::CaptureDevice;
-use crate::hid::Hid;
+use crate::hid::{Ch9329Device, Hid};
 use session::SessionContext;
 
 /// The WebRTC module itself: peer sessions and the offer→answer command
@@ -55,6 +55,11 @@ pub struct Rtc {
     /// every key/mouse event. The queue, the port and the drain worker
     /// live behind it; nothing here holds any of them.
     hid: Arc<Hid>,
+    /// A clone of the same `Ch9329Device` handle `hid` holds internally
+    /// (via `Hid::device`, not a second `Device::spawn()`). `rtc` is now
+    /// the thing that subscribes to it for presence - `hid` itself no
+    /// longer does.
+    hid_device: Ch9329Device,
 }
 
 impl Rtc {
@@ -84,7 +89,8 @@ impl Rtc {
 
     fn new(capture_card: Arc<CaptureCard>, hid: Arc<Hid>) -> Self {
         let capture_device = capture_card.device();
-        Self { capture_card, capture_device, hid }
+        let hid_device = hid.device();
+        Self { capture_card, capture_device, hid, hid_device }
     }
 
     /// The whole signaling surface: hand it the browser's offer SDP, get
@@ -304,7 +310,7 @@ async fn negotiate(offer_sdp: String, rtc: Rtc) -> Result<String> {
     // why this can't just be unconditional.
     ready.store(true, Ordering::Relaxed);
 
-    let ctx = SessionContext { capture_card: rtc.capture_card, capture_device: rtc.capture_device, hid: rtc.hid, h264_codec: h264_codec.rtp_codec, pc_state_rx };
+    let ctx = SessionContext { capture_card: rtc.capture_card, capture_device: rtc.capture_device, hid: rtc.hid, hid_device: rtc.hid_device, h264_codec: h264_codec.rtp_codec, pc_state_rx };
     let pc_for_session = peer_connection.clone();
     tokio::spawn(async move {
         if let Err(err) = session::handle(pc_for_session, dc_rx, renegotiation_rx, ctx).await {

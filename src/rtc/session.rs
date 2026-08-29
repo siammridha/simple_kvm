@@ -32,7 +32,7 @@ use webrtc::rtp_transceiver::RtpSender;
 use crate::capture::FrameEnvelope;
 use crate::capture::engine::{CaptureCard, CaptureStream};
 use crate::capture::{CaptureDevice, CaptureSettings, Resolution, SupportedFormat};
-use crate::hid::{Hid, InputCommand, MouseMode};
+use crate::hid::{Ch9329Device, Hid, InputCommand, MouseMode};
 use crate::device::{DeviceStatus, Subscription};
 
 use super::device_state::{device_state_for, DeviceState};
@@ -53,9 +53,16 @@ pub struct SessionContext {
     /// `capture_card.settings()` (see `current_device_state`); `capture`
     /// itself no longer tracks or computes either.
     pub capture_device: CaptureDevice,
-    /// The HID bridge - see `super::Rtc`. Input, mouse mode and CH9329
-    /// presence all go through it, as commands and subscriptions.
+    /// The HID bridge - see `super::Rtc`. Input and mouse mode go through
+    /// it, as commands and subscriptions; it no longer tracks or reports
+    /// CH9329 presence at all (see `hid_device`, below).
     pub hid: Arc<Hid>,
+    /// A clone of the same `Ch9329Device` handle `hid` holds internally
+    /// (via `Hid::device`) - see `super::Rtc`. This session subscribes to
+    /// it directly for presence and reads HID-available state straight off
+    /// it (see `push_initial_state`, `_hid_presence_sub`); `hid` itself no
+    /// longer tracks or reports presence at all.
+    pub hid_device: Ch9329Device,
     /// The H.264 codec registered on this connection's `MediaEngine` (see
     /// `negotiate()`), needed to build a fresh `TrackLocalStaticSample`
     /// whenever a live capture stream becomes available — see
@@ -394,13 +401,13 @@ pub async fn handle(
             }
         }
     });
-    let _hid_presence_sub = ctx.hid.add_event_listener({
-        let (hid, outbound_tx, control_open) = (Arc::clone(&ctx.hid), outbound_tx.clone(), Arc::clone(&control_open));
+    let _hid_presence_sub = ctx.hid_device.add_event_listener({
+        let (hid_device, outbound_tx, control_open) = (ctx.hid_device.clone(), outbound_tx.clone(), Arc::clone(&control_open));
         move |_| {
-            let (hid, outbound_tx, control_open) = (Arc::clone(&hid), outbound_tx.clone(), Arc::clone(&control_open));
+            let (hid_device, outbound_tx, control_open) = (hid_device.clone(), outbound_tx.clone(), Arc::clone(&control_open));
             async move {
                 if control_open.load(Ordering::Relaxed) {
-                    let _ = outbound_tx.send(ServerMessage::HidState { available: hid.is_present() });
+                    let _ = outbound_tx.send(ServerMessage::HidState { available: hid_device.is_present() });
                 }
             }
         }
@@ -483,7 +490,7 @@ pub async fn handle(
                         // recomputed from whatever `device` last probed when the
                         // card was plugged in (`current_device_state`) - opening
                         // this channel doesn't trigger a fresh probe of its own.
-                        if push_initial_state(&outbound_tx, &ctx.capture_device, &ctx.capture_card, &ctx.hid).is_ok() {
+                        if push_initial_state(&outbound_tx, &ctx.capture_device, &ctx.capture_card, &ctx.hid, &ctx.hid_device).is_ok() {
                             control_open.store(true, Ordering::Relaxed);
                         }
                     }
@@ -552,10 +559,10 @@ fn current_device_state(capture_device: &CaptureDevice, capture_card: &CaptureCa
 /// only fires for changes from here on — it doesn't tell a freshly
 /// connected tab about state that was already current before it connected
 /// (see the call site in `handle`).
-fn push_initial_state(outbound_tx: &mpsc::UnboundedSender<ServerMessage>, capture_device: &CaptureDevice, capture_card: &CaptureCard, hid: &Hid) -> Result<()> {
+fn push_initial_state(outbound_tx: &mpsc::UnboundedSender<ServerMessage>, capture_device: &CaptureDevice, capture_card: &CaptureCard, hid: &Hid, hid_device: &Ch9329Device) -> Result<()> {
     let closed = || anyhow::anyhow!("outbound queue closed");
     outbound_tx.send(ServerMessage::DeviceState(current_device_state(capture_device, capture_card))).map_err(|_| closed())?;
-    outbound_tx.send(ServerMessage::HidState { available: hid.is_present() }).map_err(|_| closed())?;
+    outbound_tx.send(ServerMessage::HidState { available: hid_device.is_present() }).map_err(|_| closed())?;
     outbound_tx.send(ServerMessage::Settings { capture: capture_card.settings(), mouse_mode: hid.mouse_mode() }).map_err(|_| closed())?;
     Ok(())
 }
@@ -698,13 +705,16 @@ mod tests {
         // stream, so a real capture device is neither needed nor wanted.
         let capture_device = CaptureDevice::spawn_at("/nonexistent-simple-kvm-test-device");
         let capture_card = Arc::new(CaptureCard::new(capture_device));
+        // Points at a path that will never exist, same reasoning as
+        // `capture_device` above - these tests only reach
+        // `handle_control_message`.
+        let hid = Hid::spawn_for_test();
+        let hid_device = hid.device();
         SessionContext {
             capture_device: capture_card.device(),
             capture_card,
-            // Points at a path that will never exist, same reasoning as
-            // `capture_device` above - these tests only reach
-            // `handle_control_message`.
-            hid: Hid::spawn_for_test(),
+            hid,
+            hid_device,
             h264_codec: RTCRtpCodec::default(),
             pc_state_rx,
         }

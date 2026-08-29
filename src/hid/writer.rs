@@ -37,19 +37,12 @@ const SLOW_COMMAND_THRESHOLD: Duration = Duration::from_millis(50);
 #[derive(Debug, Clone)]
 pub(super) enum Command {
     Input(InputCommand),
-    /// Sent by `Hid`'s presence listener whenever the CH9329 appears or
-    /// disappears — carries no data of its own, just prompts `handle` to
-    /// re-run `sync_connection_state` so a reconnect is noticed
-    /// immediately instead of waiting for the next real keystroke or
-    /// click.
-    CheckConnection,
 }
 
 impl Command {
     fn kind(&self) -> &'static str {
         match self {
             Command::Input(input) => input.kind(),
-            Command::CheckConnection => "check_connection",
         }
     }
 }
@@ -132,7 +125,6 @@ impl SerialWriter {
                 Encoded::Packet(protocol::mouse_relative(buttons, 0, 0, wheel))
             }
             Command::Input(InputCommand::PasteText(text)) => Encoded::Text(text),
-            Command::CheckConnection => Encoded::Nothing, // sync_connection_state() in `handle` does the work
         }
     }
 
@@ -199,7 +191,6 @@ mod tests {
         // Queued while the device is absent: handled (as no-ops) in order,
         // then the closed queue ends the loop.
         commands_tx.send(Command::Input(InputCommand::PointerButtons { buttons: 1, wheel: 0 })).await.unwrap();
-        commands_tx.send(Command::CheckConnection).await.unwrap();
         drop(commands_tx);
 
         tokio::time::timeout(Duration::from_secs(5), worker).await.expect("the worker must end once its queue closes").expect("the worker must not panic");

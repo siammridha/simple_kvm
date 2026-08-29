@@ -31,7 +31,13 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::device::{Ch9329Device, DeviceStatus, EventEmitter, Subscription};
+use crate::device::{EventEmitter, Subscription};
+
+/// Re-exported so `rtc` can name this type via `crate::hid::Ch9329Device`
+/// instead of reaching past this module into `crate::device` directly - the
+/// same trick `capture` already uses for `CaptureDevice` (`ARCHITECTURE.md`
+/// §3.3/§3.4).
+pub use crate::device::Ch9329Device;
 
 use writer::Command;
 
@@ -108,17 +114,14 @@ impl std::error::Error for QueueClosed {}
 pub struct Hid {
     /// The only strong sender - see the module docs on lifetimes.
     commands: mpsc::Sender<Command>,
-    /// `is_present`/`add_event_listener` delegate straight to this -
-    /// there's no settle delay of this module's own any more, so the
-    /// `Ch9329Device` exists for `Hid`'s whole lifetime (the boot-crash
-    /// mitigation now lives once, generically, in `device`'s own
-    /// detect-to-probe delay).
+    /// `device()` hands out a clone of this - there's no settle delay of
+    /// this module's own any more, so the `Ch9329Device` exists for
+    /// `Hid`'s whole lifetime (the boot-crash mitigation now lives once,
+    /// generically, in `device`'s own detect-to-probe delay). This module
+    /// no longer subscribes to it itself; the drain worker's own
+    /// `sync_connection_state` (see `writer`) checks presence per command
+    /// instead.
     device: Ch9329Device,
-    /// Kept alive only so its callback keeps firing - it prompts the
-    /// worker to open or drop its port the instant presence changes,
-    /// rather than waiting for the next command. Dropped, like everything
-    /// else here, when `Hid` is.
-    _presence_forward: Subscription<DeviceStatus<()>>,
     /// Read and written from both async tasks and the page's control
     /// channel, but never held across an `.await` - a plain `std` mutex
     /// rather than tokio's.
@@ -142,24 +145,12 @@ impl Hid {
     fn new(device: Ch9329Device) -> Arc<Self> {
         let (commands_tx, commands_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
 
-        let forward_tx = commands_tx.downgrade();
-        let presence_forward = device.add_event_listener(move |_status| {
-            let forward_tx = forward_tx.clone();
-            async move {
-                // Prompts the worker to open or drop its port right away,
-                // rather than only on the next real keystroke or click.
-                if let Some(commands_tx) = forward_tx.upgrade() {
-                    let _ = commands_tx.send(Command::CheckConnection).await;
-                }
-            }
-        });
-
         let writer = writer::SerialWriter::new(device.clone());
         tokio::spawn(async move {
             let _ = tokio::task::spawn_blocking(move || writer.run(commands_rx)).await;
         });
 
-        Arc::new(Self { commands: commands_tx, device, _presence_forward: presence_forward, mouse_mode: Mutex::new(DEFAULT_MOUSE_MODE), mouse_mode_events: Arc::new(EventEmitter::new()) })
+        Arc::new(Self { commands: commands_tx, device, mouse_mode: Mutex::new(DEFAULT_MOUSE_MODE), mouse_mode_events: Arc::new(EventEmitter::new()) })
     }
 
     /// Queues `command` for the CH9329. Commands reach the hardware in the
@@ -167,14 +158,6 @@ impl Hid {
     /// port isn't open yet.
     pub async fn send(&self, command: InputCommand) -> Result<(), QueueClosed> {
         self.commands.send(Command::Input(command)).await.map_err(|_| QueueClosed)
-    }
-
-    /// Whether the CH9329 is plugged in right now. The read counterpart of
-    /// `add_event_listener`: presence events only fire on a transition, so
-    /// a subscriber that starts after the chip was already found needs this
-    /// to learn where it's starting from.
-    pub fn is_present(&self) -> bool {
-        self.device.is_present()
     }
 
     pub fn mouse_mode(&self) -> MouseMode {
@@ -198,16 +181,12 @@ impl Hid {
         self.mouse_mode_events.add_event_listener(callback)
     }
 
-    /// Mirrors `addEventListener('devicechange', cb)` for the CH9329 -
-    /// forwards presence exactly as `Device<Ch9329Driver>` reports it. The
-    /// HID counterpart of subscribing directly on a `CaptureDevice` handle
-    /// (see `CaptureCard::device`, `rtc::session`).
-    pub fn add_event_listener<F, Fut>(&self, callback: F) -> Subscription<DeviceStatus<()>>
-    where
-        F: Fn(DeviceStatus<()>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-        self.device.add_event_listener(callback)
+    /// Hands back the same CH9329 device this module holds - a clone, not
+    /// a second `Device::spawn()` (see `ARCHITECTURE.md` §3.1 "one instance
+    /// per physical device"). `rtc` uses this to subscribe to presence
+    /// directly (§3.3/§3.4) - this module no longer does either.
+    pub fn device(&self) -> Ch9329Device {
+        self.device.clone()
     }
 }
 
