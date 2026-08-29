@@ -4,7 +4,6 @@ pub mod session;
 
 pub use device_state::DeviceState;
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use anyhow::{Context, Result};
@@ -183,25 +182,6 @@ struct Handler {
     /// browser as a `ServerMessage::Offer` (see `on_negotiation_needed`
     /// below and the `renegotiation_rx` arm in `session::handle`).
     renegotiation_tx: mpsc::UnboundedSender<String>,
-    /// False until `negotiate()` has finished the *initial* offer/answer
-    /// exchange and captured its answer SDP. Without this guard,
-    /// `on_negotiation_needed` fires spuriously during that very exchange:
-    /// the browser's offer always includes a recvonly video transceiver
-    /// (see `assets/web/app.js`), so the moment our own answer reaches
-    /// `RTCSignalingState::Stable`, the crate re-runs its own
-    /// negotiation-needed check and finds a `sendonly`-direction
-    /// transceiver (the automatic reverse of the browser's `recvonly`)
-    /// with no sender attached yet - which the crate always reports as
-    /// "still needs negotiating", track or no track. Reacting to that by
-    /// immediately building a new offer races `negotiate()`'s own
-    /// `local_description()` read below: `set_local_description` on the
-    /// spurious offer can land first, so the HTTP response ends up
-    /// carrying an *offer* (always `a=setup:actpass`) instead of the
-    /// intended answer - which every browser correctly rejects, since an
-    /// answer must commit to `active`/`passive`. Confirmed by direct
-    /// reproduction against this exact crate version. Set once, true for
-    /// good, at the end of `negotiate()` - see the `ready.store` there.
-    ready: Arc<AtomicBool>,
 }
 
 #[async_trait::async_trait]
@@ -237,9 +217,6 @@ impl PeerConnectionEventHandler for Handler {
     /// until the resulting round trip completes, so no additional
     /// debouncing is needed here.
     async fn on_negotiation_needed(&self) {
-        if !self.ready.load(Ordering::Relaxed) {
-            return;
-        }
         let Some(pc) = self.pc.get().and_then(Weak::upgrade) else {
             return;
         };
@@ -267,11 +244,11 @@ impl PeerConnectionEventHandler for Handler {
 /// the life of the connection. Returns the answer SDP to send back once
 /// ICE gathering completes (there's nothing left to negotiate after that -
 /// the browser did the same non-trickle wait before sending its offer).
-/// No video track is attached here — the browser's offer already includes
-/// a recvonly video transceiver (see `assets/web/app.js`'s `connect()`),
-/// but the session starts with nothing sending on it; `session::handle`
-/// attaches one later, once its connection is stable and a capture stream
-/// is actually available (see `Handler::on_negotiation_needed`).
+/// No video track is attached here — the browser's initial offer declares
+/// no video transceiver at all (see `assets/web/app.js`'s `connect()`);
+/// `session::handle` attaches a video track later, once its connection is
+/// stable and a capture stream is actually available, which is what first
+/// triggers `Handler::on_negotiation_needed`.
 async fn negotiate(offer_sdp: String, rtc: Rtc) -> Result<String> {
     let mut media_engine = MediaEngine::default();
     let h264_codec = RTCRtpCodecParameters {
@@ -301,8 +278,7 @@ async fn negotiate(offer_sdp: String, rtc: Rtc) -> Result<String> {
     let (state_tx, pc_state_rx) = watch::channel(RTCPeerConnectionState::New);
     let (renegotiation_tx, renegotiation_rx) = mpsc::unbounded_channel();
     let pc_cell: Arc<OnceCell<Weak<dyn PeerConnection>>> = Arc::new(OnceCell::new());
-    let ready = Arc::new(AtomicBool::new(false));
-    let handler = Arc::new(Handler { gather_complete, dc_tx, state_tx, pc: pc_cell.clone(), renegotiation_tx, ready: ready.clone() });
+    let handler = Arc::new(Handler { gather_complete, dc_tx, state_tx, pc: pc_cell.clone(), renegotiation_tx });
 
     let peer_connection: Arc<dyn PeerConnection> = Arc::new(
         PeerConnectionBuilder::new()
@@ -331,10 +307,6 @@ async fn negotiate(offer_sdp: String, rtc: Rtc) -> Result<String> {
     let _ = gather_complete_rx.await;
 
     let local_description = peer_connection.local_description().await.context("no local description after ICE gathering completed")?;
-    // Only now does `Handler::on_negotiation_needed` start acting on
-    // renegotiation triggers - see the doc comment on `Handler::ready` for
-    // why this can't just be unconditional.
-    ready.store(true, Ordering::Relaxed);
 
     let ctx = SessionContext { capture_card: rtc.capture_card, capture_device: rtc.capture_device, hid: rtc.hid, hid_device: rtc.hid_device, h264_codec: h264_codec.rtp_codec, pc_state_rx };
     let pc_for_session = peer_connection.clone();

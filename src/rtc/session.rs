@@ -150,13 +150,14 @@ struct RawVideoTrack {
     sender: Arc<dyn RtpSender>,
 }
 
-/// Builds a fresh H.264 track and attaches it to `pc`. Confirmed against
-/// the vendored `rtc-0.20.3` source that `add_track` reuses the
-/// transceiver the browser already offered for video (matching `kind()`/an
-/// empty `sender()`) rather than adding a duplicate `m=video` line, and
-/// itself calls `trigger_negotiation_needed()` — which is what drives
-/// `Handler::on_negotiation_needed` (see `super::Handler`) to create a
-/// fresh offer and hand it to this session over `renegotiation_rx`.
+/// Builds a fresh H.264 track and attaches it to `pc`. The browser's
+/// initial offer declares no video transceiver at all (see
+/// `assets/web/app.js`'s `connect()`), so `add_track` here is what creates
+/// one, with its sender already attached — confirmed against the vendored
+/// `rtc-0.20.3` source that this itself calls `trigger_negotiation_needed()`,
+/// which is what drives `Handler::on_negotiation_needed` (see
+/// `super::Handler`) to create a fresh offer and hand it to this session
+/// over `renegotiation_rx`.
 async fn add_video_track(pc: &Arc<dyn PeerConnection>, codec: &RTCRtpCodec) -> Result<RawVideoTrack> {
     let ssrc = super::rand_u32();
     let track = Arc::new(

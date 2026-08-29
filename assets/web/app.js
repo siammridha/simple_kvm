@@ -386,7 +386,6 @@ async function connect() {
     }
   });
 
-  pc.addTransceiver('video', { direction: 'recvonly' });
   pc.addEventListener('track', (event) => {
     videoEl.srcObject = event.streams[0] ?? new MediaStream([event.track]);
   });
