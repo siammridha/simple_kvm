@@ -204,10 +204,12 @@ async fn try_attach_video(pc: &Arc<dyn PeerConnection>, capture_card: &CaptureCa
     let ended_sub = stream.add_event_listener(move |()| {
         let video_ended_tx = video_ended_tx.clone();
         async move {
+            tracing::info!("capture stream ended: video track will be removed");
             let _ = video_ended_tx.send(());
         }
     });
-    tracing::info!("capture device available: added video track");
+    let settings = capture_card.settings();
+    tracing::info!(width = settings.resolution.width, height = settings.resolution.height, fps = settings.fps, "capture device available: added video track");
     Some(VideoState { track: raw.track, sender: raw.sender, target: None, stream, _ended_sub: ended_sub })
 }
 
@@ -476,7 +478,9 @@ pub async fn handle(
                 }
             }
             Some(status) = presence_rx.recv() => {
-                match presence_action(&status, connected, video.is_some()) {
+                let action = presence_action(&status, connected, video.is_some());
+                tracing::debug!(?status, connected, has_video = video.is_some(), ?action, "session: capture device presence notification received");
+                match action {
                     PresenceAction::TryAttach => {
                         if let Some(v) = try_attach_video(&pc, &ctx.capture_card, &ctx.h264_codec, &video_ended_tx).await {
                             last_captured_at = None;

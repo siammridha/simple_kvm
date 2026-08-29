@@ -74,7 +74,7 @@ const DETECT_TO_PROBE_DELAY: Duration = Duration::from_secs(5);
 /// arguments at all, so no caller ever holds a device path
 /// (`ARCHITECTURE.md` I2/I3).
 pub trait DeviceDriver: Send + Sync + 'static {
-    type Info: Clone + Send + 'static;
+    type Info: Clone + std::fmt::Debug + Send + 'static;
     type Settings: Send + 'static;
     type Open: Send + 'static;
 
@@ -279,7 +279,9 @@ async fn run_presence_task<D: DeviceDriver>(inner: Arc<DeviceInner<D>>, probe_de
                     tokio::time::sleep(probe_delay).await;
                 }
                 if Path::new(&inner.device_path).exists() {
+                    tracing::debug!(device_path = %inner.device_path, "probing device");
                     let info = D::probe(&inner.device_path);
+                    tracing::info!(device_path = %inner.device_path, ?info, "device probed");
                     inner.events.dispatch(DeviceStatus::Present(info));
                 } else {
                     tracing::info!(device_path = %inner.device_path, "device disappeared during the detect-to-probe delay, not probing");

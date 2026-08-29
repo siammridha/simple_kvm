@@ -48,9 +48,9 @@ RUN curl -fsSL https://claude.ai/install.sh | bash
 # installed here as the same vscode user that owns the Claude Code binary.
 # ponytail comes from its own marketplace (not the official one above).
 RUN claude plugin marketplace add DietrichGebert/ponytail && \
-    claude plugin marketplace add anthropics/claude-plugins-official && \
-    (claude plugin install ponytail@ponytail || echo "Warning: plugin install failed, continuing build") && \
     (claude plugin install rust-analyzer-lsp@claude-plugins-official || echo "Warning: plugin install failed, continuing build")
+    # claude plugin marketplace add anthropics/claude-plugins-official && \
+    # (claude plugin install ponytail@ponytail || echo "Warning: plugin install failed, continuing build") && \
 # Stop Claude Code from auto-installing its VS Code extension when `claude`
 # runs in the integrated terminal. This is a /config toggle, not a
 # settings.json field, so it lives in .claude.json instead. Baked into the

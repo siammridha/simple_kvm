@@ -105,9 +105,11 @@ impl Rtc {
             capture_device.add_event_listener(move |status| {
                 let capture_card = Arc::clone(&capture_card);
                 async move {
+                    tracing::debug!(?status, "rtc: capture device presence notification received");
                     if let DeviceStatus::Present(Some(info)) = status
                         && let Some(settings) = device_state::first_reported_settings(&info)
                     {
+                        tracing::info!(?settings, "rtc: applying capture default settings from device capabilities");
                         capture_card.apply_default_settings(settings);
                     }
                 }
