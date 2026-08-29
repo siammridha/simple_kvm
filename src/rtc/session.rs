@@ -221,6 +221,27 @@ fn device_probed_available(capture_device: &CaptureDevice) -> bool {
     matches!(capture_device.latest_status(), Some(DeviceStatus::Present(Some(_))))
 }
 
+/// What a presence-status change should do to this session's video track,
+/// given whether the connection is stable and whether one is currently
+/// attached. Split out from the `presence_rx` arm in `handle()` purely so
+/// this decision is unit-testable without a real `CaptureStream` - nothing
+/// in this crate can fabricate one outside `capture::engine` (see #027),
+/// and this container has no working fake V4L2 device.
+#[derive(Debug, PartialEq)]
+enum PresenceAction {
+    TryAttach,
+    Remove,
+    Nothing,
+}
+
+fn presence_action(status: &DeviceStatus<SupportedFormat>, connected: bool, has_video: bool) -> PresenceAction {
+    match status {
+        DeviceStatus::Present(Some(_)) if connected && !has_video => PresenceAction::TryAttach,
+        DeviceStatus::Absent if has_video => PresenceAction::Remove,
+        _ => PresenceAction::Nothing,
+    }
+}
+
 /// Removes this session's video track (in response to its `CaptureStream`'s
 /// `ended` event, forwarded via `handle`'s `video_ended_rx`) and
 /// renegotiates the same way `try_attach_video`'s `add_track` did -
@@ -455,11 +476,19 @@ pub async fn handle(
                 }
             }
             Some(status) = presence_rx.recv() => {
-                if connected && video.is_none() && matches!(status, DeviceStatus::Present(Some(_)))
-                    && let Some(v) = try_attach_video(&pc, &ctx.capture_card, &ctx.h264_codec, &video_ended_tx).await
-                {
-                    last_captured_at = None;
-                    video = Some(v);
+                match presence_action(&status, connected, video.is_some()) {
+                    PresenceAction::TryAttach => {
+                        if let Some(v) = try_attach_video(&pc, &ctx.capture_card, &ctx.h264_codec, &video_ended_tx).await {
+                            last_captured_at = None;
+                            video = Some(v);
+                        }
+                    }
+                    PresenceAction::Remove => {
+                        if let Some(v) = video.take() {
+                            remove_video_track(&pc, v).await;
+                        }
+                    }
+                    PresenceAction::Nothing => {}
                 }
             }
             Some(sdp) = renegotiation_rx.recv() => {
@@ -718,6 +747,43 @@ mod tests {
             h264_codec: RTCRtpCodec::default(),
             pc_state_rx,
         }
+    }
+
+    fn present_with_info() -> DeviceStatus<SupportedFormat> {
+        DeviceStatus::Present(Some(SupportedFormat { resolutions: vec![], frame_rates: Default::default() }))
+    }
+
+    #[test]
+    fn presence_action_attaches_when_present_connected_and_no_video() {
+        assert_eq!(presence_action(&present_with_info(), true, false), PresenceAction::TryAttach);
+    }
+
+    #[test]
+    fn presence_action_does_nothing_when_present_but_already_has_video() {
+        assert_eq!(presence_action(&present_with_info(), true, true), PresenceAction::Nothing);
+    }
+
+    #[test]
+    fn presence_action_does_nothing_when_present_but_not_connected() {
+        assert_eq!(presence_action(&present_with_info(), false, false), PresenceAction::Nothing);
+    }
+
+    #[test]
+    fn presence_action_removes_when_absent_and_has_video() {
+        assert_eq!(presence_action(&DeviceStatus::Absent, true, true), PresenceAction::Remove);
+        assert_eq!(presence_action(&DeviceStatus::Absent, false, true), PresenceAction::Remove);
+    }
+
+    #[test]
+    fn presence_action_does_nothing_when_absent_and_no_video() {
+        assert_eq!(presence_action(&DeviceStatus::Absent, true, false), PresenceAction::Nothing);
+    }
+
+    #[test]
+    fn presence_action_does_nothing_when_present_but_unprobed() {
+        assert_eq!(presence_action(&DeviceStatus::Present(None), true, false), PresenceAction::Nothing);
+        assert_eq!(presence_action(&DeviceStatus::Present(None), true, true), PresenceAction::Nothing);
+        assert_eq!(presence_action(&DeviceStatus::Present(None), false, false), PresenceAction::Nothing);
     }
 
     #[tokio::test]
