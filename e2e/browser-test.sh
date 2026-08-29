@@ -19,22 +19,38 @@
 # device::tests::boot_time_already_present_is_still_a_detected_transition)
 # - it still waits out device's 3-second detect-to-probe delay before the
 # actual probe/dispatch, which this script's generous log-wait timeouts
-# below already accommodate. Once dispatched, this is enough to drive a
-# real CaptureCard::request_stream() success and prove the session's
-# add-track + renegotiation path end to end. The fake file also isn't a
-# real V4L2 device, so the capture pass started for it fails
-# immediately once it runs (CaptureDriver::probe never reports a
-# supported format) - CaptureStream's `ended` event fires from that as it
-# would from a genuine mid-session unplug, proving the remove-track half
-# too, all without needing any uevent at all.
+# below already accommodate.
 #
-# What this setup *can't* exercise: a genuine mid-session replug (that
-# needs a real "video4linux" uevent this container has no privileged way
-# to synthesize). That path shares the exact same `try_attach_video`
-# function already proven above by the initial attach, triggered by
-# `rtc::session`'s own subscription on its `CaptureDevice` handle
-# (`ctx.capture_device.add_event_listener`, see src/rtc/session.rs) -
-# covered at the Rust level instead by device::tests::
+# Since the fake file isn't a real V4L2 device, CaptureDriver::probe never
+# reports a supported format for it - so once the detect-to-probe delay
+# elapses, the device stays "present but never probed"
+# (DeviceStatus::Present(None)) for the rest of this run. Issue #027 made
+# CaptureCard::request_stream() genuinely attempt and await a real device
+# open (rather than gating on a stale presence flag), and its approved
+# scope addition made `rtc::session` only ever attempt that open when the
+# device is present *and* successfully probed
+# (DeviceStatus::Present(Some(_))) - see device_probed_available in
+# src/rtc/session.rs. So this fixture can no longer drive a video track
+# being added at all: what it proves instead is that a present-but-
+# unprobeable device correctly never gets a video track, and that the
+# WebRTC connection and its data channels stay healthy regardless (see
+# "Confirming no video track is ever added..." below).
+#
+# Genuine successful-attach (a real Device::open succeeding) and genuine
+# mid-stream failure (CaptureStream's `ended` firing for a pass that
+# started successfully and later died) both need a real capture card, so
+# both now live entirely on real hardware via ./test-on-device.sh - issue
+# #027's own acceptance criteria already requires that: "confirm the video
+# track still attaches normally when the card is present, and that
+# unplugging mid-stream still ends the stream the same way it does today."
+#
+# What this setup *can't* exercise at all, hardware or not: a genuine
+# mid-session replug (that needs a real "video4linux" uevent this
+# container has no privileged way to synthesize). That path shares the
+# exact same `try_attach_video` function proven on real hardware by the
+# initial attach, triggered by `rtc::session`'s own subscription on its
+# `CaptureDevice` handle (`ctx.capture_device.add_event_listener`, see
+# src/rtc/session.rs) - covered at the Rust level instead by device::tests::
 # genuine_absent_to_present_transition_is_detected (the presence edge itself)
 # and capture::engine::tests::
 # live_count_restarts_after_pass_stopped_on_its_own_even_if_still_live
@@ -51,8 +67,9 @@ cd "$(dirname "$0")/.."
 
 export HTTP_PORT="${HTTP_PORT:-3000}"
 # `simple_kvm::rtc::session=info` on top of the otherwise-quiet default is
-# what surfaces the "added video track"/"removed video track" lines this
-# script greps the server log for below.
+# what would surface the "added video track" line this script greps the
+# server log for below - it should never actually appear for this run's
+# present-but-unprobeable fake device (see the header comment above).
 export RUST_LOG="${RUST_LOG:-warn,simple_kvm::rtc::session=info}"
 
 TEST_DIR="$(mktemp -d)"
@@ -106,13 +123,14 @@ echo "Waiting for the WebRTC connection..."
 # fake file at VIDEO_PATH isn't a real V4L2 device, so once device's
 # detect-to-probe delay elapses and CaptureDriver::probe actually runs
 # against it (see the header comment above), the probe itself fails and
-# DeviceState.available stays false for this whole run - even though the
-# presence-gated video-track path below still fires, since that only
-# needs the device to be *present*, not probed successfully. Either
-# string proves the WebRTC connection itself succeeded
-# (offer/answer exchanged, data channels open), which is what this step is
-# actually checking - negotiate() no longer attaches a video track up
-# front either way (see src/rtc/mod.rs).
+# DeviceState.available stays false for this whole run - and, since issue
+# #027's approved gate on probed availability, the video-track path below
+# is never even attempted either, because that now needs the device to be
+# present *and* successfully probed (see device_probed_available in
+# src/rtc/session.rs). Either string proves the WebRTC connection itself
+# succeeded (offer/answer exchanged, data channels open), which is what
+# this step is actually checking - negotiate() no longer attaches a video
+# track up front either way (see src/rtc/mod.rs).
 STATUS_TEXT=""
 for _ in $(seq 1 50); do
 	STATUS_TEXT=$(agent-browser get text "#status")
@@ -139,54 +157,19 @@ assert_still_connected() {
 	fi
 }
 
-# Waits (bounded) for the server's log to contain at least $2 occurrences
-# of $1 - `rtc::session::handle` logs exactly these lines from
-# `try_attach_video`/`remove_video_track` (see src/rtc/session.rs), so
-# this is a direct check that the real add/remove-track code path ran, not
-# an inference from browser-visible WebRTC object state (a recvonly
-# transceiver's receiver/track exists from the initial offer regardless of
-# whether the server ever attaches anything to it, so receiver count can't
-# tell the two states apart).
-wait_for_log_count() {
-	pattern="$1"
-	want="$2"
-	got=0
-	for _ in $(seq 1 100); do
-		got=$(grep -c "$pattern" "$SERVER_LOG" 2>/dev/null || true)
-		[ -z "$got" ] && got=0
-		[ "$got" -ge "$want" ] && return 0
-		sleep 0.2
-	done
-	echo "FAIL: server log never reached $want occurrence(s) of '$pattern' (got $got)" >&2
-	echo "--- server log tail ---" >&2
-	tail -n 40 "$SERVER_LOG" >&2
+echo "Confirming no video track is ever added for a present-but-unprobeable device (issue #027 + the approved gate on probed availability: this container can't fake a working V4L2 device, so request_stream() should never even be attempted here)..."
+if grep -q "capture device available: added video track" "$SERVER_LOG"; then
+	echo "FAIL: a video track was added for a device that never successfully probes - #027/gating regression" >&2
 	exit 1
-}
+fi
+assert_still_connected "with no video track ever attached"
 
-echo "Waiting for the server to add this session's video track (fake device was already present at startup)..."
-wait_for_log_count "capture device available: added video track" 1
-echo "server added a video track for this session"
-assert_still_connected "after adding video"
-
-# The fake device file isn't a real V4L2 device, so CaptureDriver::probe
-# never reports a supported format for it - the capture pass started for it
-# fails immediately (see src/capture/mod.rs's run_one_pass and
-# src/capture/engine.rs's own "ended_fires_exactly_once_on_unrecoverable_
-# pass_failure" test, which exercises the exact same fake-file setup).
-# CaptureStream's `ended` event fires from that, same as it would for a
-# genuine mid-session unplug - this is what's being proven here: the
-# session removes its video track and renegotiates on its own, with no
-# further action from this script and no page reload.
-echo "Waiting for the video track to be removed again (simulated capture failure/unplug)..."
-wait_for_log_count "capture device unavailable: removed video track" 1
-assert_still_connected "after losing video"
-
-echo "Confirming the input/control data channels survived all that renegotiation..."
+echo "Confirming the input/control data channels are open..."
 DC_STATES=$(agent-browser eval "inputChannel.readyState + ',' + controlChannel.readyState")
 BOTH_OPEN=$(agent-browser eval "inputChannel.readyState === 'open' && controlChannel.readyState === 'open'")
 echo "input,control readyState: $DC_STATES"
 if [ "$BOTH_OPEN" != "true" ]; then
-	echo "FAIL: expected both data channels still 'open' after renegotiating, got $DC_STATES" >&2
+	echo "FAIL: expected both data channels 'open', got $DC_STATES" >&2
 	exit 1
 fi
 
@@ -242,4 +225,4 @@ if [ -n "$PAGE_ERRORS" ]; then
 	exit 1
 fi
 
-echo "PASS: page loaded, dropdowns present, WebRTC connected with no TLS anywhere, video track added then removed live via a real presence-gated capture stream, Save settings applied in memory (no settings file), no uncaught JS errors."
+echo "PASS: page loaded, dropdowns present, WebRTC connected with no TLS anywhere, no video track attached for a present-but-unprobeable device, Save settings applied in memory (no settings file), no uncaught JS errors."

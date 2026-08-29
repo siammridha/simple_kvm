@@ -30,7 +30,7 @@ use webrtc::peer_connection::{PeerConnection, RTCPeerConnectionState, RTCSession
 use webrtc::rtp_transceiver::RtpSender;
 
 use crate::capture::FrameEnvelope;
-use crate::capture::engine::{CaptureCard, CaptureStream, NoDevice};
+use crate::capture::engine::{CaptureCard, CaptureStream};
 use crate::capture::{CaptureDevice, CaptureSettings, Resolution, SupportedFormat};
 use crate::hid::{Hid, InputCommand, MouseMode};
 use crate::device::{DeviceStatus, Subscription};
@@ -172,15 +172,19 @@ async fn add_video_track(pc: &Arc<dyn PeerConnection>, codec: &RTCRtpCodec) -> R
 
 /// Asks the capture card for a live stream (`CaptureCard::
 /// request_stream`, mirroring `getUserMedia`) and, on success, builds and
-/// attaches a fresh RTP track for it. Returns `None` if the device isn't
-/// currently available (`NoDevice`) or attaching the track itself failed -
+/// attaches a fresh RTP track for it. Returns `None` if the open itself
+/// failed (device absent, or negotiation failed - see `CaptureCard::
+/// request_stream`'s `OpenError`) or attaching the track itself failed -
 /// either way the caller just leaves the session without video, ready to
 /// try again the next time `handle`'s `presence_rx` reports the device is
 /// available.
 async fn try_attach_video(pc: &Arc<dyn PeerConnection>, capture_card: &CaptureCard, codec: &RTCRtpCodec, video_ended_tx: &mpsc::UnboundedSender<()>) -> Option<VideoState> {
     let stream = match capture_card.request_stream().await {
         Ok(stream) => stream,
-        Err(NoDevice) => return None,
+        Err(err) => {
+            tracing::debug!(%err, "no capture stream available");
+            return None;
+        }
     };
     let raw = match add_video_track(pc, codec).await {
         Ok(raw) => raw,
@@ -198,6 +202,16 @@ async fn try_attach_video(pc: &Arc<dyn PeerConnection>, capture_card: &CaptureCa
     });
     tracing::info!("capture device available: added video track");
     Some(VideoState { track: raw.track, sender: raw.sender, target: None, stream, _ended_sub: ended_sub })
+}
+
+/// Whether the capture device is not just present but successfully
+/// probed - `rtc` only attempts `request_stream()` when this is true
+/// (approved scope addition to issue #027; see the issue's own comment
+/// thread / ARCHITECTURE.md §3.4 for the reasoning: a one-time probe
+/// failure right after hot-plug means no auto-retry until replug, which
+/// is an accepted tradeoff, not an oversight).
+fn device_probed_available(capture_device: &CaptureDevice) -> bool {
+    matches!(capture_device.latest_status(), Some(DeviceStatus::Present(Some(_))))
 }
 
 /// Removes this session's video track (in response to its `CaptureStream`'s
@@ -434,7 +448,7 @@ pub async fn handle(
                 }
             }
             Some(status) = presence_rx.recv() => {
-                if connected && video.is_none() && matches!(status, DeviceStatus::Present(_))
+                if connected && video.is_none() && matches!(status, DeviceStatus::Present(Some(_)))
                     && let Some(v) = try_attach_video(&pc, &ctx.capture_card, &ctx.h264_codec, &video_ended_tx).await
                 {
                     last_captured_at = None;
@@ -501,7 +515,9 @@ pub async fn handle(
                     // device is already available; if not, `presence_rx`
                     // above retries later.
                     connected = true;
-                    if let Some(v) = try_attach_video(&pc, &ctx.capture_card, &ctx.h264_codec, &video_ended_tx).await {
+                    if device_probed_available(&ctx.capture_device)
+                        && let Some(v) = try_attach_video(&pc, &ctx.capture_card, &ctx.h264_codec, &video_ended_tx).await
+                    {
                         last_captured_at = None;
                         video = Some(v);
                     }

@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::capture::video_bus::{self, FrameEnvelope};
-use crate::device::{CaptureDevice, CaptureSettings, DeviceStatus, EventEmitter, Resolution, StateEmitter, Subscription, SupportedFormat};
+use crate::device::{CaptureDevice, CaptureSettings, DeviceStatus, EventEmitter, OpenError, Resolution, StateEmitter, Subscription, SupportedFormat};
 
 /// Startup default, falling back to the device's first reported
 /// resolution/frame-rate combination if this specific one isn't
@@ -24,9 +24,15 @@ use crate::device::{CaptureDevice, CaptureSettings, DeviceStatus, EventEmitter, 
 const DEFAULT_RESOLUTION: Resolution = Resolution { width: 1280, height: 720 };
 const DEFAULT_FPS: u32 = 5;
 
-/// Mirrors `getUserMedia()` rejecting when no matching device exists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NoDevice;
+/// What a shared open attempt settled on - private to this file, never
+/// crosses a module boundary. `request_stream()` callers never see this
+/// directly; it's what `await_open_result` translates into the real
+/// `Result<CaptureStream, OpenError>` they get back (issue #027).
+#[derive(Clone, Debug, PartialEq)]
+enum OpenOutcome {
+    Opened,
+    Failed(Arc<str>),
+}
 
 pub struct CaptureCard {
     shared: Arc<Shared>,
@@ -60,6 +66,13 @@ struct State {
     format: Option<SupportedFormat>,
     live: LiveCount,
     pass: Option<PassHandle>,
+    /// Test-only observability hook (see `CaptureCard::open_attempts`):
+    /// how many times `start_pass` has actually kicked off an open
+    /// attempt. Incremented once per call, synchronously, while `state`'s
+    /// lock is already held - not behavior, just what proves concurrent
+    /// `request_stream()` calls against the same starting pass share one
+    /// attempt instead of each opening the device.
+    open_attempts: usize,
     /// Set by `update_settings` when it stops a running pass: the
     /// replacement pass can only start once the old one has actually let
     /// go of the card, so the pass's own supervisor starts it (see
@@ -78,6 +91,13 @@ struct State {
 
 struct PassHandle {
     stop: Arc<AtomicBool>,
+    /// Settles once the pass's own open attempt finishes - `Opened` or
+    /// `Failed`. A `StateEmitter` (not a plain `EventEmitter`) so any
+    /// number of concurrent `request_stream()` calls sharing this same
+    /// starting pass can each subscribe and get the right outcome, whether
+    /// they were already waiting or only just joined (see
+    /// `await_open_result`).
+    open_result: Arc<StateEmitter<OpenOutcome>>,
 }
 
 /// The start/stop-trigger decision logic, factored out for direct unit
@@ -128,6 +148,16 @@ impl LiveCount {
     fn mark_pass_stopped(&mut self) {
         self.pass_running = false;
     }
+
+    /// The pass currently starting never made it to a live stream at all -
+    /// see `start_pass`'s `!opened` branch. Resets fully rather than a
+    /// single `decrement()` because an arbitrary number of concurrent
+    /// callers may have piled onto this one still-opening attempt before
+    /// it failed.
+    fn mark_pass_failed_to_start(&mut self) {
+        self.count = 0;
+        self.pass_running = false;
+    }
 }
 
 impl CaptureCard {
@@ -147,6 +177,7 @@ impl CaptureCard {
             format: None,
             live: LiveCount::new(),
             pass: None,
+            open_attempts: 0,
             restart_pass: false,
             ended_emitters: Vec::new(),
         });
@@ -260,39 +291,44 @@ impl CaptureCard {
         self.shared.device.clone()
     }
 
-    /// Mirrors `getUserMedia()`. Fails immediately (never hangs) if the
-    /// device isn't currently present; otherwise (re)uses the shared
-    /// encode pass, starting it if it isn't already running, and hands
-    /// back a new per-consumer `CaptureStream`. Takes no settings: the
-    /// card owns them, and a pass is shared by every consumer, so there
-    /// is only ever one set in play (see `update_settings`).
-    ///
-    /// Presence is checked per consumer, but the device is opened only by
-    /// the pass this may start (see `start_pass`): a V4L2 device can only
-    /// have its format negotiated by one holder at a time, so a second
-    /// consumer joining a running pass must not open it a second time.
-    pub async fn request_stream(&self) -> Result<CaptureStream, NoDevice> {
-        if !self.shared.device.is_present() {
-            return Err(NoDevice);
-        }
-
-        // A `StateEmitter`: the caller gets this stream back before it can
-        // subscribe, and does await-heavy work (a WebRTC session adds and
-        // negotiates a video track) in between, so a pass that fails fast
-        // ends the stream while nobody is listening yet. Latching it means
-        // that subscriber is still told, instead of being stranded with a
-        // track for a pass that is already dead (issue #023).
-        let ended = Arc::new(StateEmitter::new());
-        {
+    /// Mirrors `getUserMedia()`: genuinely attempts and awaits the real
+    /// device open when no pass is currently running - `Err` comes
+    /// straight from that attempt (device absent, or a real negotiate
+    /// failure - see `capture::open_capture`), and no stream is ever
+    /// created for a call that fails this way. If a pass is already
+    /// running (or already failed to start and another call is mid-open),
+    /// this joins the same attempt via `await_open_result` rather than
+    /// opening a second time. Takes no settings: the card owns them, and a
+    /// pass is shared by every consumer, so there is only ever one set in
+    /// play (see `update_settings`).
+    pub async fn request_stream(&self) -> Result<CaptureStream, OpenError> {
+        let open_result = {
             let mut state = self.shared.state.lock().unwrap();
             let should_start = state.live.increment();
             if should_start {
                 start_pass(&self.shared, &mut state);
             }
-            state.ended_emitters.push(Arc::downgrade(&ended));
-        }
+            Arc::clone(&state.pass.as_ref().expect("start_pass always sets state.pass before returning").open_result)
+        };
 
-        Ok(CaptureStream { inner: Arc::new(StreamInner { frames: AsyncMutex::new(self.shared.video_bus_rx.clone()), ended, _live: LiveMarker { shared: Arc::clone(&self.shared) } }) })
+        match await_open_result(&open_result).await {
+            OpenOutcome::Opened => {
+                // A `StateEmitter`: the caller gets this stream back
+                // before it can subscribe, and does await-heavy work (a
+                // WebRTC session adds and negotiates a video track) in
+                // between, so a pass that fails fast ends the stream while
+                // nobody is listening yet. Latching it means that
+                // subscriber is still told, instead of being stranded with
+                // a track for a pass that is already dead (issue #023).
+                let ended = Arc::new(StateEmitter::new());
+                {
+                    let mut state = self.shared.state.lock().unwrap();
+                    state.ended_emitters.push(Arc::downgrade(&ended));
+                }
+                Ok(CaptureStream { inner: Arc::new(StreamInner { frames: AsyncMutex::new(self.shared.video_bus_rx.clone()), ended, _live: LiveMarker { shared: Arc::clone(&self.shared) } }) })
+            }
+            OpenOutcome::Failed(msg) => Err(OpenError(msg.to_string())),
+        }
     }
 
     /// Test-only hook exposing whether a pass is currently marked as
@@ -304,19 +340,51 @@ impl CaptureCard {
     fn pass_running(&self) -> bool {
         self.shared.state.lock().unwrap().live.pass_running
     }
+
+    /// Test-only observability hook: how many times `start_pass` has
+    /// actually kicked off a real open attempt - what proves concurrent
+    /// `request_stream()` calls against the same starting pass share one
+    /// attempt rather than each opening the device (issue #027).
+    #[cfg(test)]
+    fn open_attempts(&self) -> usize {
+        self.shared.state.lock().unwrap().open_attempts
+    }
 }
 
-/// Starts the shared encode pass, reusing `capture::run_one_pass` (in turn
-/// `Device::open`, `v4l2::run_capture_loop` and `h264::H264Encoder`) - the
-/// same capture/encode machinery the pre-#004 `CaptureManager` used, just
-/// with a different start/stop trigger, tied to `state.live` (this
-/// module's own live-stream count) rather than a raw connected-session
-/// counter. Must be called with `state`'s lock already held.
+/// Waits for the shared open attempt a pass's `PassHandle` represents to
+/// settle. `StateEmitter`'s own contract (exactly one notification per
+/// subscriber, replayed if it already happened) is what makes this safe
+/// for N concurrent `request_stream()` calls against the same starting
+/// pass to share one open attempt and each get the right outcome, whether
+/// they were already waiting or only just subscribed.
+async fn await_open_result(open_result: &Arc<StateEmitter<OpenOutcome>>) -> OpenOutcome {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let tx = std::sync::Mutex::new(Some(tx));
+    let _sub = open_result.add_event_listener(move |outcome| {
+        let sent = tx.lock().unwrap().take().map(|tx| tx.send(outcome));
+        async move {
+            let _ = sent;
+        }
+    });
+    rx.await.unwrap_or_else(|_| OpenOutcome::Failed(Arc::from("capture pass ended before completing its open attempt")))
+}
+
+/// Starts the shared encode pass, reusing `capture::open_capture`/
+/// `capture::run_capture_loop_forever` (in turn `Device::open`, `v4l2::
+/// run_capture_loop` and `h264::H264Encoder`) - the same capture/encode
+/// machinery the pre-#004 `CaptureManager` used, just with a different
+/// start/stop trigger, tied to `state.live` (this module's own live-stream
+/// count) rather than a raw connected-session counter. Must be called with
+/// `state`'s lock already held.
 ///
-/// The device handle is opened by `run_one_pass` on the blocking thread,
+/// The device handle is opened by `open_capture` on the blocking thread,
 /// not here: the open is real I/O against the card, and this runs inside
-/// an async task holding a lock.
+/// an async task holding a lock. `request_stream()` awaits `open_result`
+/// (via `await_open_result`) to learn whether that open succeeded before
+/// it ever hands back a `CaptureStream` (issue #027).
 fn start_pass(shared: &Arc<Shared>, state: &mut State) {
+    state.open_attempts += 1;
+    let open_result: Arc<StateEmitter<OpenOutcome>> = Arc::new(StateEmitter::new());
     let stop = Arc::new(AtomicBool::new(false));
     let stop_task = Arc::clone(&stop);
     let settings = state.settings;
@@ -324,22 +392,43 @@ fn start_pass(shared: &Arc<Shared>, state: &mut State) {
     let device = shared.device.clone();
     let video_bus = shared.video_bus_tx.clone();
     let force_keyframe = Arc::clone(&shared.force_keyframe);
+    let open_result_task = Arc::clone(&open_result);
 
     tracing::info!("video encoding started");
-    let handle = tokio::task::spawn_blocking(move || super::run_one_pass(&device, &format, &settings, stop_task, video_bus, force_keyframe));
+    let handle = tokio::task::spawn_blocking(move || match super::open_capture(&device, &format, &settings) {
+        Ok(capture) => {
+            open_result_task.dispatch(OpenOutcome::Opened);
+            super::run_capture_loop_forever(&capture, stop_task, video_bus, force_keyframe);
+        }
+        Err(err) => {
+            tracing::error!(%err, "failed to open capture device, no video this pass");
+            open_result_task.dispatch(OpenOutcome::Failed(Arc::from(err.to_string())));
+        }
+    });
 
     let supervisor_shared = Arc::clone(shared);
     let supervisor_stop = Arc::clone(&stop);
+    let supervisor_open_result = Arc::clone(&open_result);
     tokio::spawn(async move {
         let _ = handle.await;
         // `H264Encoder`'s `Drop` impl logs its own GPU teardown steps as
         // it goes, more useful than one generic line here - see
         // `capture::mod::run`'s own equivalent comment.
+        let opened = matches!(supervisor_open_result.latest(), Some(OpenOutcome::Opened));
         let deliberate_stop = supervisor_stop.load(Ordering::Relaxed);
         let emitters = {
             let mut state = supervisor_shared.state.lock().unwrap();
             state.pass = None;
-            if deliberate_stop {
+            if !opened {
+                // Never made it to a live stream at all - every caller
+                // waiting on this attempt gets `Err` directly (see
+                // `request_stream`), never a `CaptureStream`/`LiveMarker`
+                // to decrement later, so their combined contribution to
+                // the live count has to be dropped in one go.
+                state.restart_pass = false;
+                state.live.mark_pass_failed_to_start();
+                Vec::new()
+            } else if deliberate_stop {
                 // A settings change stops the running pass and asks for a
                 // replacement, which can only be started here: the card
                 // negotiates its format on open, so the old pass has to
@@ -367,7 +456,7 @@ fn start_pass(shared: &Arc<Shared>, state: &mut State) {
         }
     });
 
-    state.pass = Some(PassHandle { stop });
+    state.pass = Some(PassHandle { stop, open_result });
 }
 
 /// Decrements `CaptureCard`'s live-stream count on drop - this *is* the
@@ -519,6 +608,15 @@ mod tests {
         assert!(live.increment(), "a fresh request_stream() must restart the pass even though live count never hit zero");
     }
 
+    #[test]
+    fn live_count_resets_completely_when_the_pass_never_opens() {
+        let mut live = LiveCount::new();
+        assert!(live.increment());
+        live.increment();
+        live.mark_pass_failed_to_start();
+        assert!(live.increment(), "a fresh request_stream() after a failed open must be able to start again");
+    }
+
     // --- Startup defaults - pure, no device, no async ---
 
     fn format_with(resolutions: &[Resolution], rates: &[(Resolution, Vec<u32>)]) -> SupportedFormat {
@@ -544,11 +642,44 @@ mod tests {
     // CaptureDriver's open is exercised against a fake/mock path in
     // tests". A plain file always fails `CaptureDriver::probe` (it's not
     // a real V4L2 device), so `format` stays `None` deterministically -
-    // which `run_one_pass` treats as "nothing to do", exiting immediately
-    // (before it would even open the device) without ever asking to stop
-    // deliberately. That's exactly what's needed to exercise the "pass
-    // ended on its own -> ended() fires" path without any real hardware or
-    // racy ioctl failure timing. ---
+    // which `open_capture` (issue #027) now treats as a fallible outcome,
+    // exactly like a real negotiate failure, folded into `request_stream`'s
+    // own `Err` before any stream is ever created.
+    //
+    // That's a real loss of coverage in this hardware-free environment: a
+    // present-but-unsupported device used to make it far enough to hand
+    // back a stream that then immediately fired `ended` (the old
+    // `run_one_pass`'s `format.is_none()` check happened *after* a stream
+    // already existed) - which is what every "ended"/live-stream test below
+    // used to ride on. After this issue's change, `request_stream()` fails
+    // outright for this fixture instead, the same as it now does for a
+    // genuine negotiate failure, so none of that is reachable here any
+    // more:
+    //
+    //   - A live `CaptureStream` actually being handed back and used (drop
+    //     stopping the pass, `next_frame` being pollable from a spawned
+    //     task) needs a real successful `Device::open` - only provable on
+    //     real hardware, via `./test-on-device.sh` (issue #027's own
+    //     acceptance criteria already requires this: "confirm the video
+    //     track still attaches normally when the card is present").
+    //   - `ended` firing for a pass that started successfully and later
+    //     died, including the late-subscriber replay case, likewise needs a
+    //     real successful open first - also only provable on real hardware
+    //     now (`./test-on-device.sh`: "unplugging mid-stream still ends the
+    //     stream the same way it does today"). The `StateEmitter` replay
+    //     contract itself (issue #023) that made the late-subscriber case
+    //     correct is generic and already has its own dedicated tests in
+    //     `src/device/event.rs` (`state_emitter_replays_the_last_value_to_a
+    //     _late_subscriber` and friends), so this integration-level test
+    //     losing its `CaptureStream`-specific case is a smaller loss than it
+    //     looks.
+    //
+    // What this fixture can still prove without real hardware: a present
+    // device that never successfully probes correctly fails the open
+    // (`request_stream_fails_when_device_present_but_unsupported`), and
+    // concurrent callers against the same still-opening pass share one
+    // open attempt (`concurrent_calls_share_one_open_attempt_and_the_same_
+    // outcome`). ---
 
     async fn present_device_at(path: &str) -> CaptureDevice {
         // The zero-delay spawn path: this helper is about proving a
@@ -578,17 +709,31 @@ mod tests {
 
         let card = CaptureCard::new(device);
         let result = card.request_stream().await;
-        assert_eq!(result.err(), Some(NoDevice));
+        assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn request_stream_succeeds_when_device_present() {
+    async fn request_stream_fails_when_device_present_but_unsupported() {
         let tmp = TempDevicePath::new();
         let device = present_device_at(tmp.as_str()).await;
         let card = CaptureCard::new(device);
 
         let result = card.request_stream().await;
-        assert!(result.is_ok());
+        assert!(result.is_err(), "a present device that never reports a supported format must fail the open, not return a stream that immediately ends");
+
+        // The supervisor task that clears `pass_running` (via
+        // `mark_pass_failed_to_start`) runs independently of the task that
+        // resolves `await_open_result` - both react to the same failed
+        // open, but with no ordering guarantee between them, so `request_
+        // stream()` returning `Err` doesn't itself guarantee `pass_running`
+        // has settled yet. Poll briefly instead of asserting immediately.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while card.pass_running() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("pass_running should settle to false shortly after a failed open");
     }
 
     #[tokio::test]
@@ -605,19 +750,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pass_starts_on_first_stream_and_stops_when_last_one_drops() {
+    async fn concurrent_calls_share_one_open_attempt_and_the_same_outcome() {
         let tmp = TempDevicePath::new();
         let device = present_device_at(tmp.as_str()).await;
         let card = CaptureCard::new(device);
 
-        let stream = card.request_stream().await.expect("device is present");
-        assert!(card.pass_running(), "requesting a stream while none was running must start the pass");
+        let (a, b) = tokio::join!(card.request_stream(), card.request_stream());
 
-        drop(stream);
-        // `LiveMarker::drop` updates `state.live`/signals `stop`
-        // synchronously - no need to wait for the (nonexistent, since
-        // `format` is `None` for this fake path) blocking OS thread.
-        assert!(!card.pass_running(), "dropping the last live stream must stop the pass");
+        assert!(a.is_err() && b.is_err(), "a present-but-unsupported device must fail both concurrent calls");
+        assert_eq!(card.open_attempts(), 1, "two concurrent calls against a pass that hasn't started yet must share exactly one open attempt, not open twice");
     }
 
     #[tokio::test]
@@ -641,91 +782,32 @@ mod tests {
         assert_eq!(seen, wanted);
     }
 
-    #[tokio::test]
-    async fn ended_fires_exactly_once_on_unrecoverable_pass_failure() {
-        let tmp = TempDevicePath::new();
-        let device = present_device_at(tmp.as_str()).await;
-        let card = CaptureCard::new(device);
-
-        let stream = card.request_stream().await.expect("device is present");
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let _sub = stream.add_event_listener(move |()| {
-            let tx = tx.clone();
-            async move {
-                let _ = tx.send(());
-            }
-        });
-
-        // `format` is `None` for this fake path (see module doc above),
-        // so `run_one_pass` returns immediately without ever setting
-        // `stop` - the supervisor task sees that as "ended on its own"
-        // and fires `ended` on every live stream.
-        tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.expect("ended should fire").expect("channel should still be open");
-
-        // Never fires again for the same stream.
-        assert!(tokio::time::timeout(Duration::from_millis(200), rx.recv()).await.is_err(), "ended must not fire a second time for the same stream");
-
-        drop(stream);
-    }
+    // --- `await_open_result` - directly unit-testable in isolation, no
+    // `CaptureCard`/hardware needed at all. ---
 
     #[tokio::test]
-    async fn ended_reaches_a_consumer_that_subscribes_after_the_pass_already_failed() {
-        let tmp = TempDevicePath::new();
-        let device = present_device_at(tmp.as_str()).await;
-        let card = CaptureCard::new(device);
+    async fn await_open_result_fans_out_one_dispatch_to_every_concurrent_waiter() {
+        let open_result = Arc::new(StateEmitter::<OpenOutcome>::new());
 
-        let stream = card.request_stream().await.expect("device is present");
+        let dispatcher = {
+            let open_result = Arc::clone(&open_result);
+            tokio::spawn(async move {
+                // Gives both `await_open_result` calls below time to
+                // register their listener before anything is dispatched -
+                // so both are genuinely pending waiters when the dispatch
+                // happens, not late subscribers replaying a value that was
+                // already there (that contract belongs to `device::event`'s
+                // own `StateEmitter` tests, not this one).
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                open_result.dispatch(OpenOutcome::Opened);
+            })
+        };
 
-        // The window this test is about: a real consumer
-        // (`rtc::session::try_attach_video`) gets its stream, then awaits
-        // an `add_track` before it subscribes. The fake path's pass fails
-        // immediately, so waiting here puts the whole `ended` dispatch
-        // strictly before the subscription below - deterministically, not
-        // as a race.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(!card.pass_running(), "the fake device's pass should already have failed by now");
+        let (a, b) = tokio::join!(await_open_result(&open_result), await_open_result(&open_result));
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let _sub = stream.add_event_listener(move |()| {
-            let tx = tx.clone();
-            async move {
-                let _ = tx.send(());
-            }
-        });
-
-        tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.expect("a consumer subscribing after its pass died must still be told the stream ended").expect("channel should still be open");
-
-        // Late or not, still exactly one notification.
-        assert!(tokio::time::timeout(Duration::from_millis(200), rx.recv()).await.is_err(), "ended must not fire a second time for the same stream");
-
-        drop(stream);
-    }
-
-    #[tokio::test]
-    async fn next_frame_can_be_polled_from_a_spawned_task() {
-        let tmp = TempDevicePath::new();
-        let device = present_device_at(tmp.as_str()).await;
-        let card = CaptureCard::new(device);
-        let stream = card.request_stream().await.expect("device is present");
-
-        // This is the actual regression-catching mechanism for
-        // `StreamInner::frames` needing `tokio::sync::Mutex`: spawning a
-        // consumer of `next_frame()` the same way a real WebRTC session
-        // would (`tokio::spawn`) simply fails to compile if `frames` were
-        // a `std::sync::Mutex`, because its `MutexGuard` held across
-        // `.changed().await` isn't `Send`.
-        let video_bus_tx = card.shared.video_bus_tx.clone();
-        let handle = tokio::spawn(async move { stream.next_frame().await });
-
-        // Give the spawned task a moment to start waiting on `.changed()`
-        // before publishing a frame.
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let envelope = FrameEnvelope { data: Arc::from(vec![1u8, 2, 3]), captured_at: Duration::from_secs(0) };
-        let _ = video_bus_tx.send(Some(envelope.clone()));
-
-        let received = tokio::time::timeout(Duration::from_secs(1), handle).await.expect("spawned task should complete").expect("task should not panic");
-        assert!(matches!(received, Some(got) if *got.data == *envelope.data));
+        dispatcher.await.unwrap();
+        assert_eq!(a, OpenOutcome::Opened, "every concurrent waiter must see the one dispatch");
+        assert_eq!(b, OpenOutcome::Opened, "every concurrent waiter must see the one dispatch");
     }
 
     /// A plain regular file standing in for a device path in tests (see

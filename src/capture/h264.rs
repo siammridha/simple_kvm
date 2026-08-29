@@ -301,7 +301,7 @@ impl H264Encoder {
     /// Forces the next encoded frame to be a keyframe, ahead of the
     /// periodic schedule (`INTRA_FRAME_PERIOD`) — used when a session's
     /// RTCP feedback (PLI/FIR) says its decoder needs one sooner, see
-    /// `rtc::session::handle` and `capture::run_one_pass`.
+    /// `rtc::session::handle` and `capture::run_capture_loop_forever`.
     pub fn force_intra_frame(&mut self) {
         self.force_intra = true;
     }
