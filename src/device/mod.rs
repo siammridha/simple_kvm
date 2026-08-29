@@ -40,10 +40,16 @@ pub use event::{EventEmitter, StateEmitter, Subscription};
 pub use capture_driver::{CaptureDevice, CaptureHandle, CaptureSettings, Resolution, SupportedFormat};
 pub use ch9329_driver::Ch9329Device;
 
-/// Backoff-free fallback poll interval, used only when the kernel uevent
-/// listener itself failed to open (see `uevent::UeventListener::open`) -
-/// mirrors `capture::DEVICE_POLL_INTERVAL`'s role for the same case.
-const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// How many times to retry opening the kernel uevent listener before
+/// giving up on tracking a device's presence altogether. There is no
+/// fallback poll of the device path: presence is learned exclusively from
+/// uevents, so a listener that still won't open after retrying really
+/// can't be worked around - see `ARCHITECTURE.md`'s "no fallback polling
+/// for device presence".
+const UEVENT_LISTENER_OPEN_ATTEMPTS: u32 = 5;
+
+/// Delay between attempts to open the kernel uevent listener.
+const UEVENT_LISTENER_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// How long to wait after presence is first detected before actually
 /// probing the device - real hardware (the capture card and the CH9329
@@ -53,7 +59,7 @@ const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// transition, not just the very first one: presence itself is reported
 /// (logged) the instant it's seen, since noticing is harmless; only the
 /// probe - which does touch the hardware - waits.
-const DETECT_TO_PROBE_DELAY: Duration = Duration::from_secs(3);
+const DETECT_TO_PROBE_DELAY: Duration = Duration::from_secs(5);
 
 /// What differs between device kinds - where the device lives, and how to
 /// probe and open it. Everything else (presence detection, event
@@ -210,17 +216,6 @@ impl<D: DeviceDriver> Device<D> {
         }
     }
 
-    /// Probes the device directly, on the caller's own schedule - the same
-    /// call the presence task itself makes after its detect-to-probe
-    /// delay, exposed here so a module that needs capabilities (`capture`,
-    /// or `rtc` if it ever needs to) can ask again without waiting for
-    /// another presence transition. Not every device kind needs this -
-    /// the CH9329's `probe` is a no-op - so calling it is left to whoever
-    /// actually wants the result.
-    pub fn probe(&self) -> Option<D::Info> {
-        D::probe(&self.inner.device_path)
-    }
-
     /// Whether the device is plugged in right now - exactly the gate
     /// `open` applies, exposed on its own so a caller can reject early
     /// (the way `getUserMedia` rejects with no matching device) without
@@ -263,12 +258,8 @@ impl<D: DeviceDriver> Device<D> {
 /// `PresenceState`'s doc comment).
 async fn run_presence_task<D: DeviceDriver>(inner: Arc<DeviceInner<D>>, probe_delay: Duration) {
     let mut state = PresenceState::new();
-    let mut uevents = match uevent::UeventListener::open() {
-        Ok(listener) => Some(listener),
-        Err(err) => {
-            tracing::warn!(%err, device_path = %inner.device_path, "failed to open kernel uevent listener, this device's reconnects will only be noticed on the poll interval");
-            None
-        }
+    let Some(mut uevents) = open_uevent_listener_with_retries(&inner.device_path).await else {
+        return;
     };
 
     loop {
@@ -289,11 +280,29 @@ async fn run_presence_task<D: DeviceDriver>(inner: Arc<DeviceInner<D>>, probe_de
             None => {}
         }
 
-        match &mut uevents {
-            Some(listener) => listener.wait_for_subsystem(D::UEVENT_SUBSYSTEM).await,
-            None => tokio::time::sleep(DEVICE_POLL_INTERVAL).await,
+        uevents.wait_for_subsystem(D::UEVENT_SUBSYSTEM).await;
+    }
+}
+
+/// Tries to open the kernel uevent listener up to
+/// `UEVENT_LISTENER_OPEN_ATTEMPTS` times, waiting
+/// `UEVENT_LISTENER_RETRY_DELAY` between attempts. Returns `None` once
+/// every attempt has failed, meaning the caller must give up on tracking
+/// this device's presence rather than fall back to polling its path.
+async fn open_uevent_listener_with_retries(device_path: &str) -> Option<uevent::UeventListener> {
+    for attempt in 1..=UEVENT_LISTENER_OPEN_ATTEMPTS {
+        match uevent::UeventListener::open() {
+            Ok(listener) => return Some(listener),
+            Err(err) => {
+                tracing::warn!(%err, device_path = %device_path, attempt, max_attempts = UEVENT_LISTENER_OPEN_ATTEMPTS, "failed to open kernel uevent listener");
+                if attempt < UEVENT_LISTENER_OPEN_ATTEMPTS {
+                    tokio::time::sleep(UEVENT_LISTENER_RETRY_DELAY).await;
+                }
+            }
         }
     }
+    tracing::error!(device_path = %device_path, attempts = UEVENT_LISTENER_OPEN_ATTEMPTS, "giving up opening kernel uevent listener; this device's presence will no longer be tracked");
+    None
 }
 
 /// A genuine presence transition, with the actual probing left to the
