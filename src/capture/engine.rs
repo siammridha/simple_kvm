@@ -11,16 +11,15 @@
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::capture::video_bus::{self, FrameEnvelope};
-use crate::device::{CaptureDevice, CaptureSettings, DeviceStatus, EventEmitter, OpenError, Resolution, StateEmitter, Subscription, SupportedFormat};
+use crate::device::{CaptureDevice, CaptureSettings, DeviceStatus, EventEmitter, OpenError, Resolution, StateEmitter, Subscription};
 
-/// Startup default, falling back to the device's first reported
-/// resolution/frame-rate combination if this specific one isn't
-/// supported - see `default_settings`.
+/// Startup-only placeholder before the device has ever been probed - see
+/// `startup_placeholder_settings`.
 const DEFAULT_RESOLUTION: Resolution = Resolution { width: 1280, height: 720 };
 const DEFAULT_FPS: u32 = 5;
 
@@ -48,12 +47,6 @@ struct Shared {
     /// every already-open tab sees a `Save` from another tab without a
     /// reload (see `rtc::session::handle`).
     settings_changed: Arc<EventEmitter<CaptureSettings>>,
-    /// Keeps `Shared`'s `format`/settings cache current - see
-    /// `CaptureCard::new`. Held only for its lifetime effect; never read
-    /// directly. A `OnceLock` because the subscription can only be made
-    /// once this `Shared` is already inside its `Arc` (see
-    /// `CaptureCard::new`), and is then never replaced.
-    device_status_sub: OnceLock<Subscription<DeviceStatus<SupportedFormat>>>,
 }
 
 struct State {
@@ -63,7 +56,6 @@ struct State {
     /// card hasn't necessarily reported its capabilities yet, and once it
     /// does they're recomputed against what it actually supports.
     settings_are_defaults: bool,
-    format: Option<SupportedFormat>,
     live: LiveCount,
     pass: Option<PassHandle>,
     /// Test-only observability hook (see `CaptureCard::open_attempts`):
@@ -172,9 +164,8 @@ impl CaptureCard {
     pub fn new(device: CaptureDevice) -> Self {
         let (video_bus_tx, video_bus_rx) = video_bus::channel();
         let state = Mutex::new(State {
-            settings: default_settings(None),
+            settings: startup_placeholder_settings(),
             settings_are_defaults: true,
-            format: None,
             live: LiveCount::new(),
             pass: None,
             open_attempts: 0,
@@ -182,64 +173,7 @@ impl CaptureCard {
             ended_emitters: Vec::new(),
         });
 
-        let shared = Arc::new(Shared {
-            device,
-            video_bus_tx,
-            video_bus_rx,
-            force_keyframe: Arc::new(AtomicBool::new(false)),
-            state,
-            settings_changed: Arc::new(EventEmitter::new()),
-            device_status_sub: OnceLock::new(),
-        });
-
-        // Subscribed strictly after `shared` exists, not from inside an
-        // `Arc::new_cyclic`: the device replays a status it already
-        // published to a listener that subscribes late (see
-        // `device::StateEmitter`), and that replay can be running on
-        // another worker thread the instant this call returns. A listener
-        // built against a `Weak<Shared>` that isn't inhabited yet would
-        // fail to upgrade and drop exactly the status this is here to
-        // catch.
-        let weak_shared = Arc::downgrade(&shared);
-        let subscription = shared.device.add_event_listener(move |status| {
-            let weak_shared = weak_shared.clone();
-            async move {
-                let Some(shared) = weak_shared.upgrade() else {
-                    return;
-                };
-                let new_settings = {
-                    let mut state = shared.state.lock().unwrap();
-                    // `Present(None)` means `CaptureDriver::probe` itself
-                    // failed (see `device::DeviceStatus`'s doc comment) -
-                    // `format` is left exactly as it was, so a `rtc`
-                    // recompute of `DeviceState` stays whatever it last
-                    // knew rather than being wiped by a probe that told us
-                    // nothing new.
-                    match status {
-                        DeviceStatus::Present(Some(info)) => state.format = Some(info),
-                        DeviceStatus::Present(None) => {}
-                        DeviceStatus::Absent => state.format = None,
-                    }
-                    // The startup defaults were picked before the card
-                    // had said anything about itself; now that it has,
-                    // fall back to a combination it actually reports -
-                    // but never overwrite settings a person chose.
-                    if state.settings_are_defaults {
-                        let defaults = default_settings(state.format.as_ref());
-                        (defaults != state.settings).then(|| {
-                            state.settings = defaults;
-                            defaults
-                        })
-                    } else {
-                        None
-                    }
-                };
-                if let Some(settings) = new_settings {
-                    shared.settings_changed.dispatch(settings);
-                }
-            }
-        });
-        let _ = shared.device_status_sub.set(subscription);
+        let shared = Arc::new(Shared { device, video_bus_tx, video_bus_rx, force_keyframe: Arc::new(AtomicBool::new(false)), state, settings_changed: Arc::new(EventEmitter::new()) });
 
         Self { shared }
     }
@@ -271,6 +205,29 @@ impl CaptureCard {
             }
         }
         self.shared.settings_changed.dispatch(settings);
+    }
+
+    /// Applies a default resolution/frame rate `rtc` computed from the
+    /// device's own reported capabilities (see `ARCHITECTURE.md` §3.4) - a
+    /// no-op once a person has applied settings by hand via `update_settings`,
+    /// and never itself counts as that person having done so, so a later
+    /// capability change (e.g. a different card plugged in) can still apply a
+    /// fresh default as long as nobody has actually hit Save. Still fires
+    /// `settings_changed` when it actually changes something, same as
+    /// `update_settings`, so every open tab sees it live.
+    pub fn apply_default_settings(&self, settings: CaptureSettings) {
+        let changed = {
+            let mut state = self.shared.state.lock().unwrap();
+            if !state.settings_are_defaults || state.settings == settings {
+                None
+            } else {
+                state.settings = settings;
+                Some(settings)
+            }
+        };
+        if let Some(settings) = changed {
+            self.shared.settings_changed.dispatch(settings);
+        }
     }
 
     /// Mirrors `addEventListener('change', cb)` for the applied settings.
@@ -388,7 +345,10 @@ fn start_pass(shared: &Arc<Shared>, state: &mut State) {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_task = Arc::clone(&stop);
     let settings = state.settings;
-    let format = state.format.clone();
+    let format = match shared.device.latest_status() {
+        Some(DeviceStatus::Present(Some(info))) => Some(info),
+        _ => None,
+    };
     let device = shared.device.clone();
     let video_bus = shared.video_bus_tx.clone();
     let force_keyframe = Arc::clone(&shared.force_keyframe);
@@ -543,27 +503,14 @@ impl CaptureStream {
     }
 }
 
-/// Computes the in-memory default settings: 720p@5fps if the device
-/// reports supporting it, otherwise the device's first reported
-/// resolution/frame-rate combination. `None` (device never probed, or
-/// probe failed) just falls back to the raw default.
-fn default_settings(format: Option<&SupportedFormat>) -> CaptureSettings {
-    let Some(format) = format else {
-        return CaptureSettings { resolution: DEFAULT_RESOLUTION, fps: DEFAULT_FPS };
-    };
-
-    if format.resolutions.contains(&DEFAULT_RESOLUTION) {
-        let fps = format.frame_rates.get(&DEFAULT_RESOLUTION).and_then(|rates| rates.contains(&DEFAULT_FPS).then_some(DEFAULT_FPS)).unwrap_or(DEFAULT_FPS);
-        return CaptureSettings { resolution: DEFAULT_RESOLUTION, fps };
-    }
-
-    match format.resolutions.first().copied() {
-        Some(resolution) => {
-            let fps = format.frame_rates.get(&resolution).and_then(|rates| rates.first().copied()).unwrap_or(DEFAULT_FPS);
-            CaptureSettings { resolution, fps }
-        }
-        None => CaptureSettings { resolution: DEFAULT_RESOLUTION, fps: DEFAULT_FPS },
-    }
+/// The in-memory placeholder before the device has ever been probed - never
+/// preferred over real capabilities, and never user-visible on its own: no
+/// encode pass runs and no session attaches video before a successful
+/// probe (`ARCHITECTURE.md` §3.4). Superseded the moment `rtc` calls
+/// `apply_default_settings` with what the device actually reports (issue
+/// #032) - this function has nothing to do with that computation any more.
+fn startup_placeholder_settings() -> CaptureSettings {
+    CaptureSettings { resolution: DEFAULT_RESOLUTION, fps: DEFAULT_FPS }
 }
 
 #[cfg(test)]
@@ -615,25 +562,6 @@ mod tests {
         live.increment();
         live.mark_pass_failed_to_start();
         assert!(live.increment(), "a fresh request_stream() after a failed open must be able to start again");
-    }
-
-    // --- Startup defaults - pure, no device, no async ---
-
-    fn format_with(resolutions: &[Resolution], rates: &[(Resolution, Vec<u32>)]) -> SupportedFormat {
-        SupportedFormat { resolutions: resolutions.to_vec(), frame_rates: rates.iter().cloned().collect() }
-    }
-
-    #[test]
-    fn default_settings_keep_the_startup_default_when_the_card_reports_it() {
-        let format = format_with(&[Resolution { width: 1920, height: 1080 }, DEFAULT_RESOLUTION], &[(DEFAULT_RESOLUTION, vec![DEFAULT_FPS, 30])]);
-        assert_eq!(default_settings(Some(&format)), CaptureSettings { resolution: DEFAULT_RESOLUTION, fps: DEFAULT_FPS });
-    }
-
-    #[test]
-    fn default_settings_fall_back_to_the_first_reported_combination() {
-        let first = Resolution { width: 640, height: 480 };
-        let format = format_with(&[first, Resolution { width: 1920, height: 1080 }], &[(first, vec![15, 30])]);
-        assert_eq!(default_settings(Some(&format)), CaptureSettings { resolution: first, fps: 15 });
     }
 
     // --- `CaptureCard`-level tests, against a real `CaptureDriver`
@@ -780,6 +708,48 @@ mod tests {
         assert_eq!(card.settings(), wanted);
         let seen = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.expect("settings listener should fire").expect("channel should still be open");
         assert_eq!(seen, wanted);
+    }
+
+    #[tokio::test]
+    async fn apply_default_settings_applies_when_nobody_has_chosen_settings_by_hand() {
+        let card = CaptureCard::new(CaptureDevice::spawn_at("/nonexistent/simple-kvm-test-device"));
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _sub = card.add_settings_listener(move |settings| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(settings);
+            }
+        });
+
+        let reported = CaptureSettings { resolution: Resolution { width: 1920, height: 1080 }, fps: 60 };
+        card.apply_default_settings(reported);
+
+        assert_eq!(card.settings(), reported);
+        let seen = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.expect("settings listener should fire").expect("channel should still be open");
+        assert_eq!(seen, reported);
+    }
+
+    #[tokio::test]
+    async fn apply_default_settings_is_a_noop_once_a_person_has_applied_settings_by_hand() {
+        let card = CaptureCard::new(CaptureDevice::spawn_at("/nonexistent/simple-kvm-test-device"));
+
+        let chosen = CaptureSettings { resolution: Resolution { width: 1920, height: 1080 }, fps: 30 };
+        card.update_settings(chosen);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _sub = card.add_settings_listener(move |settings| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(settings);
+            }
+        });
+
+        let reported = CaptureSettings { resolution: Resolution { width: 640, height: 480 }, fps: 15 };
+        card.apply_default_settings(reported);
+
+        assert_eq!(card.settings(), chosen, "a person's own choice must never be overwritten by a computed default");
+        assert!(tokio::time::timeout(Duration::from_millis(100), rx.recv()).await.is_err(), "settings_changed must not fire for a no-op default");
     }
 
     // --- `await_open_result` - directly unit-testable in isolation, no

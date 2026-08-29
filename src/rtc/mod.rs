@@ -21,6 +21,7 @@ use webrtc::peer_connection::{
 
 use crate::capture::engine::CaptureCard;
 use crate::capture::CaptureDevice;
+use crate::device::{DeviceStatus, Subscription, SupportedFormat};
 use crate::hid::{Ch9329Device, Hid};
 use session::SessionContext;
 
@@ -60,6 +61,14 @@ pub struct Rtc {
     /// the thing that subscribes to it for presence - `hid` itself no
     /// longer does.
     hid_device: Ch9329Device,
+    /// Applies the device's own first reported resolution/frame rate as the
+    /// default the moment capabilities become known, as long as nobody has
+    /// saved settings by hand (`CaptureCard::apply_default_settings` is
+    /// itself the guard - see `ARCHITECTURE.md` §3.4). Lives for the life of
+    /// the process, not per-session: `Arc`-wrapped since `Rtc` is `Clone` and
+    /// a bare `Subscription` isn't - every clone shares this one subscription,
+    /// which deregisters only once the last `Rtc` clone drops.
+    _default_settings_sub: Arc<Subscription<DeviceStatus<SupportedFormat>>>,
 }
 
 impl Rtc {
@@ -90,7 +99,22 @@ impl Rtc {
     fn new(capture_card: Arc<CaptureCard>, hid: Arc<Hid>) -> Self {
         let capture_device = capture_card.device();
         let hid_device = hid.device();
-        Self { capture_card, capture_device, hid, hid_device }
+
+        let default_settings_sub = {
+            let capture_card = Arc::clone(&capture_card);
+            capture_device.add_event_listener(move |status| {
+                let capture_card = Arc::clone(&capture_card);
+                async move {
+                    if let DeviceStatus::Present(Some(info)) = status
+                        && let Some(settings) = device_state::first_reported_settings(&info)
+                    {
+                        capture_card.apply_default_settings(settings);
+                    }
+                }
+            })
+        };
+
+        Self { capture_card, capture_device, hid, hid_device, _default_settings_sub: Arc::new(default_settings_sub) }
     }
 
     /// The whole signaling surface: hand it the browser's offer SDP, get

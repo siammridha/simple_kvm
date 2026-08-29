@@ -8,7 +8,7 @@
 
 use serde::Serialize;
 
-use crate::capture::{Resolution, SupportedFormat};
+use crate::capture::{CaptureSettings, Resolution, SupportedFormat};
 
 /// Live state of the capture card itself — whether it's plugged in right
 /// now, and what resolutions/frame rates it supports. Computed by `rtc`
@@ -38,7 +38,7 @@ pub struct ResolutionFrameRates {
 /// Cheap and ioctl-free, so it's safe to run on every presence event or
 /// settings change, unlike an actual probe. Kept as a free function over
 /// `&Option<SupportedFormat>` rather than tied to any particular struct.
-pub(super) fn device_state_for(format: &Option<SupportedFormat>, settings: &crate::capture::CaptureSettings) -> DeviceState {
+pub(super) fn device_state_for(format: &Option<SupportedFormat>, settings: &CaptureSettings) -> DeviceState {
     let Some(format) = format else {
         return DeviceState::default();
     };
@@ -58,10 +58,22 @@ pub(super) fn device_state_for(format: &Option<SupportedFormat>, settings: &crat
     DeviceState { available: true, resolutions: format.resolutions.clone(), default_resolution, frame_rates }
 }
 
+/// The default settings to apply once the device's capabilities are known
+/// and nobody has picked any by hand yet: its own first reported
+/// resolution, and that resolution's own first reported frame rate. Never
+/// a value baked into this codebase (issue #032) - `None` only if the
+/// device reports a resolution with no frame rates listed for it at all,
+/// which nothing in this codebase produces today, but this stays honest
+/// about it rather than inventing one.
+pub(super) fn first_reported_settings(format: &SupportedFormat) -> Option<CaptureSettings> {
+    let resolution = *format.resolutions.first()?;
+    let fps = format.frame_rates.get(&resolution)?.first().copied()?;
+    Some(CaptureSettings { resolution, fps })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::CaptureSettings;
     use std::collections::HashMap;
 
     fn settings(width: u32, height: u32, fps: u32) -> CaptureSettings {
@@ -96,5 +108,30 @@ mod tests {
         let state = device_state_for(&Some(format), &settings(3840, 2160, 30));
 
         assert_eq!(state.default_resolution, Some(first), "applied resolution isn't supported, so the first reported one wins");
+    }
+
+    #[test]
+    fn first_reported_settings_uses_the_only_resolution_and_fps_reported() {
+        let resolution = Resolution { width: 1920, height: 1080 };
+        let format = SupportedFormat { resolutions: vec![resolution], frame_rates: HashMap::from([(resolution, vec![30])]) };
+
+        assert_eq!(first_reported_settings(&format), Some(settings(1920, 1080, 30)));
+    }
+
+    #[test]
+    fn first_reported_settings_picks_the_first_resolution_and_its_own_first_fps() {
+        let first = Resolution { width: 640, height: 480 };
+        let second = Resolution { width: 1920, height: 1080 };
+        let format = SupportedFormat { resolutions: vec![first, second], frame_rates: HashMap::from([(first, vec![15, 30]), (second, vec![60])]) };
+
+        assert_eq!(first_reported_settings(&format), Some(settings(640, 480, 15)), "must use the first resolution's own first fps, not some other resolution's");
+    }
+
+    #[test]
+    fn first_reported_settings_is_none_when_the_first_resolution_has_no_frame_rates_listed() {
+        let resolution = Resolution { width: 1920, height: 1080 };
+        let format = SupportedFormat { resolutions: vec![resolution], frame_rates: HashMap::new() };
+
+        assert_eq!(first_reported_settings(&format), None);
     }
 }
