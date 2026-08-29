@@ -205,11 +205,15 @@ impl<D: DeviceDriver> Device<D> {
 
     /// Mirrors `getUserMedia()` rejecting when no matching device exists:
     /// fails immediately if the device isn't currently present, otherwise
-    /// delegates straight to `D::open`. Never touches the device path
-    /// itself - the path stays private to this module (see the module
-    /// doc comment).
+    /// delegates straight to `D::open`. Rechecks the actual device path,
+    /// not just the last-published status, right before opening - closes
+    /// the race where the device disappeared after the last presence
+    /// event but before this call (the presence task only notices on the
+    /// next uevent wake-up, which could be later). Never exposes the
+    /// device path itself - the path stays private to this module (see
+    /// the module doc comment).
     pub fn open(&self, settings: &D::Settings) -> Result<D::Open, OpenError> {
-        if self.is_present() {
+        if self.is_present() && Path::new(&self.inner.device_path).exists() {
             D::open(&self.inner.device_path, settings)
         } else {
             Err(OpenError("device is not currently present".to_string()))
@@ -274,8 +278,13 @@ async fn run_presence_task<D: DeviceDriver>(inner: Arc<DeviceInner<D>>, probe_de
                 if !probe_delay.is_zero() {
                     tokio::time::sleep(probe_delay).await;
                 }
-                let info = D::probe(&inner.device_path);
-                inner.events.dispatch(DeviceStatus::Present(info));
+                if Path::new(&inner.device_path).exists() {
+                    let info = D::probe(&inner.device_path);
+                    inner.events.dispatch(DeviceStatus::Present(info));
+                } else {
+                    tracing::info!(device_path = %inner.device_path, "device disappeared during the detect-to-probe delay, not probing");
+                    state.reset();
+                }
             }
             None => {}
         }
@@ -353,6 +362,17 @@ impl PresenceState {
         self.known_present = true;
         Some(PresenceTransition::Detected)
     }
+
+    /// Drops back to "not present" without producing a `Lost` transition -
+    /// for when a caller saw `Detected` but then found the device gone
+    /// before finishing whatever that transition triggers (e.g. probing),
+    /// so nothing was ever announced and there is nothing to take back.
+    /// Leaves the next genuine appearance to be reported as a fresh
+    /// `Detected`, rather than being silently swallowed because this state
+    /// still thought the device was present.
+    fn reset(&mut self) {
+        self.known_present = false;
+    }
 }
 
 #[cfg(test)]
@@ -385,6 +405,14 @@ mod tests {
         state.observe(true);
         assert_eq!(state.observe(false), Some(PresenceTransition::Lost));
         assert_eq!(state.observe(false), None, "no change while still absent");
+    }
+
+    #[test]
+    fn reset_lets_the_next_appearance_be_detected_again() {
+        let mut state = PresenceState::new();
+        state.observe(true);
+        state.reset();
+        assert_eq!(state.observe(true), Some(PresenceTransition::Detected), "reset must clear the known-present flag so a later appearance isn't swallowed");
     }
 
     #[tokio::test]
@@ -425,6 +453,51 @@ mod tests {
         let received = tokio::time::timeout(StdDuration::from_secs(2), rx.recv()).await.expect("subscriber should have been notified once the delay elapses").expect("channel should still be open");
         assert!(matches!(received, DeviceStatus::Present(Some(FakeInfo(7)))));
         assert_eq!(PROBE_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn probe_is_skipped_when_the_device_disappears_during_the_detect_to_probe_delay() {
+        struct Fake;
+        static PROBE_CALLS: AtomicUsize = AtomicUsize::new(0);
+        impl DeviceDriver for Fake {
+            const UEVENT_SUBSYSTEM: &'static str = "fake";
+            const PATH_ENV_VAR: &'static str = "SIMPLE_KVM_FAKE_DEVICE_VANISHES_DURING_DELAY";
+            const DEFAULT_PATH: &'static str = "/nonexistent/simple-kvm-fake-device";
+            type Info = FakeInfo;
+            type Settings = ();
+            type Open = ();
+            fn probe(_device_path: &str) -> Option<Self::Info> {
+                PROBE_CALLS.fetch_add(1, Ordering::SeqCst);
+                Some(FakeInfo(9))
+            }
+            fn open(_device_path: &str, _settings: &Self::Settings) -> Result<Self::Open, OpenError> {
+                Ok(())
+            }
+        }
+
+        let tmp = TempDevicePath::new();
+        let probe_delay = StdDuration::from_millis(150);
+        let device = Device::<Fake>::spawn_at_path(tmp.as_str().to_string(), probe_delay);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _sub = device.add_event_listener(move |status| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(status);
+            }
+        });
+
+        // Remove the device partway through the delay, before the probe
+        // would otherwise fire.
+        tokio::time::sleep(probe_delay / 3).await;
+        drop(tmp);
+
+        // Give the delay time to fully elapse and the task time to make its
+        // decision.
+        tokio::time::sleep(probe_delay).await;
+
+        assert_eq!(PROBE_CALLS.load(Ordering::SeqCst), 0, "must not probe a device that disappeared during the delay");
+        assert!(rx.try_recv().is_err(), "must not announce Present for a device that was never actually there when the delay elapsed");
     }
 
     struct TempDevicePath(std::path::PathBuf);
@@ -494,8 +567,37 @@ mod tests {
             }
         }
 
-        let device = Device::<Fake>::from_status("dummy", DeviceStatus::Present(Some(FakeInfo(1))));
+        // `open`'s fresh recheck needs a path that actually exists, unlike
+        // the other `from_status` tests here that only exercise the
+        // cached-status gate.
+        let tmp = TempDevicePath::new();
+        let device = Device::<Fake>::from_status(tmp.as_str(), DeviceStatus::Present(Some(FakeInfo(1))));
         assert_eq!(device.open(&()).unwrap(), "opened");
+    }
+
+    #[test]
+    fn open_fails_when_cached_present_but_the_path_no_longer_exists() {
+        struct Fake;
+        impl DeviceDriver for Fake {
+            const UEVENT_SUBSYSTEM: &'static str = "fake";
+            const PATH_ENV_VAR: &'static str = "SIMPLE_KVM_FAKE_DEVICE";
+            const DEFAULT_PATH: &'static str = "/nonexistent/simple-kvm-fake-device";
+            type Info = FakeInfo;
+            type Settings = ();
+            type Open = ();
+            fn probe(_device_path: &str) -> Option<Self::Info> {
+                Some(FakeInfo(1))
+            }
+            fn open(_device_path: &str, _settings: &Self::Settings) -> Result<Self::Open, OpenError> {
+                panic!("open must not be called when the device path no longer exists, even if the last-known status said present");
+            }
+        }
+
+        // The cached status says "present", but the path itself was never
+        // created, so the fresh recheck inside `open` must catch this and
+        // fail rather than trust the stale status alone.
+        let device = Device::<Fake>::from_status("/nonexistent/simple-kvm-open-recheck-test", DeviceStatus::Present(Some(FakeInfo(1))));
+        assert!(device.open(&()).is_err());
     }
 
     #[tokio::test]
