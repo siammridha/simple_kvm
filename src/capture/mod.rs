@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use serde::Serialize;
 
 /// The frame bus itself stays private to `capture`, but the frame it
 /// carries is what a session pulls off a `CaptureStream`, so the type has
@@ -20,30 +19,6 @@ pub use video_bus::FrameEnvelope;
 /// `CaptureCard`'s API takes and reports, so callers never have to reach
 /// past `capture` into `device` for them.
 pub use crate::device::{CaptureDevice, CaptureSettings, Resolution, SupportedFormat};
-
-/// Live state of the capture card itself — whether it's plugged in right
-/// now, and what resolutions/frame rates it supports. Computed and
-/// published by `CaptureCard`, which is the only thing holding both the
-/// card's reported capabilities and the currently-applied settings, and
-/// pushed to the web page over the `control` data channel (see
-/// `rtc::session::handle`) so an already-open tab reflects a
-/// hot-plug/unplug instead of being frozen at server-startup values.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
-pub struct DeviceState {
-    pub available: bool,
-    pub resolutions: Vec<Resolution>,
-    pub default_resolution: Option<Resolution>,
-    pub frame_rates: Vec<ResolutionFrameRates>,
-}
-
-/// One resolution's discrete frame-rate list — `Vec` rather than a
-/// `Resolution`-keyed map, since JSON object keys must be strings and
-/// `Resolution` isn't one.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct ResolutionFrameRates {
-    pub resolution: Resolution,
-    pub rates: Vec<u32>,
-}
 
 /// `pub(crate)` (rather than private) so `capture::engine`'s `CaptureCard`
 /// can reuse this exact function for its own encode pass - see issue #004,
@@ -101,29 +76,4 @@ pub(crate) fn run_one_pass(device: &CaptureDevice, format: &Option<SupportedForm
     if let Err(err) = result {
         tracing::error!(%err, "capture loop exited with error");
     }
-}
-
-/// Called by `CaptureCard` every time either half of what it depends on
-/// moves - the card's reported capabilities or the applied settings. Cheap
-/// and ioctl-free, so it's safe to run on every presence event or settings
-/// change, unlike an actual probe. Kept as a free function over
-/// `&Option<SupportedFormat>` rather than tied to any particular struct.
-fn device_state_for(format: &Option<SupportedFormat>, settings: &CaptureSettings) -> DeviceState {
-    let Some(format) = format else {
-        return DeviceState::default();
-    };
-    let default_resolution = if format.resolutions.contains(&settings.resolution) { Some(settings.resolution) } else { format.resolutions.first().copied() };
-    let frame_rates = format
-        .resolutions
-        .iter()
-        .map(|&resolution| {
-            // Falls back to just the currently-applied fps if the card
-            // didn't report a discrete list for this resolution — the
-            // dropdown should never be empty, and the applied value is
-            // always a valid option.
-            let rates = format.frame_rates.get(&resolution).cloned().unwrap_or_else(|| vec![settings.fps]);
-            ResolutionFrameRates { resolution, rates }
-        })
-        .collect();
-    DeviceState { available: true, resolutions: format.resolutions.clone(), default_resolution, frame_rates }
 }

@@ -1,5 +1,8 @@
+mod device_state;
 pub mod protocol;
 pub mod session;
+
+pub use device_state::DeviceState;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -17,6 +20,7 @@ use webrtc::peer_connection::{
 };
 
 use crate::capture::engine::CaptureCard;
+use crate::capture::CaptureDevice;
 use crate::hid::Hid;
 use session::SessionContext;
 
@@ -36,10 +40,17 @@ pub struct Rtc {
     /// Shared across every session - `session::handle` calls
     /// `request_stream()` on this once its connection is stable, and again
     /// any time a device-availability event says it's worth retrying (see
-    /// `CaptureCard::add_event_listener`). The encode pass this wraps
-    /// starts/stops as a direct consequence of how many sessions currently
-    /// hold a live `CaptureStream` - nothing here counts that by hand.
+    /// `capture_device`, below). The encode pass this wraps starts/stops as
+    /// a direct consequence of how many sessions currently hold a live
+    /// `CaptureStream` - nothing here counts that by hand.
     capture_card: Arc<CaptureCard>,
+    /// A clone of the same `CaptureDevice` handle `capture_card` holds
+    /// internally (via `CaptureCard::device`, not a second
+    /// `Device::spawn()` - `ARCHITECTURE.md` §3.1). `rtc` is now the thing
+    /// that subscribes to it for presence/capability changes and computes
+    /// `DeviceState` from what it reports plus `capture_card.settings()`
+    /// (§3.4) - `capture` itself no longer does either.
+    capture_device: CaptureDevice,
     /// Shared across every session - `session` calls `send` on this for
     /// every key/mouse event. The queue, the port and the drain worker
     /// live behind it; nothing here holds any of them.
@@ -72,7 +83,8 @@ impl Rtc {
     }
 
     fn new(capture_card: Arc<CaptureCard>, hid: Arc<Hid>) -> Self {
-        Self { capture_card, hid }
+        let capture_device = capture_card.device();
+        Self { capture_card, capture_device, hid }
     }
 
     /// The whole signaling surface: hand it the browser's offer SDP, get
@@ -292,7 +304,7 @@ async fn negotiate(offer_sdp: String, rtc: Rtc) -> Result<String> {
     // why this can't just be unconditional.
     ready.store(true, Ordering::Relaxed);
 
-    let ctx = SessionContext { capture_card: rtc.capture_card, hid: rtc.hid, h264_codec: h264_codec.rtp_codec, pc_state_rx };
+    let ctx = SessionContext { capture_card: rtc.capture_card, capture_device: rtc.capture_device, hid: rtc.hid, h264_codec: h264_codec.rtp_codec, pc_state_rx };
     let pc_for_session = peer_connection.clone();
     tokio::spawn(async move {
         if let Err(err) = session::handle(pc_for_session, dc_rx, renegotiation_rx, ctx).await {

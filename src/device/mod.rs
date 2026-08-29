@@ -232,6 +232,16 @@ impl<D: DeviceDriver> Device<D> {
         matches!(self.inner.events.latest(), Some(DeviceStatus::Present(_)))
     }
 
+    /// The full status last published, mirroring `is_present`'s "ask
+    /// without subscribing" contract but carrying the probed capabilities
+    /// too - lets a caller (e.g. `rtc`, computing device state for a
+    /// session that's only just subscribing) read what's currently known
+    /// without waiting for the next transition or paying for a fresh
+    /// probe.
+    pub fn latest_status(&self) -> Option<DeviceStatus<D::Info>> {
+        self.inner.events.latest()
+    }
+
     /// Test-only: builds a `Device` in a given status without spawning
     /// the real presence task, so `open`'s present/absent gating can be
     /// tested without real hardware, a real device path, or real timing.

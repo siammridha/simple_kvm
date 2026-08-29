@@ -199,8 +199,9 @@ impl Hid {
     }
 
     /// Mirrors `addEventListener('devicechange', cb)` for the CH9329 -
-    /// forwards presence exactly as `Device<Ch9329Driver>` reports it,
-    /// the HID counterpart of `CaptureCard::add_event_listener`.
+    /// forwards presence exactly as `Device<Ch9329Driver>` reports it. The
+    /// HID counterpart of subscribing directly on a `CaptureDevice` handle
+    /// (see `CaptureCard::device`, `rtc::session`).
     pub fn add_event_listener<F, Fut>(&self, callback: F) -> Subscription<DeviceStatus<()>>
     where
         F: Fn(DeviceStatus<()>) -> Fut + Send + Sync + 'static,

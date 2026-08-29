@@ -32,8 +32,9 @@
 # needs a real "video4linux" uevent this container has no privileged way
 # to synthesize). That path shares the exact same `try_attach_video`
 # function already proven above by the initial attach, triggered by
-# `CaptureCard::add_event_listener`'s presence forwarding - covered at
-# the Rust level instead by device::tests::
+# `rtc::session`'s own subscription on its `CaptureDevice` handle
+# (`ctx.capture_device.add_event_listener`, see src/rtc/session.rs) -
+# covered at the Rust level instead by device::tests::
 # genuine_absent_to_present_transition_is_detected (the presence edge itself)
 # and capture::engine::tests::
 # live_count_restarts_after_pass_stopped_on_its_own_even_if_still_live

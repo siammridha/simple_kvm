@@ -16,7 +16,6 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::capture::video_bus::{self, FrameEnvelope};
-use crate::capture::{device_state_for, DeviceState};
 use crate::device::{CaptureDevice, CaptureSettings, DeviceStatus, EventEmitter, Resolution, StateEmitter, Subscription, SupportedFormat};
 
 /// Startup default, falling back to the device's first reported
@@ -43,10 +42,6 @@ struct Shared {
     /// every already-open tab sees a `Save` from another tab without a
     /// reload (see `rtc::session::handle`).
     settings_changed: Arc<EventEmitter<CaptureSettings>>,
-    /// Fires whenever the UI-facing `DeviceState` moves - either half of
-    /// what it's computed from (the card's capabilities, the applied
-    /// settings) can move it.
-    device_state_changed: Arc<EventEmitter<DeviceState>>,
     /// Keeps `Shared`'s `format`/settings cache current - see
     /// `CaptureCard::new`. Held only for its lifetime effect; never read
     /// directly. A `OnceLock` because the subscription can only be made
@@ -63,9 +58,6 @@ struct State {
     /// does they're recomputed against what it actually supports.
     settings_are_defaults: bool,
     format: Option<SupportedFormat>,
-    /// Last published `DeviceState`, kept so a recompute that lands on the
-    /// same value dispatches nothing.
-    device_state: DeviceState,
     live: LiveCount,
     pass: Option<PassHandle>,
     /// Set by `update_settings` when it stops a running pass: the
@@ -153,7 +145,6 @@ impl CaptureCard {
             settings: default_settings(None),
             settings_are_defaults: true,
             format: None,
-            device_state: DeviceState::default(),
             live: LiveCount::new(),
             pass: None,
             restart_pass: false,
@@ -167,7 +158,6 @@ impl CaptureCard {
             force_keyframe: Arc::new(AtomicBool::new(false)),
             state,
             settings_changed: Arc::new(EventEmitter::new()),
-            device_state_changed: Arc::new(EventEmitter::new()),
             device_status_sub: OnceLock::new(),
         });
 
@@ -186,13 +176,14 @@ impl CaptureCard {
                 let Some(shared) = weak_shared.upgrade() else {
                     return;
                 };
-                let (new_settings, new_device_state) = {
+                let new_settings = {
                     let mut state = shared.state.lock().unwrap();
                     // `Present(None)` means `CaptureDriver::probe` itself
                     // failed (see `device::DeviceStatus`'s doc comment) -
-                    // `format` is left exactly as it was, so `DeviceState`
-                    // stays whatever it last knew rather than being wiped
-                    // by a probe that told us nothing new.
+                    // `format` is left exactly as it was, so a `rtc`
+                    // recompute of `DeviceState` stays whatever it last
+                    // knew rather than being wiped by a probe that told us
+                    // nothing new.
                     match status {
                         DeviceStatus::Present(Some(info)) => state.format = Some(info),
                         DeviceStatus::Present(None) => {}
@@ -202,7 +193,7 @@ impl CaptureCard {
                     // had said anything about itself; now that it has,
                     // fall back to a combination it actually reports -
                     // but never overwrite settings a person chose.
-                    let new_settings = if state.settings_are_defaults {
+                    if state.settings_are_defaults {
                         let defaults = default_settings(state.format.as_ref());
                         (defaults != state.settings).then(|| {
                             state.settings = defaults;
@@ -210,14 +201,10 @@ impl CaptureCard {
                         })
                     } else {
                         None
-                    };
-                    (new_settings, refresh_device_state(&mut state))
+                    }
                 };
                 if let Some(settings) = new_settings {
                     shared.settings_changed.dispatch(settings);
-                }
-                if let Some(device_state) = new_device_state {
-                    shared.device_state_changed.dispatch(device_state);
                 }
             }
         });
@@ -240,7 +227,7 @@ impl CaptureCard {
     /// Always fires `settings_changed`, even for a no-op save, so the tab
     /// that saved gets the same echo back as every other open tab.
     pub fn update_settings(&self, settings: CaptureSettings) {
-        let new_device_state = {
+        {
             let mut state = self.shared.state.lock().unwrap();
             let moved = state.settings != settings;
             state.settings = settings;
@@ -251,12 +238,8 @@ impl CaptureCard {
                 stop.store(true, Ordering::Relaxed);
                 state.restart_pass = true;
             }
-            refresh_device_state(&mut state)
-        };
-        self.shared.settings_changed.dispatch(settings);
-        if let Some(device_state) = new_device_state {
-            self.shared.device_state_changed.dispatch(device_state);
         }
+        self.shared.settings_changed.dispatch(settings);
     }
 
     /// Mirrors `addEventListener('change', cb)` for the applied settings.
@@ -268,21 +251,13 @@ impl CaptureCard {
         self.shared.settings_changed.add_event_listener(callback)
     }
 
-    /// The UI-facing state of the card: whether it's usable right now,
-    /// what it supports, and which combination is selected. Computed here
-    /// because this is the only place holding both the card's probed
-    /// capabilities and the applied settings.
-    pub fn device_state(&self) -> DeviceState {
-        self.shared.state.lock().unwrap().device_state.clone()
-    }
-
-    /// Mirrors `addEventListener('change', cb)` for `device_state`.
-    pub fn add_device_state_listener<F, Fut>(&self, callback: F) -> Subscription<DeviceState>
-    where
-        F: Fn(DeviceState) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-        self.shared.device_state_changed.add_event_listener(callback)
+    /// Hands back the same capture device this card holds - a clone, not a
+    /// second `Device::spawn()` (see `ARCHITECTURE.md` §3.1 "one instance
+    /// per physical device"). `rtc` uses this to subscribe to
+    /// presence/capability changes and compute the UI-facing device state
+    /// itself (§3.4) - this card no longer does either.
+    pub fn device(&self) -> CaptureDevice {
+        self.shared.device.clone()
     }
 
     /// Mirrors `getUserMedia()`. Fails immediately (never hangs) if the
@@ -318,24 +293,6 @@ impl CaptureCard {
         }
 
         Ok(CaptureStream { inner: Arc::new(StreamInner { frames: AsyncMutex::new(self.shared.video_bus_rx.clone()), ended, _live: LiveMarker { shared: Arc::clone(&self.shared) } }) })
-    }
-
-    /// Mirrors `navigator.mediaDevices.ondevicechange` for the specific
-    /// device this card wraps - forwards presence/capability transitions
-    /// exactly as `Device<CaptureDriver>` reports them. What
-    /// `rtc::session::handle` subscribes to in order to retry
-    /// `request_stream()` once a previously-unavailable device becomes
-    /// present again, without needing a new browser connection - matches
-    /// `request_stream`'s own presence-only gating (`Device::is_present`
-    /// is true for `DeviceStatus::Present(_)` regardless of whether
-    /// probing succeeded), rather than the stricter "successfully probed"
-    /// signal `DeviceState` carries for the UI.
-    pub fn add_event_listener<F, Fut>(&self, callback: F) -> Subscription<DeviceStatus<SupportedFormat>>
-    where
-        F: Fn(DeviceStatus<SupportedFormat>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-        self.shared.device.add_event_listener(callback)
     }
 
     /// Test-only hook exposing whether a pass is currently marked as
@@ -497,19 +454,6 @@ impl CaptureStream {
     }
 }
 
-/// Recomputes the UI-facing `DeviceState` from the cached capabilities and
-/// the applied settings, returning it only if it actually moved. The
-/// caller dispatches it after releasing the state lock, so a listener
-/// never runs with the lock held.
-fn refresh_device_state(state: &mut State) -> Option<DeviceState> {
-    let new_state = device_state_for(&state.format, &state.settings);
-    if new_state == state.device_state {
-        return None;
-    }
-    state.device_state = new_state.clone();
-    Some(new_state)
-}
-
 /// Computes the in-memory default settings: 720p@5fps if the device
 /// reports supporting it, otherwise the device's first reported
 /// resolution/frame-rate combination. `None` (device never probed, or
@@ -645,6 +589,19 @@ mod tests {
 
         let result = card.request_stream().await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn device_hands_back_a_live_clone_of_the_held_device() {
+        // `rtc` (issue #026) now relies on `device()` for its own presence
+        // subscription and `DeviceState` computation, instead of the
+        // engine forwarding either - this is what proves the handle it
+        // gets back is genuinely live, not a snapshot.
+        let tmp = TempDevicePath::new();
+        let device = present_device_at(tmp.as_str()).await;
+        let card = CaptureCard::new(device);
+
+        assert!(card.device().is_present(), "device() should hand back a working clone of the same device the card holds");
     }
 
     #[tokio::test]

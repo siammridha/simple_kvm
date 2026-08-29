@@ -89,7 +89,7 @@ pub enum ControlMessage {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
-    DeviceState(crate::capture::DeviceState),
+    DeviceState(crate::rtc::DeviceState),
     /// Whether the CH9329 is plugged in right now — the HID counterpart of
     /// `DeviceState` (which only covers the capture card).
     HidState { available: bool },

@@ -31,20 +31,28 @@ use webrtc::rtp_transceiver::RtpSender;
 
 use crate::capture::FrameEnvelope;
 use crate::capture::engine::{CaptureCard, CaptureStream, NoDevice};
-use crate::capture::{CaptureSettings, Resolution, SupportedFormat};
+use crate::capture::{CaptureDevice, CaptureSettings, Resolution, SupportedFormat};
 use crate::hid::{Hid, InputCommand, MouseMode};
 use crate::device::{DeviceStatus, Subscription};
 
+use super::device_state::{device_state_for, DeviceState};
 use super::protocol::{ControlMessage, InputEvent, MouseModeWire, ServerMessage};
 
 pub struct SessionContext {
     /// Shared across every session on this server - see `super::Rtc`.
     /// `handle` calls `request_stream()` on this once the connection is
     /// stable, and again on every later device-availability signal while
-    /// this session still has no track. Capture settings and the card's
-    /// UI-facing state are read from and written to it directly, and
-    /// subscribed to per session (see `handle`).
+    /// this session still has no track. Capture settings are read from and
+    /// written to it directly, and subscribed to per session (see
+    /// `handle`).
     pub capture_card: Arc<CaptureCard>,
+    /// A clone of the same `CaptureDevice` handle `capture_card` holds
+    /// internally (via `CaptureCard::device`) - see `super::Rtc`. This
+    /// session subscribes to it directly for presence/capability changes
+    /// and computes `DeviceState` from what it reports plus
+    /// `capture_card.settings()` (see `current_device_state`); `capture`
+    /// itself no longer tracks or computes either.
+    pub capture_device: CaptureDevice,
     /// The HID bridge - see `super::Rtc`. Input, mouse mode and CH9329
     /// presence all go through it, as commands and subscriptions.
     pub hid: Arc<Hid>,
@@ -270,13 +278,13 @@ pub async fn handle(
 
     let mut pc_state_rx = ctx.pc_state_rx.clone();
 
-    // Forwards `CaptureCard`'s own device-presence events into this
+    // Forwards the capture device's own presence events into this
     // session's `select!` loop - what drives retrying `request_stream()`
     // once a previously-unavailable device becomes present again, without
     // needing a new browser connection. Kept alive for the life of this
     // session via `_presence_sub`.
     let (presence_tx, mut presence_rx) = mpsc::unbounded_channel::<DeviceStatus<SupportedFormat>>();
-    let _presence_sub = ctx.capture_card.add_event_listener(move |status| {
+    let _presence_sub = ctx.capture_device.add_event_listener(move |status| {
         let presence_tx = presence_tx.clone();
         async move {
             let _ = presence_tx.send(status);
@@ -329,27 +337,34 @@ pub async fn handle(
     // would fail its first send against a not-yet-open channel and stop
     // for good - so the `control_open` guard is what the `OnOpen` arm's
     // `push_initial_state` hands over from.
-    let _device_state_sub = ctx.capture_card.add_device_state_listener({
-        let (capture_card, outbound_tx, control_open) = (Arc::clone(&ctx.capture_card), outbound_tx.clone(), Arc::clone(&control_open));
+    let _device_state_sub = ctx.capture_device.add_event_listener({
+        let (capture_device, capture_card, outbound_tx, control_open) = (ctx.capture_device.clone(), Arc::clone(&ctx.capture_card), outbound_tx.clone(), Arc::clone(&control_open));
         move |_| {
-            let (capture_card, outbound_tx, control_open) = (Arc::clone(&capture_card), outbound_tx.clone(), Arc::clone(&control_open));
+            let (capture_device, capture_card, outbound_tx, control_open) = (capture_device.clone(), Arc::clone(&capture_card), outbound_tx.clone(), Arc::clone(&control_open));
             async move {
                 if control_open.load(Ordering::Relaxed) {
-                    let _ = outbound_tx.send(ServerMessage::DeviceState(capture_card.device_state()));
+                    let _ = outbound_tx.send(ServerMessage::DeviceState(current_device_state(&capture_device, &capture_card)));
                 }
             }
         }
     });
     // Capture settings and mouse mode are two halves of one
     // `ServerMessage::Settings`, so both subscriptions send the same
-    // snapshot of both values.
+    // snapshot of both values. A settings change can also move
+    // `DeviceState` (it affects `default_resolution`/frame-rate fallback),
+    // so this pushes a fresh one alongside the settings snapshot - the
+    // same thing `capture`'s own `update_settings`-triggered dispatch used
+    // to cover before device state moved here (issue #026).
     let _settings_sub = ctx.capture_card.add_settings_listener({
-        let (capture_card, hid, outbound_tx, control_open) = (Arc::clone(&ctx.capture_card), Arc::clone(&ctx.hid), outbound_tx.clone(), Arc::clone(&control_open));
+        let (capture_device, capture_card, hid, outbound_tx, control_open) =
+            (ctx.capture_device.clone(), Arc::clone(&ctx.capture_card), Arc::clone(&ctx.hid), outbound_tx.clone(), Arc::clone(&control_open));
         move |_| {
-            let (capture_card, hid, outbound_tx, control_open) = (Arc::clone(&capture_card), Arc::clone(&hid), outbound_tx.clone(), Arc::clone(&control_open));
+            let (capture_device, capture_card, hid, outbound_tx, control_open) =
+                (capture_device.clone(), Arc::clone(&capture_card), Arc::clone(&hid), outbound_tx.clone(), Arc::clone(&control_open));
             async move {
                 if control_open.load(Ordering::Relaxed) {
                     let _ = outbound_tx.send(ServerMessage::Settings { capture: capture_card.settings(), mouse_mode: hid.mouse_mode() });
+                    let _ = outbound_tx.send(ServerMessage::DeviceState(current_device_state(&capture_device, &capture_card)));
                 }
             }
         }
@@ -450,11 +465,11 @@ pub async fn handle(
                         // already current when this tab connected. So the current
                         // state is read straight from the owning modules and
                         // pushed once here; the subscriptions above cover every
-                        // update from this point on. The device state is whatever
-                        // `capture` last computed from probing the card when it
-                        // was plugged in - opening this channel doesn't trigger a
-                        // fresh probe of its own.
-                        if push_initial_state(&outbound_tx, &ctx.capture_card, &ctx.hid).is_ok() {
+                        // update from this point on. The device state is
+                        // recomputed from whatever `device` last probed when the
+                        // card was plugged in (`current_device_state`) - opening
+                        // this channel doesn't trigger a fresh probe of its own.
+                        if push_initial_state(&outbound_tx, &ctx.capture_device, &ctx.capture_card, &ctx.hid).is_ok() {
                             control_open.store(true, Ordering::Relaxed);
                         }
                     }
@@ -499,15 +514,31 @@ pub async fn handle(
     Ok(())
 }
 
+/// Recomputes `DeviceState` from the capture device's last-known status
+/// (`CaptureDevice::latest_status` - no fresh probe, mirroring the same
+/// "ask without subscribing" contract `is_present` already gave `capture`)
+/// plus the capture engine's current settings. This is what `rtc` now owns
+/// in place of the `CaptureCard::device_state()` cache removed in issue
+/// #026 - both the per-event subscriptions above and the initial push
+/// below (`push_initial_state`) go through this so they can never disagree
+/// on how the value is computed.
+fn current_device_state(capture_device: &CaptureDevice, capture_card: &CaptureCard) -> DeviceState {
+    let info = match capture_device.latest_status() {
+        Some(DeviceStatus::Present(Some(info))) => Some(info),
+        _ => None,
+    };
+    device_state_for(&info, &capture_card.settings())
+}
+
 /// Enqueues the full current state (device availability, HID connectivity,
 /// settings) onto the outbound queue for the just-opened `control` channel,
 /// read straight from the modules that own it. Needed because a listener
 /// only fires for changes from here on — it doesn't tell a freshly
 /// connected tab about state that was already current before it connected
 /// (see the call site in `handle`).
-fn push_initial_state(outbound_tx: &mpsc::UnboundedSender<ServerMessage>, capture_card: &CaptureCard, hid: &Hid) -> Result<()> {
+fn push_initial_state(outbound_tx: &mpsc::UnboundedSender<ServerMessage>, capture_device: &CaptureDevice, capture_card: &CaptureCard, hid: &Hid) -> Result<()> {
     let closed = || anyhow::anyhow!("outbound queue closed");
-    outbound_tx.send(ServerMessage::DeviceState(capture_card.device_state())).map_err(|_| closed())?;
+    outbound_tx.send(ServerMessage::DeviceState(current_device_state(capture_device, capture_card))).map_err(|_| closed())?;
     outbound_tx.send(ServerMessage::HidState { available: hid.is_present() }).map_err(|_| closed())?;
     outbound_tx.send(ServerMessage::Settings { capture: capture_card.settings(), mouse_mode: hid.mouse_mode() }).map_err(|_| closed())?;
     Ok(())
@@ -642,7 +673,6 @@ fn handle_control_message(msg: ControlMessage, ctx: &SessionContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::CaptureDevice;
     use crate::rtc::protocol::CaptureSettingsWire;
 
     fn test_ctx() -> SessionContext {
@@ -651,8 +681,10 @@ mod tests {
         // `handle_control_message`, which never asks the engine for a
         // stream, so a real capture device is neither needed nor wanted.
         let capture_device = CaptureDevice::spawn_at("/nonexistent-simple-kvm-test-device");
+        let capture_card = Arc::new(CaptureCard::new(capture_device));
         SessionContext {
-            capture_card: Arc::new(CaptureCard::new(capture_device)),
+            capture_device: capture_card.device(),
+            capture_card,
             // Points at a path that will never exist, same reasoning as
             // `capture_device` above - these tests only reach
             // `handle_control_message`.
