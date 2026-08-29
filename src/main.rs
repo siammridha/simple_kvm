@@ -4,13 +4,7 @@ mod hid;
 mod rtc;
 mod web;
 
-use std::sync::Arc;
-
 use tracing_subscriber::EnvFilter;
-
-use capture::engine::CaptureCard;
-use device::CaptureDevice;
-use hid::Hid;
 
 #[tokio::main]
 async fn main() {
@@ -18,25 +12,10 @@ async fn main() {
     log_startup_banner(env!("CARGO_PKG_VERSION"));
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "simple_kvm starting");
 
-    // --- Capture: the card is never opened automatically right here at
-    // startup. Opening it unprompted has reliably crashed the real hardware
-    // this targets right at boot (see README's "boot-crash" known issue) -
-    // `Device<CaptureDriver>`'s presence task (spawned by `CaptureDevice::
-    // spawn` below) deliberately never probes the very first time it finds
-    // the device already present, for exactly that reason. `CaptureCard`
-    // owns the capture settings and the UI-facing device state; both are
-    // in-memory only, and nothing here is ever read from or written to
-    // disk. Nothing here ever sees the raw device path either - the device
-    // reads it from its own config. ---
-    let capture_card = Arc::new(CaptureCard::new(CaptureDevice::spawn()));
-
-    // --- Serial: same soft-unavailable treatment as capture. `Hid` owns
-    // its own device, queue, drain worker and mouse mode; commands sent
-    // before its port is open queue up rather than being lost, so nothing
-    // here holds up the HTTP page starting. ---
-    let hid = Hid::spawn();
-
-    let rtc = rtc::Rtc::new(capture_card, hid);
+    // --- rtc: a composition root in its own right - building it is what
+    // constructs and starts its own capture engine and HID module (see
+    // `Rtc::spawn`). ---
+    let rtc = rtc::Rtc::spawn();
 
     // --- Web: owns the port, the listener and every route. Runs until the
     // process ends, which is what keeps the whole service alive. ---

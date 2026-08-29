@@ -139,6 +139,14 @@ impl LiveCount {
 }
 
 impl CaptureCard {
+    /// Builds the engine and its own `CaptureDevice` together, so a caller
+    /// that just wants a working engine - `rtc`, which constructs its own
+    /// dependencies (`ARCHITECTURE.md` §3.2/§3.4) - never has to touch
+    /// `device` itself to get one.
+    pub fn spawn() -> Arc<Self> {
+        Arc::new(Self::new(CaptureDevice::spawn()))
+    }
+
     pub fn new(device: CaptureDevice) -> Self {
         let (video_bus_tx, video_bus_rx) = video_bus::channel();
         let state = Mutex::new(State {

@@ -47,7 +47,31 @@ pub struct Rtc {
 }
 
 impl Rtc {
-    pub fn new(capture_card: Arc<CaptureCard>, hid: Arc<Hid>) -> Self {
+    /// The composition root for `rtc`'s own dependencies, the same way
+    /// `main` is the composition root for `rtc`/`web` (`ARCHITECTURE.md`
+    /// §3.4/§3.6) — building this is what starts the capture card's
+    /// presence task and `Hid`'s own device/drain worker.
+    ///
+    /// The capture card is never opened automatically right here at
+    /// startup. Opening it unprompted has reliably crashed the real
+    /// hardware this targets right at boot (see README's "boot-crash"
+    /// known issue) - `Device<CaptureDriver>`'s presence task (spawned as
+    /// part of `CaptureCard::spawn` below) deliberately never probes the
+    /// very first time it finds the device already present, for exactly
+    /// that reason. `CaptureCard` owns the capture settings and the UI-facing
+    /// device state; both are in-memory only, and nothing here is ever
+    /// read from or written to disk. Nothing here ever sees the raw
+    /// device path either - the device reads it from its own config.
+    ///
+    /// Serial gets the same soft-unavailable treatment as capture. `Hid`
+    /// owns its own device, queue, drain worker and mouse mode; commands
+    /// sent before its port is open queue up rather than being lost, so
+    /// nothing here holds up the HTTP page starting.
+    pub fn spawn() -> Self {
+        Self::new(CaptureCard::spawn(), Hid::spawn())
+    }
+
+    fn new(capture_card: Arc<CaptureCard>, hid: Arc<Hid>) -> Self {
         Self { capture_card, hid }
     }
 
