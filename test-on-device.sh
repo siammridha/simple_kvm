@@ -13,6 +13,8 @@
 #   DEVICE_IP=192.168.1.50 ./test-on-device.sh
 set -eu
 
+[ -f .env ] && export $(cat .env | xargs)
+
 : "${DEVICE_IP:?Set DEVICE_IP to your device's LAN address, e.g. DEVICE_IP=192.168.1.50 ./test-on-device.sh}"
 
 if ! command -v cargo-zigbuild >/dev/null 2>&1; then

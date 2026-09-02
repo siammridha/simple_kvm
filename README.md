@@ -102,6 +102,9 @@ key and no password). Set `DEVICE_IP` to your device's LAN address:
 DEVICE_IP=192.168.1.50 ./test-on-device.sh
 ```
 
+Or put `DEVICE_IP=192.168.1.50` in a `.env` file in the repo root (git-ignored) and just run
+`./test-on-device.sh` - the script loads it automatically if present.
+
 ## Target platform
 
 - **Device:** Dell Wyse 3040 (Intel Atom x5-Z8350, x86_64)
