@@ -11,7 +11,8 @@
             "presentation": {
                 "reveal": "always",
                 "panel": "dedicated",
-                "clear": true
+                "clear": true,
+                "close": true
             }
         },
         {
@@ -22,7 +23,8 @@
             "presentation": {
                 "reveal": "always",
                 "panel": "dedicated",
-                "clear": true
+                "clear": true,
+                "close": true
             }
         }
     ]
