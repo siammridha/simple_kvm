@@ -31,7 +31,7 @@ ip>:3000` with:
 - **Live video** - streamed over WebRTC as H.264, decoded natively in the browser's `<video>` element.
 - **Resolution dropdown** - populated from what the capture card actually reports supporting.
 - **Frame rate dropdown** - populated from what the card supports at the currently-selected resolution.
-- **Mouse movement, clicks, and scroll wheel** - absolute or relative mode, switched via Save settings.
+- **Mouse movement, clicks, and scroll wheel** - absolute or relative mode, switched via the Save button; scroll direction can also be flipped, applied immediately in the browser.
 - **A mouse on/off toggle** - turns all mouse forwarding on or off locally in the browser; keyboard input is unaffected.
 - **A paste box** - sends pasted text to the target as simulated keystrokes (US QWERTY only).
 - **An auto-hiding controls bar** - tucks away after 5 seconds idle, reopens on tap/click.
@@ -39,8 +39,8 @@ ip>:3000` with:
 
 Video only starts when a browser tab is actually watching, and the capture card and CH9329 can be
 hot-plugged at any time - the page picks up a device connecting or disconnecting live, no restart
-or reload needed. Settings changes (resolution, frame rate, mouse mode) apply live via **Save
-settings** and are not saved to disk - they reset to defaults on restart.
+or reload needed. Settings changes (resolution, frame rate, mouse mode) apply live via **Save**
+and are not saved to disk - they reset to defaults on restart.
 
 ### No TLS to set up
 

@@ -89,11 +89,17 @@ let lastMouseMoveButtons = 0;
 // Local, unsaved toggle - when off, no mouse event (move, click, or scroll)
 // is sent to the target at all. Keyboard input is unaffected.
 let mouseEnabled = true;
-// Local, unsaved toggle for wheel direction - persisted in localStorage
-// (per-browser, not sent to the server) so it survives a reload. Defaults
-// to on: the raw un-flipped mapping felt backwards on the hardware this
-// was built against.
+// Local toggle for wheel direction - persisted in localStorage (per-browser,
+// not sent to the server) so it survives a reload. Defaults to on: the raw
+// un-flipped mapping felt backwards on the hardware this was built against.
+// Applies to the next wheel event immediately, but still counts toward the
+// Save button's dirty state (see settingsAreDirty()) so a change is visibly
+// acknowledged, same as any other setting.
 let scrollFlipped = readStoredScrollFlipped();
+// Baseline scrollFlipped is compared against for the dirty check - moves to
+// match scrollFlipped whenever Save is clicked (see wireInput()'s click
+// handler on #save-settings).
+let appliedScrollFlipped = scrollFlipped;
 
 function readStoredScrollFlipped() {
   try {
@@ -327,7 +333,8 @@ function updateIndicators() {
 // True if a dropdown's current value differs from appliedSettings (the
 // server-confirmed baseline) for whichever half of settings is actually
 // available - a device that isn't present has nothing meaningful to save,
-// so its dropdowns (which may hold placeholder values) don't count.
+// so its dropdowns (which may hold placeholder values) don't count. The
+// scroll-flip toggle has no device dependency, so it's always checked.
 function settingsAreDirty() {
   if (captureAvailable) {
     if (Number(frameRateSelect.value) !== appliedSettings.fps) return true;
@@ -337,6 +344,7 @@ function settingsAreDirty() {
   if (hidAvailable) {
     if (mouseModeSelect.value !== appliedSettings.mouse_mode) return true;
   }
+  if (scrollFlipped !== appliedScrollFlipped) return true;
   return false;
 }
 
@@ -459,8 +467,9 @@ function wireMouseToggle() {
   });
 }
 
-// Scroll-flip toggle - purely local, applies to the next wheel event, no
-// Save needed (same as the mouse enable/disable toggle).
+// Scroll-flip toggle - applies to the next wheel event immediately, but
+// (like the dropdowns) still needs Save clicked to acknowledge the change
+// and re-disable the Save button (see settingsAreDirty()).
 function wireScrollFlipToggle() {
   scrollFlipToggle.checked = scrollFlipped;
   scrollFlipToggle.addEventListener('change', () => {
@@ -471,6 +480,7 @@ function wireScrollFlipToggle() {
       // Storage unavailable (e.g. private browsing) - the toggle still
       // works for the rest of this page load, just won't persist.
     }
+    updateSaveButtonState();
   });
 }
 
@@ -706,6 +716,21 @@ function wireInput() {
     }
     if (hidAvailable) {
       message.mouse_mode = mouseModeSelect.value;
+    }
+    // The scroll-flip toggle already took effect locally the moment it was
+    // checked/unchecked - Save just moves the dirty-check baseline to match,
+    // so re-toggling back to the old value re-disables Save. It never goes
+    // over the wire.
+    appliedScrollFlipped = scrollFlipped;
+    // A message with neither field means there's no device to apply
+    // anything to (only the scroll-flip toggle was dirty) - the server has
+    // nothing to do and would never send back a `settings` confirmation, so
+    // resolve locally instead of waiting on one.
+    if (message.capture === undefined && message.mouse_mode === undefined) {
+      updateSaveButtonState();
+      saveSettingsStatus.textContent = 'Saved';
+      setTimeout(() => { saveSettingsStatus.textContent = ''; }, 2000);
+      return;
     }
     sendControl(message);
     savePending = true;
