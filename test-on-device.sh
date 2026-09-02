@@ -23,12 +23,37 @@ if ! command -v cargo-zigbuild >/dev/null 2>&1; then
 fi
 rustup target add x86_64-unknown-linux-musl >/dev/null
 
+SSH="ssh -o StrictHostKeyChecking=accept-new root@$DEVICE_IP"
+SCP="scp -o StrictHostKeyChecking=accept-new"
+
+# `libva-rs`'s build script links against `libva`/`libva-drm` (see its
+# build.rs) - on a build host whose own arch differs from the target's (e.g.
+# this aarch64 devcontainer cross-compiling to x86_64), the host's own
+# libva-dev package is the wrong arch to link against, and pkg-config
+# refuses to probe a foreign arch without extra cross-compile setup this
+# devcontainer doesn't have. The device itself already has real x86_64
+# libva headers and .so files (it has to, to run the encoder) - so fetch
+# them from there once and point the build straight at them via
+# LIBVA_RS_H_PATH/LIBVA_RS_LIB_PATH (which build.rs checks before ever
+# reaching for pkg-config), skipping the cross pkg-config problem entirely.
+# Cached under ~/.cache so a repeat run doesn't re-fetch from the device.
+LIBVA_SYSROOT="$HOME/.cache/simple_kvm-libva-x86_64-linux-musl"
+if [ ! -f "$LIBVA_SYSROOT/lib/libva.so" ]; then
+	echo "Fetching x86_64 libva headers/libraries from $DEVICE_IP (cached at $LIBVA_SYSROOT)..."
+	mkdir -p "$LIBVA_SYSROOT/include" "$LIBVA_SYSROOT/lib"
+	# The whole va/ header directory, not just the ones libva-wrapper.h
+	# includes directly - va.h itself pulls in several sibling headers
+	# (va_version.h, va_str.h, the per-codec va_{enc,dec}_*.h, etc).
+	$SCP -r "root@$DEVICE_IP:/usr/include/va" "$LIBVA_SYSROOT/include/"
+	$SCP "root@$DEVICE_IP:/usr/lib/libva.so" "root@$DEVICE_IP:/usr/lib/libva-drm.so" "$LIBVA_SYSROOT/lib/"
+fi
+export LIBVA_RS_H_PATH="$LIBVA_SYSROOT/include"
+export LIBVA_RS_LIB_PATH="$LIBVA_SYSROOT/lib"
+
 echo "Building release binary for x86_64-unknown-linux-musl..."
 RUSTC_BOOTSTRAP=1 cargo zigbuild --release --target x86_64-unknown-linux-musl
 
-BINARY="target/x86_64-unknown-linux-musl/release/simple_kvm"
-SSH="ssh -o StrictHostKeyChecking=accept-new root@$DEVICE_IP"
-SCP="scp -o StrictHostKeyChecking=accept-new"
+BINARY="${CARGO_TARGET_DIR:-target}/x86_64-unknown-linux-musl/release/simple_kvm"
 
 echo "Copying $BINARY to $DEVICE_IP..."
 $SCP "$BINARY" "root@$DEVICE_IP:/usr/local/bin/simple_kvm.new"
