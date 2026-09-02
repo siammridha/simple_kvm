@@ -12,6 +12,16 @@
 	"remoteEnv": {
 		"GH_TOKEN": "${localEnv:GH_TOKEN}"
 	},
+	// The workspace folder is bind-mounted from the host through virtiofs
+	// (Docker Desktop's Mac file-sharing layer), which has a known bug: a
+	// heavily parallel cargo build mmap's `.rlib` files under target/ and
+	// intermittently gets "Bad address (os error 14)" from virtiofs under
+	// that load. Pointing CARGO_TARGET_DIR at the cargo-cache volume below
+	// (a real ext4 volume, not virtiofs) avoids the bug entirely, so builds
+	// can use full CPU parallelism instead of being throttled around it.
+	"containerEnv": {
+		"CARGO_TARGET_DIR": "/usr/local/cargo/target-cache"
+	},
 	// Volumes survive rebuilds: cargo cache, and Claude state. The Dockerfile
 	// sets CLAUDE_CONFIG_DIR so everything, including what would otherwise be
 	// ~/.claude.json, lives in /home/vscode/.claude (the "claude-config"
