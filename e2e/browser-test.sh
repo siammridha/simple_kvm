@@ -229,15 +229,16 @@ agent-browser click "#topbar-handle"
 echo "Opening the settings panel..."
 agent-browser click "#settings-button"
 
-echo "Changing mouse mode and clicking Save settings..."
+echo "Changing mouse mode and clicking Save..."
 agent-browser select "#mouse-mode" relative
 agent-browser click "#save-settings"
 sleep 0.5
 
-# The scroll-flip toggle is purely local (localStorage, not sent to the
-# server or included in Save settings) - flip it here, before the reload
-# below, to prove it survives a reload the same way a real browser tab
-# restart would need it to.
+# The scroll-flip toggle applies locally (localStorage, not sent to the
+# server) the moment it's clicked, but still needs Save to acknowledge the
+# change and re-disable the Save button - flip it here, before the reload
+# below, to prove both that it enables Save and that it survives a reload
+# the same way a real browser tab restart would need it to.
 echo "Flipping the scroll-flip toggle..."
 SCROLL_FLIP_BEFORE=$(agent-browser eval "window.__debugScrollFlipped()")
 agent-browser click "#scroll-flip-toggle"
@@ -245,6 +246,21 @@ SCROLL_FLIP_AFTER=$(agent-browser eval "window.__debugScrollFlipped()")
 echo "scrollFlipped: $SCROLL_FLIP_BEFORE -> $SCROLL_FLIP_AFTER"
 if [ "$SCROLL_FLIP_AFTER" = "$SCROLL_FLIP_BEFORE" ]; then
 	echo "FAIL: clicking the scroll-flip toggle didn't change scrollFlipped" >&2
+	exit 1
+fi
+
+SAVE_DISABLED=$(agent-browser eval "document.getElementById('save-settings').disabled")
+if [ "$SAVE_DISABLED" != "false" ]; then
+	echo "FAIL: toggling scroll-flip should enable the Save button" >&2
+	exit 1
+fi
+
+echo "Clicking Save for the scroll-flip change..."
+agent-browser click "#save-settings"
+sleep 0.5
+SAVE_DISABLED=$(agent-browser eval "document.getElementById('save-settings').disabled")
+if [ "$SAVE_DISABLED" != "true" ]; then
+	echo "FAIL: Save button should re-disable itself after saving the scroll-flip change" >&2
 	exit 1
 fi
 
@@ -283,4 +299,4 @@ if [ -n "$PAGE_ERRORS" ]; then
 	exit 1
 fi
 
-echo "PASS: page loaded, dropdowns present, WebRTC connected with no TLS anywhere, no video track attached for a present-but-unprobeable device, video overlay/status icons reflect that correctly, keyboard status icon reflects the faked CH9329, Save settings and the scroll-flip toggle both applied in memory and survived a reload, no uncaught JS errors."
+echo "PASS: page loaded, dropdowns present, WebRTC connected with no TLS anywhere, no video track attached for a present-but-unprobeable device, video overlay/status icons reflect that correctly, keyboard status icon reflects the faked CH9329, Save and the scroll-flip toggle (including enabling/re-disabling Save) both applied in memory and survived a reload, no uncaught JS errors."
