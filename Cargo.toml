@@ -15,7 +15,7 @@ libc = "0.2.169"
 rtc = "0.20.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-serialport = "4.9.0"
+serialport = { version = "4.9.0", default-features = false }
 libva-rs = { path = "lib/libva-rs" }
 tokio = { version = "1.53.1", features = ["full"] }
 tracing = "0.1.44"
