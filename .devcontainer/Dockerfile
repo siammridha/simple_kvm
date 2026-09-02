@@ -7,6 +7,30 @@ FROM mcr.microsoft.com/devcontainers/base:alpine
 # `libva-rs` crate's bindgen-based build script and for linking against libva.
 RUN apk add --no-cache build-base pkgconf openssl-dev clang-dev linux-headers libva-dev
 
+# zig is the actual cross-compiler cargo-zigbuild (installed below via cargo)
+# shells out to for test-on-device.sh's x86_64-unknown-linux-musl builds.
+# Installed from the official tarball (checksum-verified) and pinned to
+# 0.11.0, NOT Alpine's `zig` apk package: Alpine's package tracks whatever
+# version its rolling repo currently has, and 0.12.0 switched the default
+# x86_64 ELF linker from LLD to zig's own self-hosted linker. That linker
+# silently drops rustc's standard `-Wl,-O1` release-build hint instead of
+# acting on it, logging a harmless but confusing "ignoring deprecated linker
+# optimization setting" warning on every release build. Pinning to the last
+# LLD-based release avoids the warning and stops the version (and this
+# behavior) from silently drifting on the next image rebuild.
+ARG TARGETARCH
+RUN case "$TARGETARCH" in \
+        arm64) ZIG_ARCH=aarch64; ZIG_SHA=956eb095d8ba44ac6ebd27f7c9956e47d92937c103bf754745d0a39cdaa5d4c6 ;; \
+        amd64) ZIG_ARCH=x86_64; ZIG_SHA=2d00e789fec4f71790a6e7bf83ff91d564943c5ee843c5fd966efc474b423047 ;; \
+        *) echo "Unsupported arch: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL -o /tmp/zig.tar.xz "https://ziglang.org/download/0.11.0/zig-linux-${ZIG_ARCH}-0.11.0.tar.xz" \
+    && echo "${ZIG_SHA}  /tmp/zig.tar.xz" | sha256sum -c - \
+    && mkdir -p /usr/local/zig \
+    && tar xf /tmp/zig.tar.xz -C /usr/local/zig --strip-components=1 \
+    && rm /tmp/zig.tar.xz \
+    && ln -s /usr/local/zig/zig /usr/local/bin/zig
+
 # Rust via rustup, in the same shared paths the official rust image uses (so
 # the cargo-cache volume mount in devcontainer.json keeps working).
 ENV CARGO_HOME=/usr/local/cargo \
