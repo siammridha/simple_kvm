@@ -9,6 +9,9 @@
 	},
 	"workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
 	"remoteUser": "vscode",
+	"remoteEnv": {
+		"GH_TOKEN": "${localEnv:GH_TOKEN}"
+	},
 	// Volumes survive rebuilds: cargo cache, and Claude state. The Dockerfile
 	// sets CLAUDE_CONFIG_DIR so everything, including what would otherwise be
 	// ~/.claude.json, lives in /home/vscode/.claude (the "claude-config"
