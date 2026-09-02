@@ -1,6 +1,7 @@
 /target
 .DS_Store
 .claude
+.env
 
 
 # Added by cargo
