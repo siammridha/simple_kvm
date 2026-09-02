@@ -144,6 +144,13 @@ depend() {
 EOF
 chmod 755 /etc/init.d/simple_kvm
 
+# OpenRC sources conf.d automatically before the init script runs - this is
+# what keeps an installed service at plain info-level logging (no per-frame
+# or per-packet debug lines) regardless of what main.rs's own compiled-in
+# default is. test-on-device.sh writes this same file with a debug-level
+# RUST_LOG for its own test deploys.
+echo 'export RUST_LOG=info' > /etc/conf.d/simple_kvm
+
 rc-update add simple_kvm default
 rc-service simple_kvm restart
 

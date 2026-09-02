@@ -159,15 +159,16 @@ which should avoid this, but it hasn't been confirmed on a real reboot yet.
 
 ### Configuration
 
-All optional, set as environment variables (e.g. in `/etc/init.d/simple_kvm`
-if you need to change one):
+All optional, set as environment variables (e.g. in `/etc/conf.d/simple_kvm`,
+which OpenRC sources automatically before starting the service, if you need
+to change one):
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `SERIAL_PATH` | `/dev/ttyUSB0` | CH9329/CH340 serial device |
 | `VIDEO_PATH` | `/dev/video0` | Capture card device |
 | `HTTP_PORT` | `3000` | Port for the page and WebRTC signaling (`POST /rtc/offer`) |
-| `RUST_LOG` | `info,simple_kvm::rtc::session=debug,simple_kvm::hid::writer=debug` | Standard `tracing` log filter. By default, every keystroke/click is already logged at `debug` - no configuration needed first - since each log line includes how long that event took to queue/write, which is useful for tracking down input lag. A command that takes more than 50ms logs at `warn` regardless. Setting `RUST_LOG` yourself (e.g. `RUST_LOG=debug` for everything, or `RUST_LOG=warn` to quiet the per-keystroke lines) fully overrides the default above. |
+| `RUST_LOG` | `info` | Standard `tracing` log filter - `deploy/install.sh` sets this to `info` for an installed service; `test-on-device.sh` sets a more verbose filter for test deploys. |
 
 Each browser tab's video/input connection (WebRTC) picks its own UDP port
 automatically - there's no fixed port to configure for it, and nothing to
