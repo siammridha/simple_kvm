@@ -67,7 +67,7 @@ pub(crate) fn run_capture_loop_forever(capture: &crate::device::CaptureHandle, s
     let result = v4l2::run_capture_loop(capture, || stop.load(Ordering::Relaxed), move |actual_resolution| -> anyhow::Result<_> {
         let mut encoder = h264::H264Encoder::new(actual_resolution.width, actual_resolution.height).context("Failed to set up GPU")?;
 
-        Ok(move |frame: &[u8], captured_at: v4l2::Timestamp| {
+        Ok(move |frame: &[u8], captured_at: v4l2::Timestamp, sequence: u32| {
             let captured_at = v4l2::timestamp_to_duration(captured_at);
             // A session asked (via RTCP PLI/FIR) for a fresh keyframe
             // sooner than the encoder's own periodic schedule - see
@@ -79,7 +79,13 @@ pub(crate) fn run_capture_loop_forever(capture: &crate::device::CaptureHandle, s
             let envelope = match encoder.encode_yuyv_frame(frame) {
                 Ok(bytes) => FrameEnvelope { data: bytes.into(), captured_at },
                 Err(err) => {
-                    tracing::error!(%err, "H.264 encode failed");
+                    // `sequence` names which capture frame this was, so a
+                    // run of these can be checked against the driver's own
+                    // count for gaps (a dropped frame, not just a short
+                    // one). The hex dump is debug-level, since it's only
+                    // useful when actively chasing one of these down.
+                    tracing::error!(%err, sequence, "H.264 encode failed");
+                    tracing::debug!("bad frame contents:\n{}", hex_dump(frame));
                     return;
                 }
             };
@@ -90,4 +96,32 @@ pub(crate) fn run_capture_loop_forever(capture: &crate::device::CaptureHandle, s
     if let Err(err) = result {
         tracing::error!(%err, "capture loop exited with error");
     }
+}
+
+/// Formats `data` like `hexdump -C`, collapsing runs of identical 16-byte
+/// lines down to a single `*` - a raw YUYV frame is often large stretches
+/// of one repeated pixel, and this keeps a dumped frame from flooding the
+/// log with lines that say nothing new.
+fn hex_dump(data: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let mut last_line: Option<&[u8]> = None;
+    let mut skipping = false;
+    for (i, chunk) in data.chunks(16).enumerate() {
+        if last_line == Some(chunk) {
+            if !skipping {
+                out.push_str("*\n");
+                skipping = true;
+            }
+            continue;
+        }
+        skipping = false;
+        last_line = Some(chunk);
+        let offset = i * 16;
+        let hex: String = chunk.iter().map(|b| format!("{b:02x} ")).collect();
+        let ascii: String = chunk.iter().map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' }).collect();
+        let _ = writeln!(out, "{offset:08x}  {hex:<49}|{ascii}|");
+    }
+    let _ = writeln!(out, "{:08x}", data.len());
+    out
 }

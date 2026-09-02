@@ -33,7 +33,10 @@ pub use v4l::timestamp::Timestamp;
 /// even in scope here — only the negotiated one is.
 pub fn run_capture_loop<H>(capture: &CaptureHandle, mut should_stop: impl FnMut() -> bool, make_handler: impl FnOnce(Resolution) -> Result<H>) -> Result<()>
 where
-    H: FnMut(&[u8], Timestamp),
+    // The driver's own frame sequence number (`meta.sequence`), passed
+    // alongside the frame so a handler can name which capture frame an
+    // encode failure came from.
+    H: FnMut(&[u8], Timestamp, u32),
 {
     // If GPU setup fails here, we return before ever opening the mmap
     // capture stream below - no frames are read for a pass that can't
@@ -50,7 +53,7 @@ where
                 // real frame - the driver reports the actual filled length
                 // separately (`bytesused`).
                 let len = (meta.bytesused as usize).min(buf.len());
-                on_frame(&buf[..len], meta.timestamp);
+                on_frame(&buf[..len], meta.timestamp, meta.sequence);
             }
             Err(err) if err.kind() == std::io::ErrorKind::TimedOut => continue,
             Err(err) => return Err(err).context("reading capture frame"),
