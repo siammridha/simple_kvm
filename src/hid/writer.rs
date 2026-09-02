@@ -8,13 +8,24 @@
 //! module's only open path - this writer never sees or holds the device
 //! path (`ARCHITECTURE.md` I3).
 //!
-//! Absolute mouse mode on this hardware only conveys X/Y — confirmed by an
-//! end-to-end loopback test against the real chip (see the plan doc).
-//! Buttons and wheel are silently dropped by the chip's absolute HID
-//! report, but work correctly in its relative report. So "absolute mode"
-//! here means: position via `mouse_absolute`, clicks/scroll via a
-//! `mouse_relative` report with `dx = dy = 0`. This is invisible to
-//! callers of this module — see `InputCommand::PointerButtons`.
+//! The CH9329's relative-mode report (`mouse_relative`, cmd 0x05) has no
+//! effect at all on this hardware — confirmed live against the real chip:
+//! neither clicks nor cursor movement sent that way reach the target,
+//! while the absolute report (`mouse_absolute`, cmd 0x04) does. So clicks
+//! and scroll ride the absolute report too, reusing whatever position was
+//! last sent (`last_absolute`) rather than moving the cursor. This is
+//! invisible to callers of this module — see `InputCommand::PointerButtons`.
+//! Relative *mouse mode* (`InputCommand::PointerMoveRelative`, driven by
+//! the page's mouse-mode dropdown) still goes out as a `mouse_relative`
+//! report and is therefore still broken on this hardware — unfixed here,
+//! out of scope.
+//!
+//! `PointerMoveAbsolute` also carries whatever buttons are currently held
+//! (`last_buttons`), not a hardcoded 0: the target OS only treats a move as
+//! a drag while its own button-down report is still in effect, so a move
+//! report that always claims "no buttons" would end every drag the instant
+//! the cursor moves, even with the mouse button still physically held on
+//! the peer side.
 
 use std::time::Duration;
 
@@ -64,11 +75,21 @@ pub struct SerialWriter {
     /// The one keyboard the CH9329 presents to the target — see
     /// `keyboard::Keyboard`.
     keyboard: Keyboard,
+    /// The last position sent via `PointerMoveAbsolute`, reused when a
+    /// `PointerButtons` command builds its own absolute report (see module
+    /// docs). Defaults to screen center for a click arriving before any
+    /// move ever has.
+    last_absolute: (f32, f32),
+    /// The buttons mask from the last `PointerButtons` command, reused by
+    /// `PointerMoveAbsolute` so a move sent while a button is held still
+    /// reports it as held (see module docs) — otherwise every move report
+    /// would implicitly release the button and break dragging.
+    last_buttons: u8,
 }
 
 impl SerialWriter {
     pub(super) fn new(device: Ch9329Device) -> Self {
-        Self { device, port: None, keyboard: Keyboard::default() }
+        Self { device, port: None, keyboard: Keyboard::default(), last_absolute: (0.5, 0.5), last_buttons: 0 }
     }
 
     /// Opens or drops `self.port` to match the device's presence — so a
@@ -113,16 +134,20 @@ impl SerialWriter {
                 None => Encoded::Nothing,
             },
             Command::Input(InputCommand::PointerMoveAbsolute { x_frac, y_frac }) => {
-                Encoded::Packet(protocol::mouse_absolute(0, x_frac, y_frac, 0))
+                self.last_absolute = (x_frac, y_frac);
+                Encoded::Packet(protocol::mouse_absolute(self.last_buttons, x_frac, y_frac, 0))
             }
             Command::Input(InputCommand::PointerMoveRelative { buttons, dx, dy, wheel }) => {
                 Encoded::Packet(protocol::mouse_relative(buttons, dx, dy, wheel))
             }
-            // Buttons and wheel ride a zero-delta relative report whatever
-            // the mouse mode is, because the chip's absolute report drops
-            // them (see module docs).
+            // Buttons and wheel ride an absolute report at the last-known
+            // position whatever the mouse mode is, because the chip's
+            // relative report has no effect at all on this hardware (see
+            // module docs).
             Command::Input(InputCommand::PointerButtons { buttons, wheel }) => {
-                Encoded::Packet(protocol::mouse_relative(buttons, 0, 0, wheel))
+                self.last_buttons = buttons;
+                let (x_frac, y_frac) = self.last_absolute;
+                Encoded::Packet(protocol::mouse_absolute(buttons, x_frac, y_frac, wheel))
             }
             Command::Input(InputCommand::PasteText(text)) => Encoded::Text(text),
         }
@@ -208,5 +233,45 @@ mod tests {
 
         assert!(matches!(down, Encoded::Packet(p) if p == protocol::keyboard_report(0, [0x04, 0, 0, 0, 0, 0])));
         assert!(matches!(up, Encoded::Packet(p) if p == protocol::keyboard_report(0, [0; 6])));
+    }
+
+    /// A move sent while a button is still held must keep reporting that
+    /// button - otherwise the target OS sees the button implicitly
+    /// released on the first move and a drag never happens.
+    #[tokio::test]
+    async fn a_move_carries_the_last_held_button_so_dragging_works() {
+        let mut writer = SerialWriter::new(Ch9329Device::spawn_at("/nonexistent-simple-kvm-test-ch9329"));
+
+        let down = writer.encode(Command::Input(InputCommand::PointerButtons { buttons: 1, wheel: 0 }));
+        let moved = writer.encode(Command::Input(InputCommand::PointerMoveAbsolute { x_frac: 0.7, y_frac: 0.3 }));
+
+        assert!(matches!(down, Encoded::Packet(p) if p == protocol::mouse_absolute(1, 0.5, 0.5, 0)));
+        assert!(matches!(moved, Encoded::Packet(p) if p == protocol::mouse_absolute(1, 0.7, 0.3, 0)));
+    }
+
+    /// A click reuses wherever the pointer last moved to, since the click
+    /// itself carries no position of its own.
+    #[tokio::test]
+    async fn a_click_reuses_the_last_moved_to_position() {
+        let mut writer = SerialWriter::new(Ch9329Device::spawn_at("/nonexistent-simple-kvm-test-ch9329"));
+
+        let moved = writer.encode(Command::Input(InputCommand::PointerMoveAbsolute { x_frac: 0.25, y_frac: 0.9 }));
+        let click = writer.encode(Command::Input(InputCommand::PointerButtons { buttons: 1, wheel: 0 }));
+
+        assert!(matches!(moved, Encoded::Packet(p) if p == protocol::mouse_absolute(0, 0.25, 0.9, 0)));
+        assert!(matches!(click, Encoded::Packet(p) if p == protocol::mouse_absolute(1, 0.25, 0.9, 0)));
+    }
+
+    /// A move after the button is released stops carrying it - releasing
+    /// the button must actually end the drag, not just be ignored.
+    #[tokio::test]
+    async fn a_move_after_release_no_longer_carries_the_button() {
+        let mut writer = SerialWriter::new(Ch9329Device::spawn_at("/nonexistent-simple-kvm-test-ch9329"));
+
+        writer.encode(Command::Input(InputCommand::PointerButtons { buttons: 1, wheel: 0 }));
+        writer.encode(Command::Input(InputCommand::PointerButtons { buttons: 0, wheel: 0 }));
+        let moved = writer.encode(Command::Input(InputCommand::PointerMoveAbsolute { x_frac: 0.4, y_frac: 0.4 }));
+
+        assert!(matches!(moved, Encoded::Packet(p) if p == protocol::mouse_absolute(0, 0.4, 0.4, 0)));
     }
 }
