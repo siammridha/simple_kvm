@@ -27,158 +27,25 @@ to install.
 Run the binary on the Wyse 3040 and it serves a page at `http://<device
 ip>:3000` with:
 
-- **Live video**, streamed over WebRTC as a real H.264 video track,
-  software-encoded and decoded natively by the browser into a `<video>`
-  element. The Wyse 3040's Atom CPU is genuinely weak for real-time
-  software video encoding - expect this to be choppy at higher
-  resolutions/frame rates. The encoder inserts a keyframe every 60 frames
-  so a browser that (re)connects mid-stream has something to start
-  decoding from, and also produces one immediately whenever a connected
-  browser's own decoder asks for one (standard WebRTC keyframe-request
-  feedback) - without either, only the very first frame of a capture
-  session would ever be a keyframe, and joining any later would leave the
-  video stuck.
-- **Resolution dropdown**, populated from whatever the capture card
-  actually reports supporting (queried once your browser connects, see
-  below) - not a hardcoded list.
-- **Frame rate dropdown**, populated from whatever the capture card
-  actually reports supporting for the currently-selected resolution
-  (queried once your browser connects, like the resolution dropdown) - not
-  a hardcoded list, since real hardware supports different rates at
-  different resolutions. Switching the resolution dropdown (even before clicking
-  Save) repopulates this list to match, so it's never possible to pick a
-  rate the card can't actually do at that resolution. Sent to the capture
-  card via V4L2's frame-interval negotiation; the card is still free to
-  negotiate a different rate than requested (a mismatch is logged, not
-  shown on the page), but picking through the page only ever offers rates
-  the card itself reported.
-- **Mouse movement, clicks, and scroll wheel**, absolute or relative mode,
-  switched via **Save settings**. Absolute mode positions the cursor
-  exactly where you point in the video; on the CH9329 hardware this repo
-  was built against, clicks and scroll wheel only work through its
-  *relative* HID report, so absolute mode sends position via the absolute
-  report and clicks/scroll via a zero-motion relative report - invisible
-  from the browser, just how `hid::writer` talks to this chip. Mouse
-  movement used to be sent on every native `mousemove` event, which was
-  fast enough to crash-reboot the Wyse 3040 (a power/brownout issue), so
-  it's now throttled to send at most once per video frame - matching
-  whatever fps is currently configured, and re-sampling automatically if
-  fps changes.
-- **A mouse on/off toggle** - the cursor icon next to the gear icon turns
-  all mouse forwarding (movement, clicks, scroll) on or off. It's a local,
-  browser-only switch (nothing is saved or sent to the server); keyboard
-  input keeps working either way. Useful for typing without stray clicks
-  landing on the target.
-- **A paste box** - pasting into it sends the text to the target right away
-  as simulated keystrokes, then clears the box (US QWERTY only; there's no
-  OS-level clipboard access over a HID-only link).
-- **An auto-hiding controls bar** - the bar with resolution/frame rate/mouse
-  mode/paste controls and status tucks itself away 5 seconds after it's
-  opened while a browser is connected and nothing else is going on, and
-  reopens on tap/click, or on its own if the connection drops. Hovering
-  over the bar pauses the countdown so it won't close out from under the
-  pointer; it resumes once the pointer leaves.
-- **No login.** Anyone who can reach port 3000 has full control. This is
-  meant for a trusted LAN, not the open internet.
+- **Live video** - streamed over WebRTC as H.264, decoded natively in the browser's `<video>` element.
+- **Resolution dropdown** - populated from what the capture card actually reports supporting.
+- **Frame rate dropdown** - populated from what the card supports at the currently-selected resolution.
+- **Mouse movement, clicks, and scroll wheel** - absolute or relative mode, switched via Save settings.
+- **A mouse on/off toggle** - turns all mouse forwarding on or off locally in the browser; keyboard input is unaffected.
+- **A paste box** - sends pasted text to the target as simulated keystrokes (US QWERTY only).
+- **An auto-hiding controls bar** - tucks away after 5 seconds idle, reopens on tap/click.
+- **No login** - anyone who can reach port 3000 has full control, so keep this on a trusted LAN.
 
-A browser tab doesn't get a video track as part of connecting - the
-initial offer/answer exchange carries none either way. Once a tab's WebRTC
-connection is fully up (`connected`, not just negotiating) *and* the
-capture card is actually available, the server adds a video track for
-that tab live, renegotiating the connection in the background with no page
-reload - the same mechanism used if the card is plugged in only after the
-tab connected, or unplugged and replugged again later. If the card isn't
-available yet when a tab reaches `connected`, that tab just keeps running
-with no video, and gets it automatically the moment the card becomes
-available.
-
-Video capture and encoding only run while at least one browser tab
-actually holds a live video stream this way - with nobody holding one, no
-CPU/power is spent on capture at all, and the capture card itself is never
-opened. A tab losing its stream (its own disconnect, or the card being
-unplugged) stops the encoder only once it was the last one holding it; a
-second tab connecting while a stream is already live doesn't restart
-anything, it just gets its own track off the same running pass. Every
-actual start/stop of a capture pass is logged as `video encoding
-started`/`video encoding stopped`. Keyboard and mouse input are
-unaffected by any of this - a tab losing or regaining video never touches
-its input path.
-
-The capture card is only ever opened for two reasons: once, to ask it what
-resolutions/frame rates it supports, the moment it's actually plugged in
-(this is what populates the dropdowns above - the result is cached in
-memory, so a browser connecting later just reads that cached answer
-instead of triggering a fresh probe of its own); and to actually stream
-from it, once at least one tab holds a live video stream from it (see
-above). It's never opened automatically at startup - not even if it's
-already plugged in at that point - because doing so has reliably crashed
-the real hardware this runs on if it happens too early after boot (see the
-"Known issue" note further down, under Installation).
-
-The server runs fine with no capture card or CH9329 attached - the page
-still loads, the frame rate/resolution dropdowns are disabled and
-reflect "no video device," the mouse mode dropdown is disabled too, and
-keyboard/mouse input is silently dropped instead of the service failing
-to start. Useful
-for development without the hardware plugged in. This also covers either
-device disconnecting after the service has already started, and both
-recover on their own once reconnected, no restart needed: the CH9329
-silently drops input while it's gone and reconnects as soon as it's
-plugged back in (noticed immediately, not just on the next key or click -
-see below); the capture card pauses video the same way and resumes
-streaming once it's replugged. The page picks this up live, too - the
-resolution dropdown and "no video device" status update immediately on an
-already-open tab, and the relevant dropdowns enable/disable to match, not
-just on the next load or reconnect.
-
-Both the capture card's and the CH9329's reconnects are noticed
-immediately: the server listens directly on the Linux kernel's own
-device-change broadcast (`NETLINK_KOBJECT_UEVENT`, the same channel udev
-listens on), rather than going through udev itself - the Wyse 3040 image
-this runs on has no udev daemon (it uses the simpler `mdev` instead), so
-udev's own notifications never fire there. Listening straight to the
-kernel works regardless of what (if anything) is managing devices. If the
-listener can't be opened, both the capture card's and the CH9329's
-presence detection fall back to polling every 2 seconds instead. Every
-time the capture card goes from unplugged to plugged in - a genuine
-replug while the service is running, being plugged in for the first time
-after the service started without it, or already being plugged in at the
-moment the service itself starts - triggers one fresh capabilities probe,
-cached in memory until it's unplugged again (see above). Every one of
-those probes, including the boot-time one, waits 3 seconds after presence
-is first noticed before actually running - see the "Known issue" note
-further down, under Installation, for why.
-
-**Dropdown changes only take effect when you click Save settings, and
-nothing is ever saved to disk.** Changing frame rate, resolution, or
-mouse mode does nothing on its own - picking a new value just moves the
-dropdown. Clicking **Save settings** sends one message over the WebRTC
-control channel that applies the new settings live, in memory, for the
-life of the running service - there is no settings file. If you reload
-the page (or open a second tab) without saving, the dropdowns show
-whatever the server is actually using right now, not your unsaved picks -
-and every service restart (e.g. after a reboot) always comes back up with
-a fixed 1280x720 @ 5fps default, regardless of anything saved before the
-restart - there's no startup probe of the card to draw a "real" default
-from (see above), so the dropdowns correct themselves once the first
-browser connects.
-
-Save only includes the settings for hardware that's actually connected:
-resolution/frame rate are sent only if the capture card is
-plugged in, and mouse mode only if the CH9329 is - there's nothing
-meaningful to save for a device that isn't there. If only one is
-connected, Save updates just that half and leaves the other as it was.
+Video only starts when a browser tab is actually watching, and the capture card and CH9329 can be
+hot-plugged at any time - the page picks up a device connecting or disconnecting live, no restart
+or reload needed. Settings changes (resolution, frame rate, mouse mode) apply live via **Save
+settings** and are not saved to disk - they reset to defaults on restart.
 
 ### No TLS to set up
 
-The page is served over plain HTTP - no certificate to provide, no
-warning to click through. The video/input connection (WebRTC) still gets
-encrypted end to end: WebRTC's DTLS-SRTP is mandatory and automatic,
-generating a fresh self-signed certificate per connection that's verified
-via a fingerprint exchanged during signaling, not checked against any
-certificate authority. There's nothing for an operator to provide, rotate,
-or configure. See [docs/transport-comparison.md](docs/transport-comparison.md)
-for why this replaced an earlier WebTransport-based design.
+The page is served over plain HTTP - no certificate needed. The video/input connection (WebRTC)
+is still encrypted end to end on its own. See
+[docs/transport-comparison.md](docs/transport-comparison.md) for details.
 
 ## How it's built
 
@@ -263,6 +130,12 @@ downloads the latest release binary and sets it up as an OpenRC service
 (`simple_kvm`) that starts on boot and is already running once the script
 finishes.
 
+This device's GPU needs the older `i965` driver, not the newer
+`intel-media-driver`. That driver's own auto-generated H.264 headers are
+broken, so the encoder builds them by hand instead of trusting the driver -
+see [docs/gpu-encoding-investigation.md](docs/gpu-encoding-investigation.md)
+for the full story.
+
 Check it's running:
 
 ```sh
@@ -280,36 +153,9 @@ The page, `app.js`, and `style.css` are all served with `Cache-Control:
 no-store`, so a browser tab reloaded after an update always gets the new
 version instead of quietly running old page code against the new server.
 
-**Known issue - no boot-crash protection for the capture card right now:**
-on the actual Wyse 3040 this was built and tested against, opening the
-capture card right as it finishes USB enumeration at boot reliably
-hard-crashes the machine (confirmed by repeated testing - starting the
-service at boot crashed it every time; starting the exact same binary the
-exact same way once the system had been up a while never did). The
-service used to work around this with a 30-second `start_pre()` sleep in
-`/etc/init.d/simple_kvm` before the binary even launched; that's been
-removed (it was stacking with the CH9329 delay below and needlessly
-delaying every restart, not just boot).
-
-Instead, the binary itself no longer opens the capture card on its own at
-all - see the [What it does](#what-it-does) section above. It's now only
-opened once a browser actually connects and its WebRTC connection reaches
-`connected`, which in practice is well after boot. This is expected to
-sidestep the specific crash described above, but hasn't actually been
-verified against the real hardware yet - treat it as unconfirmed rather
-than fixed until it's been tested on the Wyse 3040 through a real boot
-cycle.
-
-Separately, both the capture card and the CH9329 wait 3 seconds after
-presence is first noticed before actually being *probed* - noticing
-itself (the log line, and `is_present()`) is immediate, only the probe
-waits. This is a fixed, uniform delay applied to every device kind, not
-configurable per device. For the CH9329, which has shown the same
-crash-on-connect behavior as the capture card, this 3-second wait is also
-what stands between boot and the binary actually opening its serial
-port - previously a dedicated `SERIAL_OPEN_DELAY_SECS` (default 30
-seconds) guarded that. Whether 3 seconds is actually enough margin for
-the CH9329 on real hardware hasn't been tested yet.
+**Known issue:** opening the capture card too soon after boot has crashed this hardware in testing.
+The binary now waits until a browser actually connects before opening the capture card or CH9329,
+which should avoid this, but it hasn't been confirmed on a real reboot yet.
 
 ### Configuration
 
@@ -358,14 +204,16 @@ human reading the code.
 `e2e/browser-test.sh` drives the actual page with `agent-browser` against
 the container's system Chromium. No real capture card or CH9329 is
 needed: the capture card is faked as a plain regular file at `VIDEO_PATH`
-(no `v4l2loopback` support in the container for a real one) - enough to
-drive the real presence-gated add-track/renegotiation path and prove a
-session gets video live and loses it again on a simulated capture
-failure, without a page reload. The CH9329 is faked with `socat` (a
-linked PTY pair - the app just needs something to open at `SERIAL_PATH`,
-real hardware or not), which is enough to exercise the mouse-mode half of
-Save. A genuine mid-session replug can't be simulated this way (it needs
-a real kernel uevent this container has no privileged way to generate) -
-that half is covered by Rust tests in `src/device/mod.rs` and
-`src/capture/engine.rs` instead. This script needs `socat` installed;
-it's a layer on top of the Rust tests, not a replacement for them.
+(no `v4l2loopback` support in the container for a real one), which is
+present but never probes as a real device - so it proves the WebRTC
+connection, data channels, and UI (video overlay, status icons, Save
+settings, the scroll-flip toggle) all behave correctly with no video
+device, but can't exercise a real video track attaching or ending. The
+CH9329 is faked with `socat` (a linked PTY pair - the app just needs
+something to open at `SERIAL_PATH`, real hardware or not), which is
+enough to prove the keyboard status icon and mouse-mode half of Save. A
+real device attaching/ending, and a genuine mid-session replug, both need
+real hardware - covered by `./test-on-device.sh` and by Rust tests in
+`src/device/mod.rs` and `src/capture/engine.rs`. This script needs
+`socat` installed; it's a layer on top of the Rust tests, not a
+replacement for them.
