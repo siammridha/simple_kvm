@@ -3,7 +3,8 @@
 A small KVM-over-USB tool for a Dell Wyse 3040 running Alpine Linux. It sits
 next to a target computer, reads its screen through a capture card, and
 sends keyboard/mouse input to it through a CH9329 HID adapter — controlled
-entirely from a web page.
+entirely from a web page. Video is encoded to H.264 on the Wyse 3040's own
+GPU (Intel's `i965` VAAPI driver) and streamed to the browser over WebRTC.
 
 ## Hardware
 
@@ -94,15 +95,12 @@ over the running binary - the rename avoids "Text file busy") and `rc-service
 simple_kvm restart`.
 
 `test-on-device.sh`, in the repo root, automates all of the above (build,
-copy, install, restart) over password-authenticated SSH:
+copy, install, restart) over SSH (the device accepts root login with no
+key and no password). Set `DEVICE_IP` to your device's LAN address:
 
 ```sh
-./test-on-device.sh
+DEVICE_IP=192.168.1.50 ./test-on-device.sh
 ```
-
-This file holds the device's IP and root password directly, so it's listed
-in `.gitignore` and never committed. It won't exist in a fresh clone - copy
-it back in (or recreate it) if it's missing.
 
 ## Target platform
 
