@@ -50,9 +50,9 @@ pub async fn serve(rtc: rtc::Rtc) {
             return;
         }
     };
-    tracing::info!(port, "page and WebRTC signaling server listening");
+    tracing::info!(port, "server listening");
     if let Err(err) = axum::serve(listener, router(rtc)).await {
-        tracing::error!(%err, "page server exited");
+        tracing::error!(%err, "server exited");
     }
 }
 

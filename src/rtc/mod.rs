@@ -92,6 +92,7 @@ impl Rtc {
     /// sent before its port is open queue up rather than being lost, so
     /// nothing here holds up the HTTP page starting.
     pub fn spawn() -> Self {
+        tracing::info!("WebRTC signaling ready");
         Self::new(CaptureCard::spawn(), Hid::spawn())
     }
 
