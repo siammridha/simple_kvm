@@ -15,6 +15,7 @@ const TAG_MOUSE_RELATIVE_MOVE = 3;
 const TAG_MOUSE_BUTTONS = 4;
 
 const statusEl = document.getElementById('status');
+const statusTextEl = document.getElementById('status-text');
 const videoEl = document.getElementById('video-el');
 const inputSurface = document.getElementById('video-surface');
 const topbarHandle = document.getElementById('topbar-handle');
@@ -27,10 +28,17 @@ const pastePanel = document.getElementById('paste-panel');
 const frameRateSelect = document.getElementById('frame-rate');
 const resolutionSelect = document.getElementById('resolution');
 const mouseModeSelect = document.getElementById('mouse-mode');
+const scrollFlipToggle = document.getElementById('scroll-flip-toggle');
 const pasteText = document.getElementById('paste-text');
 const saveSettings = document.getElementById('save-settings');
 const saveSettingsStatus = document.getElementById('save-settings-status');
 const versionEl = document.getElementById('version');
+const videoOverlay = document.getElementById('video-overlay');
+const videoSpinner = document.getElementById('video-spinner');
+const videoOverlayText = document.getElementById('video-overlay-text');
+const videoOverlayState = document.getElementById('video-overlay-state');
+const keyboardStatusIcon = document.getElementById('keyboard-status-icon');
+const displayStatusIcon = document.getElementById('display-status-icon');
 
 let pc = null;
 let controlChannel = null;
@@ -57,6 +65,16 @@ let rtcConnected = false;
 // resolution dropdown *before* Save repopulates the frame-rate dropdown
 // from the right list.
 let deviceState = emptyDeviceState();
+// Whether the first device_state push has arrived yet - before that,
+// captureAvailable's initial `false` doesn't mean "no device", it means
+// "don't know yet", so the overlay shows a generic connecting message
+// instead of claiming there's no video device.
+let deviceStateKnown = false;
+// Whether this session's peer connection has actually received a video
+// track (the `track` event) - separate from captureAvailable, since the
+// server only attaches a track once this session reaches Connected, which
+// can lag behind the device_state push that says a card is present.
+let hasVideoTrack = false;
 // Whether the settings panel is open - suppresses the topbar's
 // outside-click auto-hide (see wireTopbar()) while it's up.
 let settingsOpen = false;
@@ -71,6 +89,20 @@ let lastMouseMoveButtons = 0;
 // Local, unsaved toggle - when off, no mouse event (move, click, or scroll)
 // is sent to the target at all. Keyboard input is unaffected.
 let mouseEnabled = true;
+// Local, unsaved toggle for wheel direction - persisted in localStorage
+// (per-browser, not sent to the server) so it survives a reload. Defaults
+// to on: the raw un-flipped mapping felt backwards on the hardware this
+// was built against.
+let scrollFlipped = readStoredScrollFlipped();
+
+function readStoredScrollFlipped() {
+  try {
+    const stored = localStorage.getItem('scrollFlipped');
+    return stored === null ? true : stored === 'true';
+  } catch {
+    return true;
+  }
+}
 // Whether the paste flyout is open - suppresses the topbar's outside-click
 // auto-hide the same way settingsOpen does (see wireTopbar()).
 let pasteOpen = false;
@@ -79,7 +111,7 @@ let pasteOpen = false;
 let topbarHovered = false;
 
 function setStatus(text, isError) {
-  statusEl.textContent = text;
+  statusTextEl.textContent = text;
   statusEl.classList.toggle('error', Boolean(isError));
 }
 
@@ -136,6 +168,43 @@ function closePastePanel() {
   pastePanel.classList.remove('open');
   pasteOpen = false;
   armAutoHide();
+}
+
+function setVideoOverlay(visible, spinning, text, state) {
+  videoOverlay.classList.toggle('visible', visible);
+  videoSpinner.classList.toggle('hidden', !spinning);
+  videoOverlayText.textContent = text;
+  videoOverlayState.textContent = state;
+}
+
+// Re-derives the overlay from current state - called on every device_state
+// push, on the peer connection's `track` event, and on video element events
+// that move readyState (see wireVideoOverlay()).
+function updateVideoOverlay() {
+  if (!deviceStateKnown) {
+    setVideoOverlay(true, true, 'Connecting…', '');
+    return;
+  }
+  if (!captureAvailable) {
+    setVideoOverlay(true, false, 'No video device connected', '');
+    return;
+  }
+  if (!hasVideoTrack) {
+    setVideoOverlay(true, true, 'Waiting for video…', '');
+    return;
+  }
+  if (videoEl.readyState < 4) {
+    setVideoOverlay(true, true, 'Loading video…', '');
+    return;
+  }
+  setVideoOverlay(false, false, '', '');
+}
+
+function wireVideoOverlay() {
+  for (const evt of ['loadstart', 'loadedmetadata', 'loadeddata', 'canplay', 'canplaythrough', 'playing', 'waiting', 'stalled', 'suspend', 'emptied']) {
+    videoEl.addEventListener(evt, updateVideoOverlay);
+  }
+  updateVideoOverlay();
 }
 
 function emptyDeviceState() {
@@ -224,6 +293,37 @@ function updateSettingsAvailability() {
   mouseModeSelect.disabled = !hidAvailable;
 }
 
+// Mouse input needs a picture to point at - with no video device, there's
+// nothing on screen for a click/move/scroll to mean anything about, so the
+// mouse feature is force-disabled (independent of the user's own
+// mouseEnabled toggle) whenever captureAvailable is false. Keyboard input
+// has no such dependency and keeps working either way.
+function mouseUsable() {
+  return mouseEnabled && captureAvailable;
+}
+
+// Reflects mouse/keyboard/display availability onto the topbar icons -
+// green when on, gray with a red slash when off. Called whenever
+// captureAvailable, hidAvailable, or the user's own mouse toggle changes.
+function updateIndicators() {
+  mouseToggleButton.classList.toggle('status-on', mouseUsable());
+  mouseToggleButton.disabled = !captureAvailable;
+  mouseToggleButton.setAttribute('aria-pressed', String(!mouseEnabled));
+  const mouseLabel = !captureAvailable ? 'Mouse unavailable (no video)' : mouseEnabled ? 'Disable mouse' : 'Enable mouse';
+  mouseToggleButton.setAttribute('aria-label', mouseLabel);
+  mouseToggleButton.setAttribute('title', mouseLabel);
+
+  keyboardStatusIcon.classList.toggle('status-on', hidAvailable);
+  const keyboardLabel = hidAvailable ? 'Keyboard connected' : 'Keyboard disconnected';
+  keyboardStatusIcon.setAttribute('aria-label', keyboardLabel);
+  keyboardStatusIcon.setAttribute('title', keyboardLabel);
+
+  displayStatusIcon.classList.toggle('status-on', captureAvailable);
+  const displayLabel = captureAvailable ? 'Video connected' : 'Video disconnected';
+  displayStatusIcon.setAttribute('aria-label', displayLabel);
+  displayStatusIcon.setAttribute('title', displayLabel);
+}
+
 // True if a dropdown's current value differs from appliedSettings (the
 // server-confirmed baseline) for whichever half of settings is actually
 // available - a device that isn't present has nothing meaningful to save,
@@ -303,9 +403,27 @@ function wireSettingsPanel() {
   }
 }
 
+// video-el's own rect is now sized to the actual visible video area (see
+// style.css) rather than the full surface, so a fraction computed against
+// it lines up with the picture even when the window's aspect ratio doesn't
+// match the video's. inputSurface still covers the whole window, so the
+// pointer can be over it but outside video-el's box, on whichever axis
+// isn't full-bleed (the letterbox/pillarbox gutter) - that's not a real
+// point on the picture, so it's ignored rather than snapped to the nearest
+// edge.
+function insideRect(clientX, clientY, rect) {
+  return clientX >= rect.left && clientX <= rect.left + rect.width && clientY >= rect.top && clientY <= rect.top + rect.height;
+}
+
+function isOverVideo(e) {
+  const rect = videoEl.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0 && insideRect(e.clientX, e.clientY, rect);
+}
+
 function onMouseMove(e) {
   if (appliedSettings.mouse_mode === 'absolute') {
-    const rect = inputSurface.getBoundingClientRect();
+    if (!isOverVideo(e)) return;
+    const rect = videoEl.getBoundingClientRect();
     pendingAbsoluteMove = { xFrac: (e.clientX - rect.left) / rect.width, yFrac: (e.clientY - rect.top) / rect.height };
   } else {
     pendingRelativeDx += e.movementX;
@@ -321,12 +439,13 @@ function onMouseMove(e) {
 // it's called from wireInput()'s initial setup or a later toggle.
 function updateMouseMoveListener() {
   inputSurface.removeEventListener('mousemove', onMouseMove);
-  if (mouseEnabled) inputSurface.addEventListener('mousemove', onMouseMove);
+  if (mouseUsable()) inputSurface.addEventListener('mousemove', onMouseMove);
 }
 
 // Mouse enable/disable toggle - purely local, nothing sent to the server.
 // Turning it off also drops any queued movement so re-enabling doesn't
-// flush a stale position/delta from before it was switched off.
+// flush a stale position/delta from before it was switched off. Disabled
+// outright (see updateIndicators) while there's no video to point at.
 function wireMouseToggle() {
   mouseToggleButton.addEventListener('click', () => {
     mouseEnabled = !mouseEnabled;
@@ -336,8 +455,22 @@ function wireMouseToggle() {
       pendingRelativeDx = 0;
       pendingRelativeDy = 0;
     }
-    mouseToggleButton.setAttribute('aria-pressed', String(!mouseEnabled));
-    mouseToggleButton.setAttribute('aria-label', mouseEnabled ? 'Disable mouse' : 'Enable mouse');
+    updateIndicators();
+  });
+}
+
+// Scroll-flip toggle - purely local, applies to the next wheel event, no
+// Save needed (same as the mouse enable/disable toggle).
+function wireScrollFlipToggle() {
+  scrollFlipToggle.checked = scrollFlipped;
+  scrollFlipToggle.addEventListener('change', () => {
+    scrollFlipped = scrollFlipToggle.checked;
+    try {
+      localStorage.setItem('scrollFlipped', String(scrollFlipped));
+    } catch {
+      // Storage unavailable (e.g. private browsing) - the toggle still
+      // works for the rest of this page load, just won't persist.
+    }
   });
 }
 
@@ -365,6 +498,7 @@ async function connect() {
 
   setStatus('connecting…');
   updateSettingsAvailability();
+  updateIndicators();
   pc = new RTCPeerConnection();
 
   pc.addEventListener('connectionstatechange', () => {
@@ -388,6 +522,8 @@ async function connect() {
 
   pc.addEventListener('track', (event) => {
     videoEl.srcObject = event.streams[0] ?? new MediaStream([event.track]);
+    hasVideoTrack = true;
+    updateVideoOverlay();
   });
 
   inputChannel = pc.createDataChannel('input', { ordered: false, maxRetransmits: 0 });
@@ -441,6 +577,7 @@ function waitForIceGatheringComplete(pc) {
 function handleServerMessage(msg) {
   if (msg.type === 'device_state') {
     captureAvailable = msg.available;
+    deviceStateKnown = true;
     deviceState = { resolutions: msg.resolutions, default_resolution: msg.default_resolution, frame_rates: msg.frame_rates };
     // Preserve the currently-selected resolution/fps if the new data still
     // supports them (e.g. a hot-plug refresh) - refreshCaptureOptions falls
@@ -448,15 +585,21 @@ function handleServerMessage(msg) {
     refreshCaptureOptions(currentResolutionSelection(), Number(frameRateSelect.value));
     updateSettingsAvailability();
     updateSaveButtonState();
-    if (!msg.available) {
-      setStatus('no video device found', true);
-    } else if (statusEl.textContent === 'no video device found') {
-      setStatus('connected');
+    updateVideoOverlay();
+    updateMouseMoveListener();
+    updateIndicators();
+    if (!captureAvailable) {
+      // No picture to point at any more - drop anything queued so it can't
+      // flush a stale position/delta if the device comes back.
+      pendingAbsoluteMove = null;
+      pendingRelativeDx = 0;
+      pendingRelativeDy = 0;
     }
   } else if (msg.type === 'hid_state') {
     hidAvailable = msg.available;
     updateSettingsAvailability();
     updateSaveButtonState();
+    updateIndicators();
   } else if (msg.type === 'settings') {
     appliedSettings = {
       width: msg.capture.resolution.width,
@@ -516,19 +659,28 @@ function wireInput() {
     sendKeyEvent(e.code, false);
   });
 
-  inputSurface.addEventListener('mousedown', handleMouseButtons);
-  inputSurface.addEventListener('mouseup', handleMouseButtons);
+  // Neither counts while the pointer is over the gutter - it isn't a real
+  // point on the picture, same reasoning as onMouseMove.
+  inputSurface.addEventListener('mousedown', (e) => {
+    if (!isOverVideo(e)) return;
+    handleMouseButtons(e);
+  });
+  inputSurface.addEventListener('mouseup', (e) => {
+    if (!isOverVideo(e)) return;
+    handleMouseButtons(e);
+  });
   inputSurface.addEventListener('contextmenu', (e) => {
-    if (mouseEnabled) e.preventDefault();
+    if (mouseUsable()) e.preventDefault();
   });
 
   updateMouseMoveListener();
   scheduleMouseMoveFlush();
 
   inputSurface.addEventListener('wheel', (e) => {
-    if (!mouseEnabled) return;
+    if (!mouseUsable()) return;
+    if (!isOverVideo(e)) return;
     e.preventDefault();
-    const wheel = clampWheel(-e.deltaY);
+    const wheel = clampWheel(scrollFlipped ? e.deltaY : -e.deltaY);
     if (appliedSettings.mouse_mode === 'absolute') {
       sendMouseButtons(buttonMask(e.buttons), wheel);
     } else {
@@ -562,11 +714,12 @@ function wireInput() {
   });
 
   function handleMouseButtons(e) {
-    if (!mouseEnabled) return;
+    if (!mouseUsable()) return;
+    const buttons = buttonMask(e.buttons);
     if (appliedSettings.mouse_mode === 'absolute') {
-      sendMouseButtons(buttonMask(e.buttons), 0);
+      sendMouseButtons(buttons, 0);
     } else {
-      sendMouseRelativeMove(buttonMask(e.buttons), 0, 0, 0);
+      sendMouseRelativeMove(buttons, 0, 0, 0);
     }
   }
 }
@@ -658,11 +811,14 @@ function sendControl(message) {
 // directly (video receiver count, connectionState) via `agent-browser
 // eval` - no UI element needed for it.
 window.__debugPeerConnection = () => pc;
+window.__debugScrollFlipped = () => scrollFlipped;
 
 wireTopbar();
 wireSettingsPanel();
 wireMouseToggle();
+wireScrollFlipToggle();
 wirePastePanel();
+wireVideoOverlay();
 // Forced open pre-connect, same as the disconnected state handled in
 // connect()'s connectionstatechange listener above.
 openTopbar();

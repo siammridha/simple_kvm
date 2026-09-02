@@ -9,24 +9,37 @@
 <body>
 <div id="video-surface" tabindex="0">
   <video id="video-el" autoplay playsinline muted></video>
+  <div id="video-overlay">
+    <div id="video-spinner"></div>
+    <div id="video-overlay-text"></div>
+    <div id="video-overlay-state"></div>
+  </div>
 </div>
 
 <div id="topbar">
-  <button id="topbar-handle" aria-label="Show controls">
+  <button id="topbar-handle" aria-label="Show controls" title="Show/hide controls">
     <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
   </button>
 
-  <span id="status">connecting&hellip;</span>
+  <span id="status"><span id="status-dot"></span><span id="status-text">connecting&hellip;</span></span>
 
-  <button id="mouse-toggle-button" aria-label="Disable mouse" aria-pressed="false">
+  <button id="mouse-toggle-button" class="status-icon" aria-label="Disable mouse" title="Disable mouse" aria-pressed="false">
     <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3l7.07 16.97 2.51-7.39 7.39-2.51L3 3z"></path><path d="M13 13l6 6"></path><path class="disabled-slash" d="M4 20L20 4"></path></svg>
   </button>
 
-  <button id="settings-button" aria-label="Settings">
+  <span id="keyboard-status-icon" class="status-icon" role="img" aria-label="Keyboard disconnected" title="Keyboard disconnected">
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="5" width="20" height="14" rx="2"></rect><path d="M6 9h.01M10 9h.01M14 9h.01M18 9h.01M6 13h.01M18 13h.01M9 17h6"></path><path class="disabled-slash" d="M4 20L20 4"></path></svg>
+  </span>
+
+  <span id="display-status-icon" class="status-icon" role="img" aria-label="Video disconnected" title="Video disconnected">
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line><path class="disabled-slash" d="M4 20L20 4"></path></svg>
+  </span>
+
+  <button id="settings-button" aria-label="Settings" title="Settings">
     <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
   </button>
 
-  <button id="paste-button" aria-label="Paste text">
+  <button id="paste-button" aria-label="Paste text" title="Paste text">
     <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path><rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect></svg>
   </button>
 
@@ -34,20 +47,30 @@
 </div>
 
 <div id="settings-panel">
-  <label>Frame rate
-    <select id="frame-rate"></select>
-  </label>
+  <div class="settings-section">
+    <h3 class="settings-section-title">Display</h3>
+    <label>Frame rate
+      <select id="frame-rate"></select>
+    </label>
 
-  <label>Resolution
-    <select id="resolution"></select>
-  </label>
+    <label>Resolution
+      <select id="resolution"></select>
+    </label>
+  </div>
 
-  <label>Mouse
-    <select id="mouse-mode">
-      <option value="absolute">Absolute</option>
-      <option value="relative">Relative</option>
-    </select>
-  </label>
+  <div class="settings-section">
+    <h3 class="settings-section-title">Mouse</h3>
+    <label>Mouse
+      <select id="mouse-mode">
+        <option value="absolute">Absolute</option>
+        <option value="relative">Relative</option>
+      </select>
+    </label>
+
+    <label>Flip scroll direction
+      <input type="checkbox" id="scroll-flip-toggle">
+    </label>
+  </div>
 
   <div class="panel-actions">
     <button id="save-settings" disabled>Save settings</button>
