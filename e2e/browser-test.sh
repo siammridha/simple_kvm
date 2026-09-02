@@ -119,27 +119,19 @@ if [ "$DROPDOWN_COUNT" -ne 3 ]; then
 fi
 
 echo "Waiting for the WebRTC connection..."
-# "no video device found" is the correct status here, not a failure - the
-# fake file at VIDEO_PATH isn't a real V4L2 device, so once device's
-# detect-to-probe delay elapses and CaptureDriver::probe actually runs
-# against it (see the header comment above), the probe itself fails and
-# DeviceState.available stays false for this whole run - and, since issue
-# #027's approved gate on probed availability, the video-track path below
-# is never even attempted either, because that now needs the device to be
-# present *and* successfully probed (see device_probed_available in
-# src/rtc/session.rs). Either string proves the WebRTC connection itself
-# succeeded (offer/answer exchanged, data channels open), which is what
-# this step is actually checking - negotiate() no longer attaches a video
-# track up front either way (see src/rtc/mod.rs).
+# The top status text now only ever says "connected" once the peer
+# connection is up - whether a video device is available or not is shown
+# separately, in the video overlay (checked below), not folded into this
+# string any more.
 STATUS_TEXT=""
 for _ in $(seq 1 50); do
 	STATUS_TEXT=$(agent-browser get text "#status")
-	{ [ "$STATUS_TEXT" = "connected" ] || [ "$STATUS_TEXT" = "no video device found" ]; } && break
+	[ "$STATUS_TEXT" = "connected" ] && break
 	sleep 0.1
 done
 echo "status indicator: $STATUS_TEXT"
-if [ "$STATUS_TEXT" != "connected" ] && [ "$STATUS_TEXT" != "no video device found" ]; then
-	echo "FAIL: status never reached 'connected' or 'no video device found' - WebRTC didn't connect" >&2
+if [ "$STATUS_TEXT" != "connected" ]; then
+	echo "FAIL: status never reached 'connected' - WebRTC didn't connect" >&2
 	exit 1
 fi
 
@@ -164,6 +156,36 @@ if grep -q "capture device available: added video track" "$SERVER_LOG"; then
 fi
 assert_still_connected "with no video track ever attached"
 
+# With no video ever attached, deviceStateKnown flips true (the device_state
+# push has arrived) but captureAvailable stays false for the rest of this
+# run - the overlay should say so, the display status icon should stay off,
+# and the mouse toggle should be force-disabled (there's no picture to point
+# a click at, see mouseUsable() in app.js).
+echo "Confirming the video overlay reports no video device..."
+OVERLAY_TEXT=""
+for _ in $(seq 1 50); do
+	OVERLAY_TEXT=$(agent-browser get text "#video-overlay-text")
+	[ "$OVERLAY_TEXT" = "No video device connected" ] && break
+	sleep 0.1
+done
+echo "video overlay text: $OVERLAY_TEXT"
+if [ "$OVERLAY_TEXT" != "No video device connected" ]; then
+	echo "FAIL: expected the video overlay to say 'No video device connected', got '$OVERLAY_TEXT'" >&2
+	exit 1
+fi
+
+DISPLAY_ON=$(agent-browser eval "document.getElementById('display-status-icon').classList.contains('status-on')")
+if [ "$DISPLAY_ON" != "false" ]; then
+	echo "FAIL: display status icon should not be 'on' with no video device, got $DISPLAY_ON" >&2
+	exit 1
+fi
+
+MOUSE_ENABLED=$(agent-browser is enabled "#mouse-toggle-button")
+if [ "$MOUSE_ENABLED" != "false" ]; then
+	echo "FAIL: mouse toggle should be disabled with no video device to point at, got enabled=$MOUSE_ENABLED" >&2
+	exit 1
+fi
+
 echo "Confirming the input/control data channels are open..."
 DC_STATES=$(agent-browser eval "inputChannel.readyState + ',' + controlChannel.readyState")
 BOTH_OPEN=$(agent-browser eval "inputChannel.readyState === 'open' && controlChannel.readyState === 'open'")
@@ -173,14 +195,29 @@ if [ "$BOTH_OPEN" != "true" ]; then
 	exit 1
 fi
 
-# The CH9329 writer only checks whether its port is still present when it
-# actually handles a command - a keypress is the trigger that makes it
-# notice the socat-faked device and mark HID as connected, same as it
-# would notice a real CH9329 on the next keystroke after being plugged in.
-echo "Sending a keypress so the server notices the faked CH9329..."
+echo "Sending a keypress on the faked CH9329..."
 agent-browser click "#video-surface"
 agent-browser press "a"
 sleep 0.5
+
+# `rtc` subscribes to the CH9329's own presence directly (see
+# ARCHITECTURE.md §3.4), so hid_state tracks the socat-faked device's
+# presence on its own - not triggered by the keypress above, which only
+# proves keyboard input still works with no video device attached. The
+# keyboard status icon should reflect "available" within the same
+# detect-to-probe delay device/mod.rs already waits out for the video
+# fixture above.
+echo "Confirming the keyboard status icon reports the faked CH9329 as available..."
+KEYBOARD_ON="false"
+for _ in $(seq 1 100); do
+	KEYBOARD_ON=$(agent-browser eval "document.getElementById('keyboard-status-icon').classList.contains('status-on')")
+	[ "$KEYBOARD_ON" = "true" ] && break
+	sleep 0.1
+done
+if [ "$KEYBOARD_ON" != "true" ]; then
+	echo "FAIL: keyboard status icon never turned on for the faked CH9329" >&2
+	exit 1
+fi
 
 # The top bar slides off-screen once connected (clicking the video surface
 # above just closed it, since we're connected by this point) - the handle
@@ -197,17 +234,31 @@ agent-browser select "#mouse-mode" relative
 agent-browser click "#save-settings"
 sleep 0.5
 
-echo "Reloading to confirm the change was applied in memory (not just picked in the dropdown)..."
+# The scroll-flip toggle is purely local (localStorage, not sent to the
+# server or included in Save settings) - flip it here, before the reload
+# below, to prove it survives a reload the same way a real browser tab
+# restart would need it to.
+echo "Flipping the scroll-flip toggle..."
+SCROLL_FLIP_BEFORE=$(agent-browser eval "window.__debugScrollFlipped()")
+agent-browser click "#scroll-flip-toggle"
+SCROLL_FLIP_AFTER=$(agent-browser eval "window.__debugScrollFlipped()")
+echo "scrollFlipped: $SCROLL_FLIP_BEFORE -> $SCROLL_FLIP_AFTER"
+if [ "$SCROLL_FLIP_AFTER" = "$SCROLL_FLIP_BEFORE" ]; then
+	echo "FAIL: clicking the scroll-flip toggle didn't change scrollFlipped" >&2
+	exit 1
+fi
+
+echo "Reloading to confirm the mouse-mode and scroll-flip changes were applied (not just picked in the UI)..."
 agent-browser reload
 agent-browser wait --load load
 STATUS_TEXT=""
 for _ in $(seq 1 50); do
 	STATUS_TEXT=$(agent-browser get text "#status")
-	{ [ "$STATUS_TEXT" = "connected" ] || [ "$STATUS_TEXT" = "no video device found" ]; } && break
+	[ "$STATUS_TEXT" = "connected" ] && break
 	sleep 0.1
 done
-if [ "$STATUS_TEXT" != "connected" ] && [ "$STATUS_TEXT" != "no video device found" ]; then
-	echo "FAIL: status never reached 'connected' or 'no video device found' after reload" >&2
+if [ "$STATUS_TEXT" != "connected" ]; then
+	echo "FAIL: status never reached 'connected' after reload" >&2
 	exit 1
 fi
 
@@ -218,6 +269,13 @@ if [ "$MOUSE_MODE" != "relative" ]; then
 	exit 1
 fi
 
+SCROLL_FLIP_RELOADED=$(agent-browser eval "window.__debugScrollFlipped()")
+echo "scrollFlipped after reload: $SCROLL_FLIP_RELOADED"
+if [ "$SCROLL_FLIP_RELOADED" != "$SCROLL_FLIP_AFTER" ]; then
+	echo "FAIL: expected scrollFlipped to persist across reload (localStorage) as '$SCROLL_FLIP_AFTER', got '$SCROLL_FLIP_RELOADED'" >&2
+	exit 1
+fi
+
 PAGE_ERRORS=$(agent-browser errors)
 if [ -n "$PAGE_ERRORS" ]; then
 	echo "FAIL: uncaught page errors:" >&2
@@ -225,4 +283,4 @@ if [ -n "$PAGE_ERRORS" ]; then
 	exit 1
 fi
 
-echo "PASS: page loaded, dropdowns present, WebRTC connected with no TLS anywhere, no video track attached for a present-but-unprobeable device, Save settings applied in memory (no settings file), no uncaught JS errors."
+echo "PASS: page loaded, dropdowns present, WebRTC connected with no TLS anywhere, no video track attached for a present-but-unprobeable device, video overlay/status icons reflect that correctly, keyboard status icon reflects the faked CH9329, Save settings and the scroll-flip toggle both applied in memory and survived a reload, no uncaught JS errors."
