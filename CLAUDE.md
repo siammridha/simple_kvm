@@ -9,9 +9,11 @@
 - When a question is asked just answer the question so that I can make an informative decission. Do not start planing and exicuting.
 - Once I approve a plan, build exactly what the plan says. If while building you think a step should change, stop and ask me first. Do not quietly do something different. If you did diverge, say so clearly in your report, do not smooth over it.
 - Write brief comments only when they add context that isn't obvious from the code itself. Don't use comments to describe what the code does.
+- Comments must never describe what the code does — never ever ever. Only add one when there is something very important to flag (a hidden gotcha, a non-obvious reason), and keep it short and direct, one line. Do not write long comments or essays.
 - Treat everything I report seeing as accurate. Never question or contradict my observations. Instead, do everything you can to accurately explain what I saw, including any plausible technical or UI behavior that could account for it.
 - Never use `sed -i` (or any in-place-edit flag that swaps in a new file) in this environment. It has repeatedly stripped file permissions down to `000`, making the file unreadable and unwritable by anyone, including root. Use the `Edit` tool for file changes. If a bulk find/replace across many files is genuinely needed, write into the existing file instead of swapping a new one in, so it keeps its own permissions.
 - Let every build saturate all available CPUs (10 in this devcontainer). Never pass `-j`/`--build-jobs`/`CARGO_BUILD_JOBS` to limit `cargo build`/`check`/`nextest run`/`zigbuild`. This applies to every build, including `test-on-device.sh`.
+- Create agent worktrees under a temp directory (e.g. `/tmp`), never under `.claude/worktrees/` in the repo. Keeps the repo clean of leftover worktrees.
 
 ## Architecture boundaries (non-negotiable)
 
