@@ -190,6 +190,13 @@ open in a firewall today, since `deploy/install.sh` doesn't set one up.
 
 ## Development
 
+Run this once per clone, so the tracked commit-msg hook (blocks
+`Co-Authored-By` trailers) is active:
+
+```sh
+git config core.hooksPath hooks
+```
+
 ```sh
 cargo build
 cargo nextest run
