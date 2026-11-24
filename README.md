@@ -126,9 +126,10 @@ there:
   binary is dynamically linked against musl and needs `libgcc_s.so.1`),
   `libva` + `libva-intel-driver` (the VAAPI runtime and the Intel `i965`
   driver), `libva-utils` (`vainfo`), `jq` and `musl-utils` (`ldd`).
-- **Kernel modules**, loaded now and added to `/etc/modules` for every boot:
-  `i915` (GPU), `uvcvideo` (capture card), `ch341` (the CH340 USB-serial
-  chip in front of the CH9329).
+- **Kernel modules** `i915` (GPU), `uvcvideo` (capture card) and `ch341`
+  (the CH340 USB-serial chip in front of the CH9329). One that's already
+  loaded is left alone; otherwise it's loaded now and added to
+  `/etc/modules` for every boot.
 
 It then requires a GPU render device at `/dev/dri/renderD*` and `vainfo`
 reporting the `i965` driver with H.264 encode support. Both are hard

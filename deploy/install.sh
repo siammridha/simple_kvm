@@ -78,6 +78,10 @@ ok "required packages installed"
 #   uvcvideo - USB capture card (/dev/video*)
 #   ch341    - CH340 USB-serial chip the CH9329 sits behind (/dev/ttyUSB*)
 for MODULE in i915 uvcvideo ch341; do
+	if [ -d /sys/module/$MODULE ]; then
+		ok "kernel module $MODULE already loaded"
+		continue
+	fi
 	if ! modprobe "$MODULE"; then
 		fail "could not load kernel module $MODULE - is this the stock Alpine kernel (linux-lts)?"
 		exit 1
