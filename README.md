@@ -118,18 +118,29 @@ Run this on the Wyse 3040 itself, as root:
 wget -qO- https://raw.githubusercontent.com/siammridha/simple_kvm/main/deploy/install.sh | sh
 ```
 
-This first checks the device has what the binary needs to run - root, an
-x86_64 CPU, Alpine's `apk`, a GPU render device at `/dev/dri/renderD*`, and
-the VAAPI runtime + Intel `i965` driver (`libva`/`libva-intel-driver`,
-installing them from Alpine's `community` repo if missing) - since the
-H.264 encoder needs the GPU and has no CPU fallback: if VAAPI setup fails,
-the binary refuses to start rather than silently falling back to software
-encoding. It also reports (without blocking on) whether the capture card
-and CH9329 are currently plugged in, since both are hot-pluggable and the
-app runs fine without either attached yet. Once the checks pass, it
-downloads the latest release binary and sets it up as an OpenRC service
-(`simple_kvm`) that starts on boot and is already running once the script
-finishes.
+This first checks for root, an x86_64 CPU and Alpine's `apk`. It then
+installs everything the binary needs, without assuming any of it is already
+there:
+
+- **Packages** (from Alpine's `main` and `community` repos): `libgcc` (the
+  binary is dynamically linked against musl and needs `libgcc_s.so.1`),
+  `libva` + `libva-intel-driver` (the VAAPI runtime and the Intel `i965`
+  driver), `libva-utils` (`vainfo`), `jq` and `musl-utils` (`ldd`).
+- **Kernel modules**, loaded now and added to `/etc/modules` for every boot:
+  `i915` (GPU), `uvcvideo` (capture card), `ch341` (the CH340 USB-serial
+  chip in front of the CH9329).
+
+It then requires a GPU render device at `/dev/dri/renderD*` and `vainfo`
+reporting the `i965` driver with H.264 encode support. Both are hard
+failures, since the H.264 encoder needs the GPU and has no CPU fallback: if
+VAAPI setup fails, the binary refuses to start rather than silently falling
+back to software encoding. It also reports (without blocking on) whether the
+capture card and CH9329 are currently plugged in, since both are
+hot-pluggable and the app runs fine without either attached yet. Once the
+checks pass, it downloads the latest release binary, uses `ldd` to confirm
+every shared library it needs is present, and sets it up as an OpenRC
+service (`simple_kvm`) that starts on boot and is already running once the
+script finishes.
 
 This device's GPU needs the older `i965` driver, not the newer
 `intel-media-driver`. That driver's own auto-generated H.264 headers are

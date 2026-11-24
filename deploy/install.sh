@@ -3,7 +3,7 @@
 #
 #   wget -qO- https://raw.githubusercontent.com/siammridha/simple_kvm/main/deploy/install.sh | sh
 #
-# Checks the device has what the binary needs to run, downloads the latest
+# Installs and checks what the binary needs to run, downloads the latest
 # release binary from GitHub, installs it as an OpenRC boot service, and
 # starts it. No other files need to be copied to the device first.
 set -eu
@@ -46,48 +46,60 @@ if ! command -v apk >/dev/null 2>&1; then
 fi
 ok "Alpine Linux (apk found)"
 
+# Packages, all installed every run (apk skips ones already present):
+#   libgcc             - libgcc_s.so.1; the binary is dynamically linked
+#                        against musl (-crt-static) and won't start without it
+#   musl-utils         - ldd, used below to verify the downloaded binary
+#   jq                 - parses the GitHub release JSON below
+#   libva              - VAAPI runtime the H.264 encoder links against
+#   libva-intel-driver - the classic `i965` driver; the newer
+#                        `intel-media-driver`/iHD is Gen9+ and doesn't
+#                        support this chip
+#   libva-utils        - vainfo, for the H.264 encode check below
+# The libva packages live in `community`, which isn't enabled by default;
+# both repos are passed with `--repository` for this one command instead of
+# editing /etc/apk/repositories (see docs/gpu-encoding-investigation.md).
+ALPINE_VERSION="v$(cut -d. -f1,2 /etc/alpine-release)"
+MAIN_REPO="http://dl-cdn.alpinelinux.org/alpine/$ALPINE_VERSION/main"
+COMMUNITY_REPO="http://dl-cdn.alpinelinux.org/alpine/$ALPINE_VERSION/community"
+PACKAGES="libgcc musl-utils jq libva libva-intel-driver libva-utils"
+
+echo "Installing required packages ($PACKAGES)..."
+# shellcheck disable=SC2086
+if ! apk add --no-cache --repository "$MAIN_REPO" --repository "$COMMUNITY_REPO" $PACKAGES; then
+	fail "could not install: $PACKAGES"
+	exit 1
+fi
+ok "required packages installed"
+
+# Kernel modules, loaded now and listed in /etc/modules so they also load on
+# every boot:
+#   i915     - Intel GPU; provides /dev/dri/renderD* for the encoder
+#   uvcvideo - USB capture card (/dev/video*)
+#   ch341    - CH340 USB-serial chip the CH9329 sits behind (/dev/ttyUSB*)
+for MODULE in i915 uvcvideo ch341; do
+	if ! modprobe "$MODULE"; then
+		fail "could not load kernel module $MODULE - is this the stock Alpine kernel (linux-lts)?"
+		exit 1
+	fi
+	grep -qx "$MODULE" /etc/modules 2>/dev/null || echo "$MODULE" >> /etc/modules
+	ok "kernel module $MODULE loaded (and set to load at boot)"
+done
+
 if ! ls /dev/dri/renderD* >/dev/null 2>&1; then
 	fail "no /dev/dri/renderD* device - no GPU render node for the H.264 encoder to use"
 	exit 1
 fi
 ok "GPU render device present ($(ls /dev/dri/renderD* | head -1))"
 
-apk add --no-cache jq >/dev/null
-
-# libva (the VAAPI runtime) and libva-intel-driver (the classic `i965`
-# driver this GPU generation needs - the newer `intel-media-driver`/iHD
-# targets Gen9+ and doesn't support this chip) both live in Alpine's
-# `community` repo, which isn't enabled by default. Installed with
-# `--repository` for this one command, same as documented in
-# docs/gpu-encoding-investigation.md, rather than editing
-# /etc/apk/repositories - these are the only community packages needed.
-COMMUNITY_REPO="http://dl-cdn.alpinelinux.org/alpine/v$(cut -d. -f1,2 /etc/alpine-release)/community"
-
-need_install() { ! apk info -e "$1" >/dev/null 2>&1; }
-
-if need_install libva || need_install libva-intel-driver; then
-	echo "Installing the VAAPI runtime and Intel i965 driver from the community repo..."
-	if ! apk add --no-cache --repository "$COMMUNITY_REPO" libva libva-intel-driver; then
-		fail "could not install libva / libva-intel-driver from $COMMUNITY_REPO"
-		echo "The H.264 encoder needs these to run - install them manually and re-run this script." >&2
-		exit 1
-	fi
+VAINFO_OUT=$(vainfo 2>&1 || true)
+if ! echo "$VAINFO_OUT" | grep -q "i965" \
+	|| ! echo "$VAINFO_OUT" | grep -q "VAProfileH264ConstrainedBaseline.*VAEntrypointEncSlice"; then
+	fail "vainfo didn't report the i965 driver with H.264 encode support - the encoder can't start"
+	echo "$VAINFO_OUT" | sed 's/^/         /' >&2
+	exit 1
 fi
-ok "VAAPI runtime (libva) installed"
-ok "Intel i965 VAAPI driver (libva-intel-driver) installed"
-
-if command -v vainfo >/dev/null 2>&1; then
-	VAINFO_OUT=$(vainfo 2>&1 || true)
-	if echo "$VAINFO_OUT" | grep -q "i965" \
-		&& echo "$VAINFO_OUT" | grep -q "VAProfileH264ConstrainedBaseline.*VAEntrypointEncSlice"; then
-		ok "driver reports H.264 encode support (vainfo)"
-	else
-		warn "vainfo didn't report the i965 driver with H.264 encode support - the encoder may fail to start"
-		echo "$VAINFO_OUT" | sed 's/^/         /' >&2
-	fi
-else
-	warn "vainfo not installed (apk add libva-utils) - skipping the deeper driver check"
-fi
+ok "driver reports H.264 encode support (vainfo)"
 
 # The capture card and CH9329 are both hot-pluggable and the app runs fine
 # without either already plugged in (see README.md's "The server runs fine
@@ -124,6 +136,16 @@ echo "Downloading $DOWNLOAD_URL..."
 # touching the file the running process has open.
 wget -qO /usr/local/bin/simple_kvm.new "$DOWNLOAD_URL"
 chmod 755 /usr/local/bin/simple_kvm.new
+
+MISSING_LIBS=$(ldd /usr/local/bin/simple_kvm.new 2>&1 | grep -i "not found" || true)
+if [ -n "$MISSING_LIBS" ]; then
+	rm -f /usr/local/bin/simple_kvm.new
+	fail "the binary needs shared libraries that aren't installed:"
+	echo "$MISSING_LIBS" | sed 's/^/         /' >&2
+	exit 1
+fi
+ok "all shared libraries the binary needs are present"
+
 mv /usr/local/bin/simple_kvm.new /usr/local/bin/simple_kvm
 
 cat > /etc/init.d/simple_kvm <<'EOF'
