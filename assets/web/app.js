@@ -509,7 +509,7 @@ async function connect() {
   setStatus('connecting…');
   updateSettingsAvailability();
   updateIndicators();
-  pc = new RTCPeerConnection();
+  pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }] });
 
   pc.addEventListener('connectionstatechange', () => {
     if (pc.connectionState === 'connected') {

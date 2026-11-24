@@ -15,7 +15,7 @@ use rtc::rtp_transceiver::rtp_sender::{RTCRtpCodec, RTCRtpCodecParameters, RtpCo
 use webrtc::data_channel::DataChannel;
 use webrtc::peer_connection::{
     register_default_interceptors, MediaEngine, PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfigurationBuilder,
-    RTCIceGatheringState, RTCPeerConnectionState, RTCSessionDescription, Registry,
+    RTCIceGatheringState, RTCIceServer, RTCPeerConnectionState, RTCSessionDescription, Registry,
 };
 
 use crate::capture::engine::CaptureCard;
@@ -23,6 +23,8 @@ use crate::capture::CaptureDevice;
 use crate::device::{DeviceStatus, Subscription, SupportedFormat};
 use crate::hid::{Ch9329Device, Hid};
 use session::SessionContext;
+
+const STUN_SERVER: &str = "stun:stun.cloudflare.com:3478";
 
 /// The WebRTC module itself: peer sessions and the offer→answer command
 /// `web` calls on every signaling request. Just the two modules a session
@@ -266,12 +268,7 @@ async fn negotiate(offer_sdp: String, rtc: Rtc) -> Result<String> {
     let registry = register_default_interceptors(Registry::new(), &mut media_engine).context("registering RTP interceptors")?;
 
     let mut setting_engine = SettingEngine::default();
-    // This device is only ever used on a local network, never over STUN/TURN
-    // (none is configured). Some browsers hide their real LAN IP behind a
-    // random "<uuid>.local" mDNS name instead of sending it directly, and
-    // with no STUN/TURN server there's no other candidate to fall back on.
-    // Disabling mDNS here means we don't try (and fail) to resolve that name
-    // - we just drop it, same as if it were never sent.
+    // Browsers may hide their LAN IP behind a "<uuid>.local" name we can't resolve; drop it instead of failing on it.
     setting_engine.set_multicast_dns_mode(MulticastDnsMode::Disabled);
 
     let (gather_complete, gather_complete_rx) = OnceSignal::new();
@@ -283,7 +280,11 @@ async fn negotiate(offer_sdp: String, rtc: Rtc) -> Result<String> {
 
     let peer_connection: Arc<dyn PeerConnection> = Arc::new(
         PeerConnectionBuilder::new()
-            .with_configuration(RTCConfigurationBuilder::new().build())
+            .with_configuration(
+                RTCConfigurationBuilder::new()
+                    .with_ice_servers(vec![RTCIceServer { urls: vec![STUN_SERVER.to_owned()], ..Default::default() }])
+                    .build(),
+            )
             .with_media_engine(media_engine)
             .with_interceptor_registry(registry)
             .with_setting_engine(setting_engine)

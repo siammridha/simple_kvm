@@ -186,6 +186,9 @@ to change one):
 Each browser tab's video/input connection (WebRTC) picks its own UDP port
 automatically - there's no fixed port to configure for it, and nothing to
 open in a firewall today, since `deploy/install.sh` doesn't set one up.
+Both the server and the page use Cloudflare's public STUN server
+(`stun:stun.cloudflare.com:3478`) to find their public address. No TURN
+server is set up.
 
 ## Releasing a new version
 
