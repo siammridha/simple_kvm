@@ -1,51 +1,56 @@
-// For format details, see https://aka.ms/devcontainer.json. For config options, see the
-// README at: https://github.com/devcontainers/templates/tree/main/src/rust
+// For format details, see https://aka.ms/devcontainer.json.
 {
-	"name": "Rust",
-	// Dedicated image: rust + node + Claude Code + rust-analyzer + the
-	// rust-analyzer-lsp plugin are baked in by the Dockerfile.
+	"name": "simple_kvm",
 	"build": {
 		"dockerfile": "Dockerfile"
 	},
 	"workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
 	"remoteUser": "vscode",
+	// Delete the container (and everything written to its filesystem) when it
+	// stops. Only the "mounts" below persist; VS Code creates a fresh container
+	// from the existing image on next open.
+	"runArgs": ["--rm"],
+	// `|| true`: the folder may not be a git repo yet; runs again on every open.
+	"postCreateCommand": "git config core.hooksPath hooks 2>/dev/null || true",
 	"remoteEnv": {
-		"GH_TOKEN": "${localEnv:GH_TOKEN}"
+		"GH_TOKEN": "${localEnv:GH_TOKEN}",
+		// Claude Code login, shared by every project: a long-lived token from
+		// `claude setup-token`, exported in the Mac's shell profile. (Sharing
+		// .credentials.json through a symlinked volume doesn't work: Claude
+		// Code replaces the symlink with a regular file when it saves.)
+		"CLAUDE_CODE_OAUTH_TOKEN": "${localEnv:CLAUDE_CODE_OAUTH_TOKEN}"
 	},
-	// The workspace folder is bind-mounted from the host through virtiofs
-	// (Docker Desktop's Mac file-sharing layer), which has a known bug: a
-	// heavily parallel cargo build mmap's `.rlib` files under target/ and
-	// intermittently gets "Bad address (os error 14)" from virtiofs under
-	// that load. Pointing CARGO_TARGET_DIR at the cargo-cache volume below
-	// (a real ext4 volume, not virtiofs) avoids the bug entirely, so builds
-	// can use full CPU parallelism instead of being throttled around it.
 	"containerEnv": {
-		"CARGO_TARGET_DIR": "/usr/local/cargo/target-cache"
+		// The workspace is bind-mounted through virtiofs (Docker Desktop's Mac
+		// file sharing), which intermittently fails heavily parallel cargo
+		// builds with "Bad address (os error 14)". Building inside the
+		// container's own filesystem avoids that, and the build output is
+		// deleted along with the container.
+		"CARGO_TARGET_DIR": "/home/vscode/cargo-target",
+		// Full debug info is most of a debug target/'s size; line tables keep
+		// file:line in backtraces at a fraction of it.
+		"CARGO_PROFILE_DEV_DEBUG": "line-tables-only"
 	},
-	// Volumes survive rebuilds: cargo cache, and Claude state. The Dockerfile
-	// sets CLAUDE_CONFIG_DIR so everything, including what would otherwise be
-	// ~/.claude.json, lives in /home/vscode/.claude (the "claude-config"
-	// volume, named per-project below) -- EXCEPT the login token, which
-	// setup-claude-auth.sh symlinks in from the separate "claude-auth" volume.
-	// claude-auth has a fixed name (not scoped to this project) so it's the
-	// same volume across every devcontainer on this machine: log in once,
-	// and any project's devcontainer -- including a rebuilt claude-config --
-	// picks it up. For another project to share it, its devcontainer.json
-	// needs this same mount with source "devcontainer-claude-auth-shared".
 	"mounts": [
+		// Downloaded crates, shared by every project on this machine.
 		{
-			"source": "${localWorkspaceFolderBasename}-devcontainer-cargo-cache",
-			"target": "/usr/local/cargo",
+			"source": "devcontainer-cargo-registry",
+			"target": "/usr/local/cargo/registry",
 			"type": "volume"
 		},
+		{
+			"source": "devcontainer-cargo-git",
+			"target": "/usr/local/cargo/git",
+			"type": "volume"
+		},
+		// This project's Claude sessions, history and settings.
 		{
 			"source": "${localWorkspaceFolderBasename}-devcontainer-claude-config",
 			"target": "/home/vscode/.claude",
 			"type": "volume"
 		},
-		// Bind the host git config so name/email survive rebuilds. SSH keys are
-		// not mounted: VS Code forwards the host SSH agent into the container
-		// automatically, so the key never leaves the host.
+		// Host git config, so name/email are set. SSH keys are not mounted: VS
+		// Code forwards the host SSH agent into the container automatically.
 		{
 			"source": "${localEnv:HOME}/.gitconfig",
 			"target": "/home/vscode/.gitconfig",
